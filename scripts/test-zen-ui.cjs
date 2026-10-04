@@ -1,5 +1,9 @@
 /* DOM/protocol regression tests, not a substitute for an Android WebView test.
    npm install --ignore-scripts && npm run test:webui */
+// Harness instances must not interleave: linkedom windows share custom
+// properties (window.ksu, dynamic callbacks) across parseHTML calls, so a
+// harness only owns the bridge until the next harness() call. Run each
+// harness to completion before constructing the next one.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -12,7 +16,7 @@ const html = fs.readFileSync(path.join(web,'index.html'),'utf8');
 const source = fs.readFileSync(path.join(web,'assets/zen.js'),'utf8');
 let checks = 0;
 function check(name, fn) { fn(); checks++; console.log('PASS ' + name); }
-function harness({noMetadata=false, noExec=false, port=31415, cachedPort=port, token='a'.repeat(64), authErrno=0, authRaw=null, authStderr='', deferAuth=false, execStyle='three', bridgeName='ksu', callbackStyle='errno-first', origin='https://mui.kernelsu.org', rpc=false, rpcAutoApply=true, deferRpc=false}={}) {
+function harness({noMetadata=false, noExec=false, port=31415, cachedPort=port, token='a'.repeat(64), authErrno=0, authRaw=null, authStderr='', deferAuth=false, execStyle='three', bridgeName='ksu', callbackStyle='errno-first', origin='https://mui.kernelsu.org', rpc=false, rpcAutoApply=true, deferRpc=false, rpcErrno=0}={}) {
   const {window,document} = parseHTML(html);
   let now = 1000, next = 0;
   const timers = new Map(), sockets = [], storage = new Map();
@@ -90,7 +94,7 @@ function harness({noMetadata=false, noExec=false, port=31415, cachedPort=port, t
           const [action,pkg,mode]=request.message.split('\t');
           app.rules=app.rules.filter(r=>r.package!==pkg);if(action==='set')app.rules.push({package:pkg,mode});
         }
-        const respond=()=>finish(0,JSON.stringify({modes:request.endpoint==='apps'?'':Object.entries(state).map(([k,v])=>k+':'+v).join(','),
+        const respond=()=>finish(rpcErrno,JSON.stringify({modes:request.endpoint==='apps'?'':Object.entries(state).map(([k,v])=>k+':'+v).join(','),
           apps:request.endpoint==='modes'?'':JSON.stringify(app),logs:request.logs?'2026-10-03 12:00:00 信息 -> root 通道日志\n':'',cursor:request.logs?'1:40':'',logsReset:request.logs&&!request.cursor}), '');
         if(deferRpc)rpcCallbacks.push(respond);else respond();
       } else window[callback](0,'read-only diagnostic data','');
@@ -211,6 +215,32 @@ check('dark theme persists in local UI preferences',()=>{assert.equal(h.document
 el('#glass-effects').checked=false;el('#glass-effects').onchange({target:el('#glass-effects')});
 el('#reduce-motion').checked=true;el('#reduce-motion').onchange({target:el('#reduce-motion')});
 check('simple surfaces and reduced motion are local UI options',()=>{assert.equal(h.document.documentElement.dataset.effects,'simple');assert.equal(h.document.documentElement.dataset.motion,'reduced');});
+el('#glass-effects').checked=true;el('#glass-effects').onchange({target:el('#glass-effects')});
+check('liquid glass transparency is tunable with live preview and saved on release',()=>{
+  const slider=el('#glass-intensity');
+  assert(slider,'missing glass intensity slider');
+  assert.equal(slider.disabled,false);
+  assert.equal(h.document.documentElement.style.getPropertyValue('--glass-level'),'45');
+  assert.equal(el('#glass-value').textContent,'45%');
+  slider.value='85';slider.oninput({target:slider});
+  assert.equal(h.document.documentElement.style.getPropertyValue('--glass-level'),'85');
+  assert.equal(el('#glass-value').textContent,'85%');
+  assert.match(el('#glass-note').textContent,/极通透/);
+  assert.equal(JSON.parse(h.storage.get('novasched.zen.ui.v1')).glassLevel,45);
+  slider.onchange();
+  assert.equal(JSON.parse(h.storage.get('novasched.zen.ui.v1')).glassLevel,85);
+  slider.value='200';slider.oninput({target:slider});
+  assert.equal(h.document.documentElement.style.getPropertyValue('--glass-level'),'100');
+  assert.equal(JSON.parse(h.storage.get('novasched.zen.ui.v1')).glassLevel,85);
+});
+check('glass switch disables transparency tuning and simple mode hides the glint',()=>{
+  el('#glass-effects').checked=false;el('#glass-effects').onchange({target:el('#glass-effects')});
+  assert.equal(el('#glass-intensity').disabled,true);
+  const css=fs.readFileSync(path.join(web,'assets/zen.css'),'utf8');
+  assert.match(css,/html\[data-effects=simple\] \.glass-dock::after \{ display:none; \}/);
+  el('#glass-effects').checked=true;el('#glass-effects').onchange({target:el('#glass-effects')});
+  assert.equal(el('#glass-intensity').disabled,false);
+});
 click('#diagnostics');click('#read-diagnostics');
 check('diagnostics executes a fixed read-only command without app interpolation',()=>assert.match(h.execCalls.at(-1), /exec.*novasched.*game-diagnose --module-dir/));
 click('#sheet-close');
@@ -273,7 +303,7 @@ check('missing root bridge blocks sockets and mutation',()=>{
   assert.match(missingExec.el('#mode-feedback').textContent,/root.*接口/);
 });
 check('malformed credential response and root command failure fail closed',()=>{
-  for(const settings of [{authRaw:'not-json'},{authRaw:'null'},{token:'short'},{token:'A'.repeat(64)},{port:80},{authErrno:1}]) {
+  for(const settings of [{authRaw:'not-json'},{authRaw:'null'},{token:'short'},{token:'A'.repeat(64)},{port:80},{authErrno:1,authRaw:'command exited with a nonzero status'}]) {
     const failed=harness(settings);
     assert.equal(failed.sockets.length,0);
     assert.equal(failed.el('#connection-label').textContent,'未连接');
@@ -328,6 +358,21 @@ check('stdout-first nonzero callback remains a real error instead of a successfu
   const host=harness({callbackStyle:'stdout-first',authErrno:1,authRaw:'permission failure'});
   assert.equal(host.sockets.length,0);assert.equal(host.el('#connection-label').textContent,'未连接');
 });
+check('a complete credential in stdout outranks a bridge-reported nonzero exit code',()=>{
+  // Real-world trigger: WebUI X / KSU exec wrappers can report a nonzero exit
+  // for a webui-session run that printed a full credential. The daemon only
+  // prints it after root, identity and origin checks, and the WebSocket
+  // handshake revalidates the token against the live daemon.
+  const host=harness({authErrno:1});host.connect();
+  assert.equal(host.el('#connection-label').textContent,'已连接');
+  assert.equal(host.execCalls.filter(x=>x.includes(' webui-session ')).length,1);
+});
+check('nonzero exit code with credentials minted for another origin still fails closed',()=>{
+  const host=harness({authErrno:1,authRaw:JSON.stringify({port:31415,token:'a'.repeat(64),origin:'https://evil.example'})});
+  assert.equal(host.sockets.length,0);
+  assert.equal(host.el('#connection-label').textContent,'未连接');
+  assert.match(host.el('#mode-feedback').textContent,/不匹配/);
+});
 check('current hardware and optional capabilities come from daemon status and clear offline',()=>{
   const host=harness();host.connect();host.status({socName:'Snapdragon 8 Elite',socId:'SM8750',configProfile:'SDM8Elite.json',smoothSupported:'false',extremeSupported:'false'});
   assert.equal(host.el('#processor-tag').textContent,'SM8750');assert(host.el('#smooth-save').disabled);assert(host.el('#extreme-save').disabled);
@@ -336,7 +381,7 @@ check('current hardware and optional capabilities come from daemon status and cl
   host.live('/modes').fail();assert.equal(host.el('#processor-tag').textContent,'自动识别');
 });
 check('missing identity shows backend startup reason and offers startup diagnostics',()=>{
-  const failed=harness({authErrno:1,authStderr:'novasched: daemon.identity missing; stage=环境校验; cgroup missing'});
+  const failed=harness({authErrno:1,authRaw:'',authStderr:'novasched: daemon.identity missing; stage=环境校验; cgroup missing'});
   assert.equal(failed.sockets.length,0);
   assert.match(failed.el('#mode-feedback').textContent,/环境校验/);
   failed.click('#connection'); assert.match(failed.el('#connection-error').textContent,/cgroup missing/);
@@ -415,6 +460,12 @@ check('Scene taking control cancels a pending local profile request',()=>{
   assert.match(switchingController.el('#mode-feedback').textContent,/Scene 已接管/);
   assert(!switchingController.el('.profile[data-mode=fast]').classList.contains('is-pending'));
 });
+const misreportedRpc=harness({rpc:true,rpcErrno:1});misreportedRpc.live('/modes').fail();await flush();
+check('root bridge snapshots are honored despite a bridge-reported nonzero exit code',()=>{
+  assert.equal(misreportedRpc.el('#connection-label').textContent,'已连接');
+  assert.equal(misreportedRpc.el('#server-address').textContent,'宿主 root 通道');
+  assert.equal(misreportedRpc.el('#active-mode').textContent,'均衡');
+});
 const blockedNetwork=harness({rpc:true});blockedNetwork.live('/modes').fail();await flush();
 check('blocked WebSocket automatically connects through the authorized root bridge',()=>{
   assert.equal(blockedNetwork.el('#connection-label').textContent,'已连接');
@@ -481,6 +532,16 @@ check('CSS parses cleanly and covers safe areas, narrow screens and motion',()=>
   const css=fs.readFileSync(path.join(web,'assets/zen.css'),'utf8');
   cssTree.parse(css,{onParseError:err=>{throw err;}});
   assert.match(css,/minmax\(0,1fr\)/);assert.match(css,/max-width:359px/);assert.match(css,/safe-area-inset-bottom/);assert.match(css,/prefers-reduced-motion/);assert.match(css,/overflow-wrap:anywhere/);
+});
+check('liquid glass derives blur tint and specular from the single tunable level',()=>{
+  const css=fs.readFileSync(path.join(web,'assets/zen.css'),'utf8');
+  assert.match(css,/--glass-level:45/);
+  assert.match(css,/blur\(var\(--glass-blur\)\)/);
+  assert.match(css,/saturate\(var\(--glass-sat\)\)/);
+  assert.match(css,/--glass-tint:calc\(0\.54 - var\(--glass-level\)\*0\.0042\)/);
+  assert.match(css,/dock-glint/);
+  assert.match(css,/glass-slider::-webkit-slider-thumb/);
+  assert(css.includes('animation-duration:.001ms!important'));
 });
 console.log(`Zen UI: ${checks} DOM/protocol/static checks passed. No browser rendering or physical Android device is implied.`);
 }

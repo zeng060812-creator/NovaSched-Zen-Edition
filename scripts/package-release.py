@@ -41,8 +41,15 @@ programs = (ROOT / 'native/target-static/elf-programs.txt').read_text()
 dynamic = (ROOT / 'native/target-static/elf-dynamic.txt').read_text()
 assert 'AArch64' in header and 'EXEC (Executable file)' in header
 assert 'INTERP' not in programs and 'NEEDED' not in dynamic
-for line in re.findall(r'LOAD[^\n]*\n[^\n]+', programs):
-    assert line.strip().endswith('0x4000'), 'ELF LOAD alignment is not 16KB'
+# GNU binutils wraps each program header onto a second line that carries the
+# alignment column; llvm-readelf (NDK) keeps one line per record. Accept both.
+program_lines = programs.splitlines()
+load_records = []
+for index, line in enumerate(program_lines):
+    if line.strip().startswith('LOAD'):
+        load_records.append(line + program_lines[index + 1] if len(line.split()) == 4 and index + 1 < len(program_lines) else line)
+for record in load_records:
+    assert record.split()[-1] == '0x4000', 'ELF LOAD alignment is not 16KB'
 assert f'version=v{VERSION}' in (MODULE/'module.prop').read_text()
 assert 'versionCode=218' in (MODULE/'module.prop').read_text()
 runpy.run_path(str(ROOT/'scripts/generate-profiles.py'))['generate'](check=True)

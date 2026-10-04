@@ -1,0 +1,2 @@
+# Shell scripts run in Android mksh and must stay LF on any platform.
+* text=auto eol=lf

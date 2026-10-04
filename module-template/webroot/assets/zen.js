@@ -42,12 +42,13 @@
     logReceived: false, sheet: "", sheetEpoch: 0, edit: null, installed: null, loadingApps: false,
     labels: new Map(), queried: new Set(), iconFailures: new Set(), rulesRenderKey: "", logsRenderKey: "",
   };
-  let ui = { theme: "system", glass: true, motion: false, port: 31415 };
+  let ui = { theme: "system", glass: true, motion: false, port: 31415, glassLevel: 45 };
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE) || "{}");
     if (own(THEME_NAMES, saved.theme)) ui.theme = saved.theme;
     if (typeof saved.glass === "boolean") ui.glass = saved.glass;
     if (typeof saved.motion === "boolean") ui.motion = saved.motion;
+    if (Number.isInteger(saved.glassLevel) && saved.glassLevel >= 0 && saved.glassLevel <= 100) ui.glassLevel = saved.glassLevel;
     if (Number.isInteger(saved.port) && saved.port >= 1024 && saved.port <= 65535) ui.port = saved.port;
   } catch (_) { /* Storage may be disabled by the host WebView. */ }
   s.port = ui.port;
@@ -72,15 +73,31 @@
   const present = (id, text) => { const node = $(id); if (node && node.textContent !== String(text)) node.textContent = String(text); };
   function saveUI() { try { localStorage.setItem(STORAGE, JSON.stringify(ui)); } catch (_) {} }
 
+  function glassNote(level) {
+    if (level >= 80) return "极通透 · 最纯粹的液态质感";
+    if (level >= 55) return "通透 · 明显的折射光感";
+    if (level >= 30) return "适中 · 平衡通透与可读性";
+    return "磨砂 · 雾面玻璃，最易阅读";
+  }
   function applyAppearance() {
     const dark = ui.theme === "dark" || (ui.theme === "system" && !!darkQuery?.matches);
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     document.documentElement.dataset.effects = ui.glass ? "glass" : "simple";
+    // One CSS variable drives every liquid glass surface (blur, tint, specular).
+    document.documentElement.style.setProperty("--glass-level", String(ui.glassLevel));
     document.documentElement.dataset.motion = ui.motion || motionQuery?.matches ? "reduced" : "full";
     $("meta[name=theme-color]").content = dark ? "#111c19" : "#f2f6f3";
     present("#theme-label", THEME_NAMES[ui.theme]);
     $("#glass-effects").checked = ui.glass;
     $("#reduce-motion").checked = ui.motion;
+    const slider = $("#glass-intensity");
+    if (slider) {
+      slider.disabled = !ui.glass;
+      if (slider.value !== String(ui.glassLevel)) slider.value = String(ui.glassLevel);
+      slider.style.setProperty("--fill", ui.glassLevel + "%");
+      present("#glass-value", ui.glassLevel + "%");
+      present("#glass-note", glassNote(ui.glassLevel));
+    }
     present("#motion-note", motionQuery?.matches ? "系统已启用减少动态效果" : "也会尊重系统的减少动态效果设置");
   }
   function toast(message, timeout = 3500) {
@@ -321,6 +338,21 @@
     return String(value || "").replace(/[a-f0-9]{64}/gi, "[凭据已隐藏]")
       .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, " ").trim().slice(0, 900);
   }
+  function extractCredentials(text) {
+    const raw = String(text || "").trim();
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (_) {
+      // Some hosts merge command output with shell noise; the daemon prints an
+      // exact single object, so a strict embedded match is enough to recover it.
+      const match = raw.match(/\{[^{}]*"port"\s*:\s*\d+[^{}]*"token"\s*:\s*"[a-f0-9]{64}"[^{}]*"origin"\s*:\s*"[^"]*"[^{}]*\}/);
+      try { parsed = match ? JSON.parse(match[0]) : null; } catch (_) { parsed = null; }
+    }
+    return parsed && typeof parsed === "object" ? parsed : null;
+  }
+  function usableCredentials(value, origin) {
+    return !!value && Number.isInteger(value.port) && value.port >= 1024 && value.port <= 65535
+      && typeof value.token === "string" && /^[a-f0-9]{64}$/.test(value.token) && value.origin === origin;
+  }
   function loadAuthentication(epoch, ready) {
     const api = bridge();
     const failed = (message, retry = true) => {
@@ -348,17 +380,23 @@
       request.completed = true; clearTimeout(request.timer); delete window[name];
       if (authRequest === request) authRequest = null;
       if (epoch !== s.epoch || s.suspended) return;
-      if (Number(errno) !== 0) {
+      // print_current emits the credential JSON only after validating root,
+      // daemon identity and page origin, so a complete credential in stdout is
+      // authoritative even when the bridge misreports a nonzero exit code
+      // (merged 2>&1 output, su wrappers, or an early WebView pipe close).
+      // The WebSocket handshake still verifies the token against the live
+      // daemon, so a fabricated or stale token simply fails closed.
+      const credentials = extractCredentials(stdout);
+      if (credentials && !usableCredentials(credentials, origin)) {
+        failed("连接凭据格式或页面来源不匹配，请完整安装同一版本的模块后重启。"); return;
+      }
+      if (!credentials && Number(errno) !== 0) {
         failed("无法读取守护连接状态：" + (publicError(stderr) || publicError(stdout) || `命令退出码 ${errno}，请检查宿主 root 授权并读取启动诊断。`)); return;
       }
-      let credentials;
-      try { credentials = JSON.parse(String(stdout || "")); } catch (_) {
+      if (!credentials) {
         const detail = /^novasched:|Permission denied|not found/.test(String(stdout || "")) ? publicError(stdout) : "宿主返回格式无效，请读取启动诊断。";
         failed("未取得有效连接凭据：" + detail); return;
       }
-      if (!Number.isInteger(credentials?.port) || credentials.port < 1024 || credentials.port > 65535
-          || typeof credentials?.token !== "string" || !/^[a-f0-9]{64}$/.test(credentials.token)
-          || credentials?.origin !== origin) { failed("连接凭据格式或页面来源不匹配，请完整安装同一版本的模块后重启。"); return; }
       if (typeof credentials.moduleDir === "string" && /^\/data\/adb\/(?:modules|ap\/modules)\/NovaSched_Zen_Edition$/.test(credentials.moduleDir)) MODULE = credentials.moduleDir;
       sessionToken = credentials.token;
       s.connectionError = ""; feedback(""); ready(credentials.port);
@@ -386,11 +424,15 @@
   function rootRequest(request) {
     const command = moduleCommand("webui-rpc", `--origin ${shellQuote(s.rootOrigin)} --request ${shellQuote(JSON.stringify(request))}`);
     return rootExec(command, 30000, !own(request, "message")).then(result => {
-      if (result.errno !== 0) throw new Error(publicError(result.stderr) || publicError(result.stdout) || `宿主返回退出码 ${result.errno}`);
       let reply;
-      try { reply = JSON.parse(result.stdout); } catch (_) { throw new Error("宿主备用通道未返回有效状态，请完整安装同一版本后重启。"); }
-      if (!reply || typeof reply.modes !== "string" || typeof reply.apps !== "string"
+      try { reply = JSON.parse(result.stdout); } catch (_) {
+        if (result.errno !== 0) throw new Error(publicError(result.stderr) || publicError(result.stdout) || `宿主返回退出码 ${result.errno}`);
+        throw new Error("宿主备用通道未返回有效状态，请完整安装同一版本后重启。");
+      }
+      if (!reply || typeof reply !== "object" || typeof reply.modes !== "string" || typeof reply.apps !== "string"
           || typeof reply.logs !== "string" || typeof reply.cursor !== "string") throw new Error("备用通道状态格式无效");
+      // Same tolerance as the credential read: a complete daemon snapshot is
+      // authoritative even when the bridge misreports a nonzero exit code.
       return reply;
     });
   }
@@ -855,6 +897,22 @@
   $("#sheet-body").addEventListener("click",event => { const row = event.target.closest("[data-pick]"); if (row && editable()) showRule(row.dataset.pick); });
   for (const name of ["smooth","extreme"]) $("#" + name + "-save").onchange = event => { if (!beginPending(name,event.target.checked)) render(); };
   $("#glass-effects").onchange = event => { ui.glass = event.target.checked; saveUI(); applyAppearance(); };
+  // Guarded: the slider row may be absent when a newer script runs against an
+  // older index.html (e.g. a manual in-place webroot hot swap).
+  const glassSlider = $("#glass-intensity");
+  if (glassSlider) {
+    glassSlider.oninput = event => {
+      const value = Number(event.target.value);
+      if (!Number.isFinite(value)) return;
+      ui.glassLevel = Math.min(100, Math.max(0, Math.round(value)));
+      // Live preview while dragging; persistence happens once on change.
+      document.documentElement.style.setProperty("--glass-level", String(ui.glassLevel));
+      event.target.style.setProperty("--fill", ui.glassLevel + "%");
+      present("#glass-value", ui.glassLevel + "%");
+      present("#glass-note", glassNote(ui.glassLevel));
+    };
+    glassSlider.onchange = () => saveUI();
+  }
   $("#reduce-motion").onchange = event => { ui.motion = event.target.checked; saveUI(); applyAppearance(); };
   $("#theme-picker").onclick = showTheme;
   $("#diagnostics").onclick = showDiagnostics;
