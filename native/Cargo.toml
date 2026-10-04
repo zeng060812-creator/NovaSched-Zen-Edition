@@ -1,0 +1,20 @@
+[package]
+name = "novasched_zen"
+version = "0.2.18-rc1"
+edition = "2021"
+rust-version = "1.75"
+authors = ["ZenJooo"]
+description = "NovaSched Zen Edition userspace scheduler for six Snapdragon flagship SoCs"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "novasched"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true

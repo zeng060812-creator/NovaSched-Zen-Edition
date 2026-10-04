@@ -1,0 +1,9 @@
+/native/target/
+/native/target-static/
+/module-template/bin/novasched
+/node_modules/
+/dist/
+/validation/
+/ui-preview/
+__pycache__/
+*.pyc

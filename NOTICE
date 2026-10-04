@@ -1,0 +1,9 @@
+来源与许可证
+
+模块名称：NovaSched Zen Edition。模块作者：ZenJooo。模块 ID：NovaSched_Zen_Edition。
+
+现有调度核心与 Scene 联动设计源于 LittleYouran/LittleYouran_CTS_3，上游作者 LittleYouran，基线提交 3ecd526b72a08d97429376e519869aa464d50a39。相关代码沿用 GPL-3.0-only 许可证，原文见 LICENSE。
+
+本版本重新定义配置格式与默认策略，并修改硬件识别、配置迁移和 WebUI。来源署名用于说明许可证归属。
+
+WebUI 中的 Google Material rounded SVG 图标采用 Apache-2.0 许可证，原文位于模块的 webroot/licenses/Material-Icons.txt，源码包对应 module-template/webroot/licenses/Material-Icons.txt。

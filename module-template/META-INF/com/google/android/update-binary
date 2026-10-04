@@ -1,0 +1,18 @@
+#!/sbin/sh
+# Standard Magisk module entry. KSU/APatch use their own module installer.
+# Detect the required installer API, not a brand or numeric version threshold.
+umask 022
+OUTFD=$2
+ZIPFILE=$3
+ui_print() { printf '%s\n' "$1"; }
+if [ ! -r /data/adb/magisk/util_functions.sh ]; then
+  ui_print "! Magisk 安装接口不可读，请从已启用 root 的模块管理器安装，不支持 Recovery。"
+  exit 1
+fi
+. /data/adb/magisk/util_functions.sh
+if ! command -v install_module >/dev/null 2>&1; then
+  ui_print "! 当前安装器缺少 install_module 接口，未执行安装。"
+  exit 1
+fi
+install_module
+exit $?

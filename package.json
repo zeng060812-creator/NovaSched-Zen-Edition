@@ -1,0 +1,13 @@
+{
+  "name": "novasched-zen-ui-validation",
+  "private": true,
+  "version": "0.2.18-rc1",
+  "scripts": {
+    "test:webui": "node scripts/test-zen-ui.cjs"
+  },
+  "devDependencies": {
+    "css-tree": "3.1.0",
+    "linkedom": "0.18.12",
+    "playwright-core": "1.62.1"
+  }
+}

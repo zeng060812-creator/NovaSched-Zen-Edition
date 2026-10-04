@@ -1,0 +1,225 @@
+{
+  "schema": "novasched/2",
+  "module": "NovaSched_Zen_Edition",
+  "meta": {
+    "name": "NovaSched Zen Edition",
+    "author": "ZenJooo",
+    "version": 218,
+    "soc": "SM8850",
+    "loglevel": "INFO"
+  },
+  "policies": [
+    0,
+    6,
+    -1,
+    -1
+  ],
+  "features": {
+    "node_watchdog": true,
+    "cpuset": {
+      "enabled": false,
+      "top_app": "0-7",
+      "foreground": "0-7",
+      "restricted": "0-3",
+      "system_background": "0-3",
+      "background": "0-1"
+    },
+    "launch_boost": {
+      "enabled": false,
+      "rate_limit_ms": 500,
+      "min": [
+        "0",
+        "0",
+        "0",
+        "0"
+      ]
+    },
+    "disable_gpu_boost": false,
+    "scheduler": {
+      "enabled": false,
+      "energy_aware": true,
+      "schedstats": false,
+      "latency_ns": "10000000",
+      "migration_cost_ns": "500000",
+      "min_granularity_ns": "1000000",
+      "wakeup_granularity_ns": "1000000",
+      "nr_migrate": "32",
+      "util_clamp_min": "0",
+      "util_clamp_max": "1024"
+    },
+    "foreground_ignore": [],
+    "extreme": {
+      "enabled": false,
+      "max": [
+        "55%",
+        "55%",
+        "0",
+        "0"
+      ],
+      "uclamp_max": "1024"
+    },
+    "smooth": {
+      "enabled": false,
+      "max": [
+        "70%",
+        "70%",
+        "0",
+        "0"
+      ],
+      "uclamp_max": "1024",
+      "uclamp_min_limit": "1024",
+      "up_rate_limit_us": "0",
+      "restore_stock_response": true
+    },
+    "perf_lock": {
+      "enabled": false,
+      "services": []
+    }
+  },
+  "modes": {
+    "powersave": {
+      "min": [
+        "0%",
+        "0%",
+        "0",
+        "0"
+      ],
+      "max": [
+        "70%",
+        "70%",
+        "0",
+        "0"
+      ],
+      "governors": [
+        "auto",
+        "auto",
+        "",
+        ""
+      ],
+      "params": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "online": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    "balance": {
+      "min": [
+        "0%",
+        "0%",
+        "0",
+        "0"
+      ],
+      "max": [
+        "100%",
+        "100%",
+        "0",
+        "0"
+      ],
+      "governors": [
+        "auto",
+        "auto",
+        "",
+        ""
+      ],
+      "params": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "online": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    "performance": {
+      "min": [
+        "15%",
+        "15%",
+        "0",
+        "0"
+      ],
+      "max": [
+        "100%",
+        "100%",
+        "0",
+        "0"
+      ],
+      "governors": [
+        "auto",
+        "auto",
+        "",
+        ""
+      ],
+      "params": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "online": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    "fast": {
+      "min": [
+        "25%",
+        "25%",
+        "0",
+        "0"
+      ],
+      "max": [
+        "100%",
+        "100%",
+        "0",
+        "0"
+      ],
+      "governors": [
+        "auto",
+        "auto",
+        "",
+        ""
+      ],
+      "params": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "online": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    }
+  }
+}

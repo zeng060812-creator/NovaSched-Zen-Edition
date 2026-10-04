@@ -1,0 +1,13 @@
+{
+  "name": "NovaSched Zen Edition",
+  "author": "ZenJooo",
+  "version": "v0.2.18-rc1",
+  "versionCode": 218,
+  "features": {
+    "strict": true,
+    "pedestal": true
+  },
+  "module": "NovaSched_Zen_Edition",
+  "state": "/data/adb/novasched/mode.txt",
+  "entry": "/data/powercfg.sh"
+}
