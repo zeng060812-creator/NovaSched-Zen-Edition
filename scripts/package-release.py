@@ -85,27 +85,17 @@ def executable(f):
 
 module_entries = [(f, f.relative_to(MODULE).as_posix(), executable(f))
                   for f in sorted(MODULE.rglob('*')) if f.is_file() and f.suffix.lower() != '.md']
-ksu = DIST / f'NovaSched-v{VERSION}-Universal.zip'
-archive(ksu, module_entries)
-with zipfile.ZipFile(ksu) as z:
+flashable = DIST / f'NovaSched-v{VERSION}-release.zip'
+archive(flashable, module_entries)
+with zipfile.ZipFile(flashable) as z:
     assert z.read('bin/novasched') == binary.read_bytes()
     assert not any(name.endswith('webui.session') for name in z.namelist()), 'Private session included in release archive'
     assert z.read('META-INF/com/google/android/updater-script').strip() == b'#MAGISK'
     for name in ['bin/novasched','action.sh','service.sh','customize.sh','uninstall.sh','vtools/powercfg.sh','META-INF/com/google/android/update-binary']:
         assert (z.getinfo(name).external_attr >> 16) & 0o777 == 0o755
 
-excludes = {'dist','target','target-static','node_modules','.git','__pycache__','ui-preview','validation'}
-source_entries = []
-for f in sorted(ROOT.rglob('*')):
-    if f.is_file() and f.suffix.lower() != '.md' and not any(part in excludes for part in f.relative_to(ROOT).parts):
-        if f == binary:
-            continue
-        rel = f.relative_to(ROOT).as_posix()
-        source_entries.append((f, 'NovaSched-Zen-Edition/' + rel, executable(f)))
-archive(DIST/f'NovaSched-v{VERSION}-Source.zip', source_entries)
-
-print('Final universal module/source archives passed CRC, metadata, executable modes, protocol key and ELF consistency checks.')
+print('Final release archive passed CRC, metadata, executable modes, protocol key and ELF consistency checks.')
 
 sums = DIST / 'NovaSched-v0221-SHA256SUMS.txt'
-sums.write_text(''.join(digest(path)+'  '+path.name+'\n' for path in [ksu,DIST/f'NovaSched-v{VERSION}-Source.zip',binary]))
+sums.write_text(''.join(digest(path)+'  '+path.name+'\n' for path in [flashable,binary]))
 print(sums.name)

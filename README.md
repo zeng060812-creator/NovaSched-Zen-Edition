@@ -34,7 +34,7 @@
 
 1. 确认设备为 **arm64-v8a**，并已解锁 root（Magisk / Alpha / KernelSU 系列 / APatch 任一）。
 2. 若安装过旧模块 `LittleYouran_CTS_Rust`，请先在管理器中停用并卸载，重启后再安装本模块。
-3. 在管理器中刷入 `NovaSched-v*-Universal.zip`。
+ 3. 在管理器中刷入 `NovaSched-v*-release.zip`。
 4. 安装程序会依次执行二进制自检（`self-test`）、硬件探测（`probe`）、配置初始化（`prepare-config`）；任何一步失败都会中止安装并保留输出与原配置。
 5. 覆盖安装后**必须重启手机**，以退出旧版进程并加载新版本。
 
