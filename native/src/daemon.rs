@@ -351,6 +351,11 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         }
         let option_changed = scheduler.set_extreme_powersave(options.extreme_powersave());
         let smooth_changed = scheduler.set_smooth_powersave(options.smooth_powersave());
+        // Re-write ceilings that a vendor service refused until they stick.
+        // Cheap when the queue is empty; revision bump refreshes the WebUI.
+        if scheduler.enforce_pending() {
+            revision.fetch_add(1, Ordering::Relaxed);
+        }
 
         let foreground = monitor.detect(
             &app_modes,

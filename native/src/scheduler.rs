@@ -21,7 +21,10 @@ pub struct Scheduler {
     smooth_powersave: bool,
     current_power_kind: PowerSaveKind,
     hardware: Hardware,
-    tolerated_note: String,
+    pending_note: String,
+    /// Ceilings the kernel or a vendor service refused; re-written every tick
+    /// until they stick, so a refused value never rolls back the dispatch.
+    pending_enforcement: Vec<(PathBuf, String)>,
     open_drift: Option<Vec<String>>,
 }
 
@@ -92,7 +95,8 @@ impl Scheduler {
             smooth_powersave: false,
             current_power_kind: PowerSaveKind::Standard,
             hardware,
-            tolerated_note: String::new(),
+            pending_note: String::new(),
+            pending_enforcement: Vec::new(),
             open_drift: None,
         })
     }
@@ -281,20 +285,22 @@ impl Scheduler {
                 self.config.functions.launch_boost.rate_limit_ms,
             ));
         }
-        let mut tolerated = Vec::new();
-        self.apply_frequency(&profile, &mut tolerated)?;
+        self.pending_enforcement.clear();
+        self.apply_frequency(&profile)?;
         self.apply_sched_params(&profile)?;
         self.apply_online(&profile)?;
         self.apply_mode_cpuset(power_kind)?;
         self.apply_mode_power_limits(power_kind)?;
         let drift = mismatched_controls(&expected)?;
-        // A ceiling a vendor service keeps overriding is recorded as tolerated
-        // (one info line, re-asserted by the watchdog) instead of failing the
-        // whole dispatch — the remaining controls still apply.
+        // An unaccepted ceiling is queued for background enforcement (written
+        // every tick until it sticks) instead of rolling back the dispatch —
+        // every other control that did stick must survive. Only drift outside
+        // that queue is a hard failure.
         let hard: Vec<String> = drift
             .iter()
             .filter(|line| {
-                !tolerated
+                !self
+                    .pending_enforcement
                     .iter()
                     .any(|(path, _)| line.starts_with(&*path.to_string_lossy()))
             })
@@ -303,7 +309,7 @@ impl Scheduler {
         if !hard.is_empty() {
             return Err(format!("下发后关键节点读回不一致: {}", hard.join("；")));
         }
-        self.report_tolerated(&tolerated);
+        self.report_pending();
         self.open_drift = None;
         self.expected_controls = expected;
         self.current_mode = mode.to_string();
@@ -331,6 +337,18 @@ impl Scheduler {
             self.open_drift = None;
             return Ok(false);
         }
+        // Drift that is already queued for per-tick background enforcement is
+        // handled silently by enforce_pending; auditing it again would only
+        // duplicate logs and force a redundant full re-apply.
+        let pending_only = drift.iter().all(|line| {
+            self.pending_enforcement
+                .iter()
+                .any(|(path, _)| line.starts_with(&*path.to_string_lossy()))
+        });
+        if pending_only {
+            self.open_drift = Some(drift);
+            return Ok(false);
+        }
         if self.open_drift.as_ref() == Some(&drift) {
             // The same divergence already failed a repair; keep re-asserting
             // quietly instead of spamming the log every audit cycle.
@@ -356,26 +374,66 @@ impl Scheduler {
         Ok(self.open_drift.is_none())
     }
 
+    /// Re-assert ceilings that the kernel or a vendor service refused, once
+    /// per loop tick, until they stick. Silent by design: only state
+    /// transitions are logged, never per-attempt errors.
+    pub fn enforce_pending(&mut self) -> bool {
+        if self.pending_enforcement.is_empty() {
+            return false;
+        }
+        let mut still = Vec::new();
+        let mut resolved = false;
+        for (path, value) in std::mem::take(&mut self.pending_enforcement) {
+            let outcome = self.snapshot.write(&path, &value);
+            let observed = util::read_trimmed(&path).unwrap_or_default();
+            if frequency_ceiling_matches(&observed, &value) {
+                resolved = true;
+            } else {
+                if let Err(error) = outcome {
+                    self.logger.debug(format!(
+                        "重申上限暂未写入: {} ({error})",
+                        path.display()
+                    ));
+                }
+                still.push((path, value));
+            }
+        }
+        self.pending_enforcement = still;
+        if resolved {
+            self.report_pending();
+        }
+        resolved
+    }
+
     /// One info line per distinct set of vendor-held ceilings, plus a
-    /// positive line when the kernel accepts the configured values again.
-    fn report_tolerated(&mut self, tolerated: &[(PathBuf, String)]) {
-        if tolerated.is_empty() {
-            if !self.tolerated_note.is_empty() {
-                self.tolerated_note.clear();
+    /// positive line when the kernel finally accepts the values.
+    fn report_pending(&mut self) {
+        if self.pending_enforcement.is_empty() {
+            if !self.pending_note.is_empty() {
+                self.pending_note.clear();
                 self.logger
-                    .info("被系统服务占用的频率上限已恢复，配置完整生效");
+                    .info("此前被占用的频率上限已彻底写入，配置完整生效");
             }
             return;
         }
-        let note = tolerated
+        let note = self
+            .pending_enforcement
             .iter()
-            .map(|(_, text)| text.as_str())
+            .map(|(path, value)| {
+                format!(
+                    "{} 保持目标 {value}",
+                    path.parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|p| p.to_str())
+                        .unwrap_or("policy")
+                )
+            })
             .collect::<Vec<_>>()
             .join("；");
-        if self.tolerated_note != note {
-            self.tolerated_note = note.clone();
+        if self.pending_note != note {
+            self.pending_note = note.clone();
             self.logger
-                .info(format!("部分频率上限被系统服务占用，守护会持续自动重申: {note}"));
+                .info(format!("部分频率上限被系统服务占用，守护将每 2 秒自动重写直至生效: {note}"));
         }
     }
 
@@ -577,11 +635,7 @@ impl Scheduler {
         self.snapshot.capture_batch(paths, services)
     }
 
-    fn apply_frequency(
-        &self,
-        profile: &ModeProfile,
-        tolerated: &mut Vec<(PathBuf, String)>,
-    ) -> Result<()> {
+    fn apply_frequency(&mut self, profile: &ModeProfile) -> Result<()> {
         for cluster in 0..4 {
             let policy = self.config.policy[cluster];
             if policy < 0 {
@@ -594,7 +648,6 @@ impl Scheduler {
                 &data.min_freq,
                 &data.max_freq,
                 &data.governor,
-                tolerated,
             )?;
         }
         Ok(())
@@ -629,20 +682,19 @@ impl Scheduler {
         Ok(())
     }
 
-    fn apply_boost(&self, profile: &ModeProfile) -> Result<()> {
+    fn apply_boost(&mut self, profile: &ModeProfile) -> Result<()> {
         for cluster in 0..4 {
             let policy = self.config.policy[cluster];
             if policy < 0 {
                 continue;
             }
-            let mut ignored = Vec::new();
+            let boost_ceiling = self.config.functions.launch_boost.frequencies[cluster].clone();
             self.write_frequency(
                 policy,
                 cluster,
                 &profile.clusters[cluster].min_freq,
-                &self.config.functions.launch_boost.frequencies[cluster],
+                &boost_ceiling,
                 &profile.clusters[cluster].governor,
-                &mut ignored,
             )?;
         }
         Ok(())
@@ -732,13 +784,12 @@ impl Scheduler {
     }
 
     fn write_frequency(
-        &self,
+        &mut self,
         policy: i32,
         cluster: usize,
         min: &str,
         max: &str,
         governor: &str,
-        tolerated: &mut Vec<(PathBuf, String)>,
     ) -> Result<()> {
         let base = self.node(format!("/sys/devices/system/cpu/cpufreq/policy{policy}"));
         let (effective_min, effective_max) = frequency_range(&base, min, max)?;
@@ -757,8 +808,10 @@ impl Scheduler {
         }
         // A vendor thermal/perf service can rewrite the ceiling between our
         // write and the readback, especially around mode switches. Re-assert
-        // with a short backoff before recording the override; the watchdog
-        // keeps re-asserting afterwards until the kernel accepts the value.
+        // with a short backoff inside this dispatch; whatever still refuses
+        // goes into the enforcement queue and is re-written on every loop
+        // tick until the kernel accepts it — never a rollback, never a
+        // failed dispatch, and the watchdog/audit keeps watching too.
         let ceiling = base.join("scaling_max_freq");
         let mut observed_max = util::read_trimmed(&ceiling)?;
         for delay in [15, 30, 60, 120] {
@@ -770,10 +823,14 @@ impl Scheduler {
             observed_max = util::read_trimmed(&ceiling)?;
         }
         if !frequency_ceiling_matches(&observed_max, &effective_max) {
-            tolerated.push((
-                ceiling.clone(),
-                format!("policy{policy} 上限保持 {observed_max}（请求 {effective_max} 被系统服务占用）"),
-            ));
+            let target = effective_max.clone();
+            if !self
+                .pending_enforcement
+                .iter()
+                .any(|(path, value)| *path == ceiling && *value == target)
+            {
+                self.pending_enforcement.push((ceiling.clone(), target));
+            }
         }
         let observed_governor = util::read_trimmed(base.join("scaling_governor"))?;
         if observed_governor != governor {
