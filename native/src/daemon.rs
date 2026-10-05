@@ -155,26 +155,26 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     };
     scheduler.set_extreme_powersave(options.extreme_powersave());
     scheduler.set_smooth_powersave(options.smooth_powersave());
-    if let Err(error) = if scene.controls_locked() {
-        Ok(())
+    // A failed first dispatch must not kill the daemon. Vendor frequency
+    // managers race the first ceiling write at boot, and exiting here turned
+    // one rejected write into a dead module once the supervisor gave up.
+    // Degrade instead: the tick loop retries every 5 s and the WebUI stays
+    // connected with the honest error, so the user can self-recover.
+    let mut last_apply_error = if scene.controls_locked() {
+        String::new()
     } else {
-        scheduler.initialize(&default_mode)
-    } {
-        logger.error(format!("首次下发失败，开始自动回滚: {error}"));
-        if let Err(e) = snapshot.restore() {
-            logger.error(format!("启动回滚失败: {e}"));
+        match scheduler.initialize(&default_mode) {
+            Ok(()) => String::new(),
+            Err(error) => {
+                logger.error(format!("首次策略下发失败，转入降级重试: {error}"));
+                error
+            }
         }
-        return startup_fail(&logger, state_dir, "首次策略下发", error);
-    }
-    if let Err(error) = if scene.controls_locked() {
-        Ok(())
-    } else {
-        app_modes.write_current_mode(&default_mode)
-    } {
-        if let Err(e) = snapshot.restore() {
-            logger.error(format!("启动回滚失败: {e}"));
+    };
+    if last_apply_error.is_empty() {
+        if let Err(error) = app_modes.write_current_mode(&default_mode) {
+            logger.error(format!("写入初始模式失败，等待循环重试: {error}"));
         }
-        return startup_fail(&logger, state_dir, "写入初始模式", error);
     }
 
     let runtime = RuntimeState::default();
@@ -228,7 +228,6 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     logger.info(watcher.describe());
     let mut last_status = String::new();
     let mut status_written = Instant::now();
-    let mut last_apply_error = String::new();
     let mut retry_at = Instant::now();
     let mut suspended = scene.controls_locked();
     let mut first_scan = true;

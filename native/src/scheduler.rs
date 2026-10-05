@@ -691,7 +691,19 @@ impl Scheduler {
         if util::read_trimmed(base.join("scaling_governor"))? != governor {
             self.required_write(base.join("scaling_governor"), governor)?;
         }
-        let observed_max = util::read_trimmed(base.join("scaling_max_freq"))?;
+        // A vendor thermal/perf service can rewrite the ceiling between our
+        // write and the readback, especially right after boot. Re-assert
+        // briefly before reporting; the degraded retry loop handles the rest.
+        let ceiling = base.join("scaling_max_freq");
+        let mut observed_max = util::read_trimmed(&ceiling)?;
+        for _ in 0..2 {
+            if frequency_ceiling_matches(&observed_max, &effective_max) {
+                break;
+            }
+            util::sleep(Duration::from_millis(15));
+            self.required_write(base.join("scaling_max_freq"), &effective_max)?;
+            observed_max = util::read_trimmed(&ceiling)?;
+        }
         if !frequency_ceiling_matches(&observed_max, &effective_max) {
             return Err(format!(
                 "CPU policy{policy} 上限未按请求生效: 请求={effective_max} 读回={observed_max}"
