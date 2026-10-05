@@ -1,6 +1,6 @@
 id=NovaSched_Zen_Edition
 name=NovaSched Zen Edition
-version=v1.0.4
-versionCode=225
+version=v1.0.5
+versionCode=226
 author=ZenJooo
 description=骁龙旗舰调度模块。自动识别处理器和 CPU 频率范围，提供省电、均衡、性能、极速四档，支持应用单独设置、Scene 联动和节点恢复。升级保留手动参数，安装后重启生效。

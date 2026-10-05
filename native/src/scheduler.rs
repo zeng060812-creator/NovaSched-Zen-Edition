@@ -292,20 +292,27 @@ impl Scheduler {
         self.apply_mode_cpuset(power_kind)?;
         self.apply_mode_power_limits(power_kind)?;
         let drift = mismatched_controls(&expected)?;
-        // An unaccepted ceiling is queued for background enforcement (written
-        // every tick until it sticks) instead of rolling back the dispatch —
-        // every other control that did stick must survive. Only drift outside
-        // that queue is a hard failure.
-        let hard: Vec<String> = drift
-            .iter()
-            .filter(|line| {
-                !self
+        // The per-cluster readbacks and this final sweep are separate reads:
+        // a vendor service rewriting a ceiling in between used to fail the
+        // whole dispatch and roll back. Ceiling drift is enforcement work,
+        // not a failure — queue it; only semantic controls (governor) and
+        // non-frequency drift stay hard errors.
+        let mut hard = Vec::new();
+        for item in drift {
+            let ceiling = item.path.file_name().and_then(|v| v.to_str()) == Some("scaling_max_freq");
+            if ceiling {
+                if !self
                     .pending_enforcement
                     .iter()
-                    .any(|(path, _)| line.starts_with(&*path.to_string_lossy()))
-            })
-            .cloned()
-            .collect();
+                    .any(|(path, value)| *path == item.path && *value == item.expected)
+                {
+                    self.pending_enforcement
+                        .push((item.path.clone(), item.expected.clone()));
+                }
+            } else {
+                hard.push(item.describe());
+            }
+        }
         if !hard.is_empty() {
             return Err(format!("下发后关键节点读回不一致: {}", hard.join("；")));
         }
@@ -337,25 +344,28 @@ impl Scheduler {
             self.open_drift = None;
             return Ok(false);
         }
-        // Drift that is already queued for per-tick background enforcement is
-        // handled silently by enforce_pending; auditing it again would only
-        // duplicate logs and force a redundant full re-apply.
-        let pending_only = drift.iter().all(|line| {
-            self.pending_enforcement
-                .iter()
-                .any(|(path, _)| line.starts_with(&*path.to_string_lossy()))
+        // Ceiling drift is queued enforcement work handled silently by
+        // enforce_pending every tick; only drift the queue cannot cover
+        // (governor, cpuset, uclamp) warrants a repair pass here.
+        let described: Vec<String> = drift.iter().map(|item| item.describe()).collect();
+        let pending_only = drift.iter().all(|item| {
+            item.path.file_name().and_then(|v| v.to_str()) == Some("scaling_max_freq")
+                && self
+                    .pending_enforcement
+                    .iter()
+                    .any(|(path, value)| *path == item.path && *value == item.expected)
         });
         if pending_only {
-            self.open_drift = Some(drift);
+            self.open_drift = Some(described);
             return Ok(false);
         }
-        if self.open_drift.as_ref() == Some(&drift) {
+        if self.open_drift.as_ref() == Some(&described) {
             // The same divergence already failed a repair; keep re-asserting
             // quietly instead of spamming the log every audit cycle.
             return Ok(false);
         }
         self.logger
-            .warn(format!("检测到节点漂移: {}", drift.join("；")));
+            .warn(format!("检测到节点漂移: {}", described.join("；")));
         let package = self.current_package.clone();
         let mode = self.current_mode.clone();
         let snapshot = self.snapshot.clone();
@@ -367,9 +377,11 @@ impl Scheduler {
             self.logger.info("检测到漂移已纠正（关键节点读回一致）");
             None
         } else {
-            self.logger
-                .warn(format!("部分节点仍未生效，持续重试: {}", remaining.join("；")));
-            Some(remaining)
+            self.logger.warn(format!(
+                "部分节点仍未生效，持续重试: {}",
+                remaining.iter().map(|item| item.describe()).collect::<Vec<_>>().join("；")
+            ));
+            Some(remaining.iter().map(|item| item.describe()).collect())
         };
         Ok(self.open_drift.is_none())
     }
@@ -1216,7 +1228,26 @@ struct ExpectedControl {
     comparison: ControlKind,
 }
 
-fn mismatched_controls(controls: &[ExpectedControl]) -> Result<Vec<String>> {
+/// A control whose readback does not match the requested value. Ceilings are
+/// queued for background enforcement instead of failing the dispatch.
+struct Drift {
+    path: PathBuf,
+    expected: String,
+    actual: String,
+}
+
+impl Drift {
+    fn describe(&self) -> String {
+        format!(
+            "{} 期望={} 实际={}",
+            self.path.display(),
+            self.expected.trim(),
+            self.actual
+        )
+    }
+}
+
+fn mismatched_controls(controls: &[ExpectedControl]) -> Result<Vec<Drift>> {
     let mut drift = Vec::new();
     for control in controls {
         let actual =
@@ -1235,11 +1266,11 @@ fn mismatched_controls(controls: &[ExpectedControl]) -> Result<Vec<String>> {
             ControlKind::Text => actual == control.value.trim(),
         };
         if !matches {
-            drift.push(format!(
-                "{} 期望={} 实际={actual}",
-                control.path.display(),
-                control.value.trim()
-            ));
+            drift.push(Drift {
+                path: control.path.clone(),
+                expected: control.value.clone(),
+                actual,
+            });
         }
     }
     Ok(drift)
