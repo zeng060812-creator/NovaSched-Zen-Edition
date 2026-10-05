@@ -9,15 +9,45 @@ LAYOUTS = {
     'SM8550': [0, 3, 7, -1], 'SM8650': [0, 2, 5, 7],
     'SM8750': [0, 6, -1, -1], 'SM8850': [0, 6, -1, -1],
 }
-# Per-SoC mode refinements over the shared defaults. Percentages are resolved
-# against each cluster's physical max frequency on the device.
+# Per-SoC mode floors over the shared defaults. Slot order follows LAYOUTS
+# (c0..c3 = the listed policy anchors, little/efficiency first, prime last);
+# percentages resolve against each cluster's physical max on the device.
+# Powersave/balance stay shared everywhere: percent ceilings plus per-device
+# frequency tables already adapt them, and daily battery profile is sacred.
 MODE_OVERRIDES = {
-    # 8 Gen 3: hold the prime and big clusters near their efficient knees in
-    # fast mode so game frametimes stop re-ramping from deep idle; powersave
-    # keeps the stock low-power daily profile untouched.
+    # 8 Gen 1 / 8+ Gen 1: c0=4xA510 little, c1=3xA710 big, c2=X1/X2 prime.
+    # A710 runs hot; floors stay moderate so fast mode helps frametimes
+    # without cooking the older silicon.
+    'SM8450': {
+        'performance': {'min': ['20%', '25%', '25%', '0%']},
+        'fast': {'min': ['30%', '40%', '45%', '0%']},
+    },
+    'SM8475': {
+        'performance': {'min': ['20%', '25%', '25%', '0%']},
+        'fast': {'min': ['30%', '40%', '45%', '0%']},
+    },
+    # 8 Gen 2: c0=3xA520 little, c1=4xA715/A710 big, c2=X3 prime.
+    'SM8550': {
+        'performance': {'min': ['20%', '25%', '25%', '0%']},
+        'fast': {'min': ['35%', '45%', '50%', '0%']},
+    },
+    # 8 Gen 3: c0=2xA520 little, c1=3xA720@3.0 mid, c2=2xA720@3.2 big,
+    # c3=X4@3.3 prime. Prime gets the highest floor (X4 55% ~ 1.8GHz) so
+    # game main threads stop re-ramping from deep idle; little stays low
+    # to keep background work cheap.
     'SM8650': {
-        'performance': {'min': ['25%', '25%', '20%', '15%']},
-        'fast': {'min': ['55%', '50%', '40%', '35%']},
+        'performance': {'min': ['15%', '20%', '25%', '25%']},
+        'fast': {'min': ['30%', '40%', '50%', '55%']},
+    },
+    # 8 Elite / 8 Elite Gen 5: c0=6x Oryon efficiency, c1=Oryon prime.
+    # Two wide dynamic clocks; 45% keeps the ~4.3GHz prime near 1.9GHz.
+    'SM8750': {
+        'performance': {'min': ['15%', '20%', '0%', '0%']},
+        'fast': {'min': ['35%', '45%', '0%', '0%']},
+    },
+    'SM8850': {
+        'performance': {'min': ['15%', '20%', '0%', '0%']},
+        'fast': {'min': ['35%', '45%', '0%', '0%']},
     },
 }
 
@@ -37,7 +67,7 @@ def profile(soc, policies):
             modes[name][key] = [values[i] if p >= 0 else '0' for i, p in enumerate(policies)]
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 226,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 227,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': {
