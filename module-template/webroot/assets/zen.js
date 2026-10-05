@@ -1,4 +1,4 @@
-/* NovaSched Zen UI v0.2.18-rc2.
+/* NovaSched Zen UI v0.2.18-rc3.
  * Original Web implementation; the Rust command protocol is unchanged.
  * Rendering never equates sending a command with successful application.
  */
@@ -69,7 +69,7 @@
   const icon = (name) => `<svg class="icon" aria-hidden="true"><use href="#i-${esc(name)}"/></svg>`;
   const basePackage = (raw) => String(raw || "").split(":", 1)[0];
   const validPackage = (raw) => typeof raw === "string" && raw.length <= 255 && /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+(?::[A-Za-z0-9_.]+)?$/.test(raw);
-  const editable = (kind = "") => s.online && !s.external && (!s.linked || kind === "smooth" || kind === "extreme");
+  const editable = () => s.online && !s.external;
   const present = (id, text) => { const node = $(id); if (node && node.textContent !== String(text)) node.textContent = String(text); };
   function saveUI() { try { localStorage.setItem(STORAGE, JSON.stringify(ui)); } catch (_) {} }
 
@@ -183,7 +183,7 @@
   function sourceLabel() {
     if (!s.online) return "等待本地服务";
     if (s.external) return "Scene 外部调度器";
-    if (s.linked) return "Scene 接管";
+    if (s.linked) return "Scene 联动";
     return "WebUI 接管";
   }
   const connectionAddress = () => s.discovered ? (s.transport === "root" ? "宿主 root 通道" : `${s.host}:${s.port}`) : "从管理器读取本机服务";
@@ -214,7 +214,7 @@
     $("#current-rule").disabled = !editable() || !active || !!s.pending;
     const currentRule = s.rules.find(rule => rule.package === a.base);
     present("#current-rule-note", currentRule ? `${MODES[currentRule.mode]?.name || "未知"}档 · 点按编辑` : "使用单独的运行档位");
-    present("#profile-hint", !s.online ? "连接后可切换" : s.external || s.linked ? "Scene 接管 · 请在 Scene 切档" : s.pending?.kind === "mode" ? "等待实际反馈" : "高亮为实际生效档位");
+    present("#profile-hint", !s.online ? "连接后可切换" : s.external ? "Scene 外部调度器接管 · 请在 Scene 切档" : s.pending?.kind === "mode" ? "等待实际反馈" : s.linked ? "与 Scene 双向同步" : "高亮为实际生效档位");
     $$(".profile").forEach(button => {
       const actual = s.online && !s.external && button.dataset.mode === s.effective;
       const pending = s.pending?.kind === "mode" && s.pending.value === button.dataset.mode;
@@ -225,8 +225,8 @@
       $(".profile-caption", button).textContent = pending ? "提交中…" : actual ? s.phase === "ready" ? "当前生效" : "最后成功档位" : ({ powersave:"续航优先", balance:"日常默认", performance:"响应优先", fast:"游戏与重负载" })[button.dataset.mode];
     });
     present("#source-title", sourceLabel());
-    present("#source-note", !s.online ? "连接后显示当前控制来源" : s.external ? "切换档位和修改规则暂不可用" : s.linked ? "Scene 控制档位与应用规则，NovaSched 执行调度" : "本地默认档位与应用规则共同生效");
-    present("#rules-context", !s.online ? "连接后可以编辑；已经读取的规则仍可查看。" : s.external ? "外部 Scene 调度器接管中，规则当前只读。" : s.linked ? "应用规则由 Scene 管理，请在 Scene 中修改。" : "应用进入前台时，使用对应档位；其余沿用默认档位。");
+    present("#source-note", !s.online ? "连接后显示当前控制来源" : s.external ? "切换档位和修改规则暂不可用" : s.linked ? "档位与应用规则与 Scene 双向同步，两侧修改即时生效" : "本地默认档位与应用规则共同生效");
+    present("#rules-context", !s.online ? "连接后可以编辑；已经读取的规则仍可查看。" : s.external ? "外部 Scene 调度器接管中，规则当前只读。" : s.linked ? "应用规则与 Scene 双向同步；在本页或 Scene 修改都会同步到另一侧。" : "应用进入前台时，使用对应档位；其余沿用默认档位。");
     $("#add-rule").disabled = !editable() || !!s.pending;
     for (const name of ["smooth", "extreme"]) {
       const field = $("#" + name + "-save");
@@ -241,8 +241,8 @@
     present("#processor-tag", s.online && s.socId ? s.socId : "自动识别");
     present("#service-state", s.online ? "已连接" : s.connecting ? "连接中" : "离线");
     present("#diagnostics-summary", s.online && s.error ? "检测到下发错误 · 点按查看" : "真实状态、错误与只读诊断");
-    present("#build-version", s.version ? "v" + s.version.replace(/^v/, "") : "v0.2.18-rc2");
-    present("#footer-version", (s.version ? "v" + s.version.replace(/^v/, "") : "v0.2.18-rc2") + " · ZenJooo");
+    present("#build-version", s.version ? "v" + s.version.replace(/^v/, "") : "v0.2.18-rc3");
+    present("#footer-version", (s.version ? "v" + s.version.replace(/^v/, "") : "v0.2.18-rc3") + " · ZenJooo");
     renderRules(); renderSheetLive();
   }
   function emptyState(title, description, symbol = "apps", button = "") {
@@ -609,8 +609,7 @@
     } catch (_) { toast("应用规则数据无法解析，请重连后再试"); }
   }
   function send(kind, message) {
-    const preference = message.startsWith("smooth\t") ? "smooth" : message.startsWith("extreme\t") ? "extreme" : "";
-    if (!editable(preference)) { toast(s.external || s.linked ? "Scene 接管期间，请在 Scene 中切档或修改规则" : "请先连接本地守护进程"); return false; }
+    if (!editable()) { toast(s.external ? "Scene 外部调度器接管中，请先在 Scene 停用它的调度" : "请先连接本地守护进程"); return false; }
     if (s.transport === "root") {
       const epoch = s.epoch, generation = ++s.rootGeneration;
       clearTimeout(s.rootTimer);
@@ -646,7 +645,7 @@
   function confirmPending() {
     const p = s.pending;
     if (!p) return;
-    if (s.external || (s.linked && p.kind !== "smooth" && p.kind !== "extreme")) return finishPending(false, "Scene 已接管，操作结果请在 Scene 中确认");
+    if (s.external) return finishPending(false, "Scene 外部调度器接管中，档位请以 Scene 为准");
     if (!s.online) return;
     if (p.kind === "mode") {
       if (s.phase === "degraded" && s.mode === p.value) return finishPending(false, s.error || "策略下发失败，已保留最后成功档位");
@@ -711,7 +710,7 @@
     $("#open-diagnostics").onclick = showDiagnostics;
   }
   function showSource() {
-    openSheet("source", "控制来源", "规则如何生效", `<dl class="detail-list">${detailRow("当前来源",sourceLabel(),"detail-source")}${detailRow("默认档位",MODES[s.mode]?.name || "等待连接","detail-default")}${detailRow("实际档位",s.online ? s.external ? "由外部调度器控制" : MODES[s.effective]?.name || "等待确认" : "等待连接","detail-effective")}</dl><p>${s.external ? "Scene 当前选用其他调度器。NovaSched 暂停节点写入，本页切档与规则编辑保持只读。" : s.linked ? "Scene 已使用 NovaSched 回调：四档和应用规则由 Scene 管理，Rust 守护进程负责执行；本页显示实际档位，切档和规则编辑保持只读。Scene 的统计和采样仍由 Scene 自己完成。" : "应用专属规则优先于默认档位。点击概览的档位会更新默认选择；命中应用规则时，实际档位可能暂时不同。"}</p>`);
+    openSheet("source", "控制来源", "规则如何生效", `<dl class="detail-list">${detailRow("当前来源",sourceLabel(),"detail-source")}${detailRow("默认档位",MODES[s.mode]?.name || "等待连接","detail-default")}${detailRow("实际档位",s.online ? s.external ? "由外部调度器控制" : MODES[s.effective]?.name || "等待确认" : "等待连接","detail-effective")}</dl><p>${s.external ? "Scene 当前选用其他调度器。NovaSched 暂停节点写入，本页切档与规则编辑保持只读。" : s.linked ? "Scene 已接入 NovaSched 回调：调度执行由 Rust 守护进程完成，档位和应用规则在 Scene 与本页之间双向同步，任意一侧修改都会即时生效。Scene 的统计和采样仍由 Scene 自己完成。" : "应用专属规则优先于默认档位。点击概览的档位会更新默认选择；命中应用规则时，实际档位可能暂时不同。"}</p>`);
   }
   function renderSheetLive() {
     if (s.sheet === "connection") {
@@ -726,7 +725,7 @@
     if (s.sheet === "rule") {
       const lock = !editable() || !!s.pending;
       $$("#rule-editor input,#rule-editor button").forEach(node => { node.disabled = lock; });
-      const note = $("#rule-lock"); if (note) { note.hidden = editable(); note.textContent = s.external || s.linked ? "Scene 接管中，请在 Scene 中修改规则。" : "当前离线，输入会保留；重连后可保存。"; }
+      const note = $("#rule-lock"); if (note) { note.hidden = editable(); note.textContent = s.external ? "Scene 外部调度器接管中，规则暂不可修改。" : "当前离线，输入会保留；重连后可保存。"; }
       const save = $("#rule-save"); if (save) save.textContent = s.pending?.kind === "rule" ? "保存中…" : "保存应用规则";
       const remove = $("#rule-delete"); if (remove) remove.disabled = lock;
     }
@@ -801,7 +800,7 @@
     $$("[data-theme-choice]").forEach(button => button.onclick = () => { ui.theme = button.dataset.themeChoice; saveUI(); applyAppearance(); closeSheet(); toast("外观已切换为" + THEME_NAMES[ui.theme]); });
   }
   function showAbout() {
-    openSheet("about","NovaSched Zen Edition","作者 ZenJooo", `<dl class="detail-list">${detailRow("模块版本",s.version ? "v" + s.version.replace(/^v/,"") : "未连接")}${detailRow("界面版本","0.2.18-rc2")}${detailRow("当前处理器",s.online ? s.soc || "待识别" : "未连接")}${detailRow("配置文件",s.online ? s.configProfile || "待识别" : "未连接")}${detailRow("配置格式","NovaSched 2")}${detailRow("许可证","GPL-3.0-only")}</dl><p>按处理器和内核能力映射 CPU 策略，支持应用单独设置和 Scene 联动。流畅省电与极限节能默认关闭。</p><p class="sheet-caption">覆盖安装后请重启，让新的调度核心生效。开源许可与图标授权见模块内 NOTICE。</p>`);
+    openSheet("about","NovaSched Zen Edition","作者 ZenJooo", `<dl class="detail-list">${detailRow("模块版本",s.version ? "v" + s.version.replace(/^v/,"") : "未连接")}${detailRow("界面版本","0.2.18-rc3")}${detailRow("当前处理器",s.online ? s.soc || "待识别" : "未连接")}${detailRow("配置文件",s.online ? s.configProfile || "待识别" : "未连接")}${detailRow("配置格式","NovaSched 2")}${detailRow("许可证","GPL-3.0-only")}</dl><p>按处理器和内核能力映射 CPU 策略，支持应用单独设置和 Scene 联动。流畅省电与极限节能默认关闭。</p><p class="sheet-caption">覆盖安装后请重启，让新的调度核心生效。开源许可与图标授权见模块内 NOTICE。</p>`);
   }
   function rootExec(command, timeout = 12000, negotiate = true) {
     return new Promise((resolve,reject) => {

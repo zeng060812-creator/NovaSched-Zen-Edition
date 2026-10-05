@@ -31,7 +31,7 @@ function harness({noMetadata=false, noExec=false, port=31415, cachedPort=port, t
     'org.example.adversarial': '<img src=x onerror=alert(1)>',
   };
   let state={mode:'balance',effective:'balance',package:'org.example.photoalbum',controller:'WebUI',sceneActive:'false',sceneLinked:'false',phase:'ready',heartbeatMs:'0',port:String(port),extremePowerSave:'false',smoothPowerSave:'false',powerSaveProfile:''};
-  let app={type:'app-modes',rules:[],defaultMode:'balance',currentPackage:state.package,effectiveMode:'balance',controller:'WebUI',locked:false,sceneAvailable:false,sceneLinked:false,phase:'ready',error:'',version:'0.2.18-rc2',port,extremePowerSave:false,smoothPowerSave:false,powerSaveProfile:''};
+  let app={type:'app-modes',rules:[],defaultMode:'balance',currentPackage:state.package,effectiveMode:'balance',controller:'WebUI',locked:false,sceneAvailable:false,sceneLinked:false,phase:'ready',error:'',version:'0.2.18-rc3',port,extremePowerSave:false,smoothPowerSave:false,powerSaveProfile:''};
   const setTimer = (fn,ms=0) => {timers.set(++next,{fn,at:now+ms});return next;};
   const clearTimer = id => timers.delete(id);
   const advance = ms => {
@@ -196,16 +196,20 @@ check('leaving logs unsubscribes and saves background work',()=>assert.equal(log
 status({sceneActive:'true',phase:'suspended'});apps({locked:true,sceneAvailable:true});
 check('external Scene owns controls and locks all scheduler mutation',()=>{assert([...h.document.querySelectorAll('.profile')].every(x=>x.disabled));assert.equal(el('#smooth-save').disabled,true);assert.equal(el('#extreme-save').disabled,true);assert.equal(el('#add-rule').disabled,true);assert.equal(el('#active-mode').textContent,'外部控制');});
 status({sceneActive:'false',sceneLinked:'true',phase:'ready'});apps({locked:false,sceneAvailable:false,sceneLinked:true});
-check('Scene-linked NovaSched is distinct from external takeover',()=>{
-  assert.equal(el('#source-title').textContent,'Scene 接管');
+check('Scene-linked NovaSched stays editable and is distinct from external takeover',()=>{
+  assert.equal(el('#source-title').textContent,'Scene 联动');
   assert.equal(el('#smooth-save').disabled,false);
-  assert([...h.document.querySelectorAll('.profile')].every(x=>x.disabled));
-  assert.equal(el('#add-rule').disabled,true);
+  assert([...h.document.querySelectorAll('.profile')].every(x=>!x.disabled));
+  assert.equal(el('#add-rule').disabled,false);
   assert.equal(el('#active-mode').textContent,'省电');
 });
-check('Scene owns profiles while module energy preferences remain independent',()=>{
+check('linked mode sends profile requests both ways and keeps energy preferences independent',()=>{
   const count=h.live('/modes').messages.length;click('.profile[data-mode=fast]');
-  assert.equal(h.live('/modes').messages.length,count);
+  assert.equal(h.live('/modes').messages.at(-1),'fast');
+  assert.equal(h.live('/modes').messages.length,count+1);
+  status({mode:'fast',effective:'fast'});
+  check('linked profile request confirms through the normal heartbeat',()=>{assert.equal(el('.profile[data-mode=fast]').getAttribute('aria-pressed'),'true');assert.match(el('#mode-feedback').textContent,/已生效/);});
+  status({mode:'balance',effective:'balance'});apps({defaultMode:'balance'});
   el('#smooth-save').checked=false;el('#smooth-save').onchange({target:el('#smooth-save')});
   assert.equal(h.live('/modes').messages.at(-1),'smooth\t0');
   status({smoothPowerSave:'false'});
@@ -449,16 +453,20 @@ check('delayed rules frames cannot resurrect Scene ownership after unlink',()=>{
   assert([...staleScene.document.querySelectorAll('.profile')].every(node=>!node.disabled));
 });
 staleScene.status({controller:'Scene（NovaSched Zen Edition）',sceneLinked:'true'});
-check('a fresh Scene installation immediately owns controls again',()=>{
-  assert.equal(staleScene.el('#source-title').textContent,'Scene 接管');
-  assert([...staleScene.document.querySelectorAll('.profile')].every(node=>node.disabled));
-  assert.equal(staleScene.el('#add-rule').disabled,true);
+check('a fresh Scene link resumes two-way editing immediately',()=>{
+  assert.equal(staleScene.el('#source-title').textContent,'Scene 联动');
+  assert([...staleScene.document.querySelectorAll('.profile')].every(node=>!node.disabled));
+  assert.equal(staleScene.el('#add-rule').disabled,false);
 });
 const switchingController=harness();switchingController.connect();switchingController.click('.profile[data-mode=fast]');
 switchingController.status({sceneLinked:'true',controller:'Scene（NovaSched Zen Edition）'});
-check('Scene taking control cancels a pending local profile request',()=>{
-  assert.match(switchingController.el('#mode-feedback').textContent,/Scene 已接管/);
-  assert(!switchingController.el('.profile[data-mode=fast]').classList.contains('is-pending'));
+check('a pending profile request survives Scene linking',()=>{
+  assert(switchingController.el('.profile[data-mode=fast]').classList.contains('is-pending'));
+});
+switchingController.status({mode:'fast',effective:'fast'});
+check('linked confirmation completes the pending profile request',()=>{
+  assert.equal(switchingController.el('#active-mode').textContent,'极速');
+  assert.match(switchingController.el('#mode-feedback').textContent,/已生效/);
 });
 const misreportedRpc=harness({rpc:true,rpcErrno:1});misreportedRpc.live('/modes').fail();await flush();
 check('root bridge snapshots are honored despite a bridge-reported nonzero exit code',()=>{

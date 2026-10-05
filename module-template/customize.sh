@@ -2,7 +2,7 @@
 
 SKIPUNZIP=0
 
- ui_print "- NovaSched Zen Edition v0.2.18-rc2"
+ ui_print "- NovaSched Zen Edition v0.2.18-rc3"
 ui_print "- 作者：ZenJooo"
 ui_print "- 骁龙 8 Gen 1 / 8+ Gen 1 / 8 Gen 2 / 8 Gen 3 / 8 Elite / 8 Elite Gen 5"
 ui_print "- 按处理器与内核能力校验，不限制手机品牌或机型"

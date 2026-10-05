@@ -1,6 +1,6 @@
 [package]
 name = "novasched_zen"
-version = "0.2.18-rc2"
+version = "0.2.18-rc3"
 edition = "2021"
 rust-version = "1.75"
 authors = ["ZenJooo"]

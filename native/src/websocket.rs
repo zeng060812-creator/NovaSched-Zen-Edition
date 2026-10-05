@@ -90,14 +90,16 @@ impl RuntimeState {
         self.inner.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
-    fn webui_allows_message(&self, message: &str) -> bool {
+    fn webui_allows_message(&self, _message: &str) -> bool {
         self.inner
             .lock()
             .map(|v| {
+                // A foreign scheduler owns the node writers, so nothing flows.
+                // Linked mode is two-way: WebUI edits reach Scene's
+                // powercfg.xml through AppModes.sync_scene_rules, while
+                // Scene's own switches return through the watched XML and
+                // the scene-mode request file. Last writer wins on both ends.
                 !v.scene_active
-                    && (!v.scene_linked
-                        || message.starts_with("smooth\t")
-                        || message.starts_with("extreme\t"))
             })
             .unwrap_or(false)
     }
@@ -523,7 +525,7 @@ fn payload(state: &WebState, app_endpoint: bool) -> String {
     format!(
         "{{\"type\":\"app-modes\",\"defaultMode\":\"{}\",\"currentPackage\":\"{}\",\"effectiveMode\":\"{}\",\"controller\":\"{}\",\"sceneAvailable\":{},\"sceneLinked\":{},\"locked\":{},\"rules\":[{}],\"revision\":{},\"phase\":\"{}\",\"error\":\"{}\",\"version\":\"{}\",\"port\":{},\"extremePowerSave\":{},\"smoothPowerSave\":{},\"powerSaveProfile\":\"{}\",\"socName\":\"{}\",\"socId\":\"{}\",\"configProfile\":\"{}\",\"extremeSupported\":{},\"smoothSupported\":{}}}",
         json_escape(&default), json_escape(&runtime.package), json_escape(&runtime.effective_mode), json_escape(&runtime.controller),
-        runtime.scene_active || runtime.scene_linked, runtime.scene_linked, runtime.scene_active || runtime.scene_linked, rules,
+        runtime.scene_active || runtime.scene_linked, runtime.scene_linked, runtime.scene_active, rules,
         state.revision.load(Ordering::Relaxed),
         json_escape(&runtime.phase),json_escape(&runtime.error),env!("CARGO_PKG_VERSION"),
         runtime.port,state.options.extreme_powersave(),state.options.smooth_powersave(),json_escape(&runtime.power_profile),
@@ -869,7 +871,7 @@ fn read_server_text(stream: &mut TcpStream) -> Result<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn scene_owns_webui_profiles_and_rules_but_not_module_energy_preferences() {
+    fn linked_scene_syncs_webui_mode_and_rule_messages_while_foreign_blocks_all() {
         let runtime = super::RuntimeState::default();
         runtime.set("com.test.app", "balance", "Scene", false, true);
         for message in [
@@ -877,16 +879,21 @@ mod tests {
             "powersave",
             "set\tcom.test.app\tfast",
             "delete\tcom.test.app",
+            "smooth\t1",
+            "extreme\t0",
         ] {
-            assert!(!runtime.webui_allows_message(message));
+            assert!(
+                runtime.webui_allows_message(message),
+                "linked must stay editable: {message}"
+            );
         }
-        assert!(runtime.webui_allows_message("smooth\t1"));
-        assert!(runtime.webui_allows_message("extreme\t0"));
         runtime.set("com.test.app", "balance", "WebUI", false, false);
         assert!(runtime.webui_allows_message("fast"));
         assert!(runtime.webui_allows_message("set\tcom.test.app\tfast"));
         runtime.set("com.test.app", "", "Scene foreign", true, false);
-        assert!(!runtime.webui_allows_message("smooth\t1"));
+        for message in ["smooth\t1", "fast", "set\tcom.test.app\tfast"] {
+            assert!(!runtime.webui_allows_message(message));
+        }
     }
     use super::*;
 
