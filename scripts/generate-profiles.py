@@ -9,6 +9,17 @@ LAYOUTS = {
     'SM8550': [0, 3, 7, -1], 'SM8650': [0, 2, 5, 7],
     'SM8750': [0, 6, -1, -1], 'SM8850': [0, 6, -1, -1],
 }
+# Per-SoC mode refinements over the shared defaults. Percentages are resolved
+# against each cluster's physical max frequency on the device.
+MODE_OVERRIDES = {
+    # 8 Gen 3: hold the prime and big clusters near their efficient knees in
+    # fast mode so game frametimes stop re-ramping from deep idle; powersave
+    # keeps the stock low-power daily profile untouched.
+    'SM8650': {
+        'performance': {'min': ['25%', '25%', '20%', '15%']},
+        'fast': {'min': ['55%', '50%', '40%', '35%']},
+    },
+}
 
 def profile(soc, policies):
     def slots(value):
@@ -21,9 +32,12 @@ def profile(soc, policies):
             'governors': ['auto' if p >= 0 else '' for p in policies],
             'params': [{}, {}, {}, {}], 'online': [True] * 8,
         }
+    for name, fields in MODE_OVERRIDES.get(soc, {}).items():
+        for key, values in fields.items():
+            modes[name][key] = [values[i] if p >= 0 else '0' for i, p in enumerate(policies)]
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 218,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 219,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': {
@@ -50,9 +64,10 @@ def generate(check=False):
         path = ROOT / 'module-template/config' / (soc + '.json')
         text = json.dumps(profile(soc, policies), ensure_ascii=False, indent=2) + '\n'
         if check:
-            assert path.read_text() == text, f'{path.name} differs from generated defaults'
+            assert path.read_bytes() == text.encode('utf-8'), f'{path.name} differs from generated defaults'
         else:
-            path.write_text(text)
+            # Write bytes so Windows hosts keep the LF endings Android expects.
+            path.write_bytes(text.encode('utf-8'))
     print('Six NovaSched profiles verified' if check else 'Six NovaSched profiles generated')
 
 if __name__ == '__main__':
