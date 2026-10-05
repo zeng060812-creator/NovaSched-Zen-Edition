@@ -352,8 +352,9 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         let option_changed = scheduler.set_extreme_powersave(options.extreme_powersave());
         let smooth_changed = scheduler.set_smooth_powersave(options.smooth_powersave());
         // Re-write ceilings that a vendor service refused until they stick.
-        // Cheap when the queue is empty; revision bump refreshes the WebUI.
-        if scheduler.enforce_pending() {
+        // Cheap when the queue is empty; skipped while a foreign scheduler
+        // owns the nodes, and its queue is dropped to avoid write wars.
+        if !scene.controls_locked() && scheduler.enforce_pending() {
             revision.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -406,6 +407,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             || smooth_changed;
         if scene.controls_locked() {
             suspended = true;
+            scheduler.clear_pending();
             runtime.set(&package, "", scene.controller(), true, false);
             runtime.tick("suspended", "其它 Scene 调度器已接管，NovaSched 暂停下发");
         } else if Instant::now() >= retry_at || force_apply {
@@ -473,7 +475,14 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                 scene.controls_locked(),
                 scene.linked(),
             );
-            runtime.tick("degraded", &last_apply_error);
+            // Backoff window after an apply error: keep the honest phase
+            // instead of forcing degraded onto a healthy scheduler.
+            let phase = if last_apply_error.is_empty() {
+                "ready"
+            } else {
+                "degraded"
+            };
+            runtime.tick(phase, &last_apply_error);
         }
         if foreground.is_some() || force_apply {
             revision.fetch_add(1, Ordering::Relaxed);

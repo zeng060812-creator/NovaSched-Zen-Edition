@@ -56,12 +56,17 @@ impl Options {
     }
 
     pub fn set_extreme_powersave(&self, enabled: bool) -> Result<()> {
+        // The capability gate mirrors supports_extreme(): a shipped config
+        // caps frequencies without restricting cpuset, which the dispatcher
+        // applies gracefully. Requiring the optional top_app field here made
+        // the toggle fail on every device.
         if enabled
-            && crate::config::Config::load(Path::new(util::CONFIG_PATH))?
+            && !crate::config::Config::load(Path::new(util::CONFIG_PATH))?
                 .functions
                 .extreme_powersave
-                .cpuset_top_app
-                .is_none()
+                .max_frequencies
+                .iter()
+                .any(|value| value != "0" && value != "0%")
         {
             return Err("当前处理器配置未提供极限节能参数".into());
         }
@@ -86,12 +91,13 @@ impl Options {
     }
 
     pub fn set_smooth_powersave(&self, enabled: bool) -> Result<()> {
+        // Same as extreme: only the block itself is required; cpuset fields
+        // are optional refinements the dispatcher handles when present.
         if enabled
             && crate::config::Config::load(Path::new(util::CONFIG_PATH))?
                 .functions
                 .smooth_powersave
-                .as_ref()
-                .map_or(true, |v| v.limits.cpuset_top_app.is_none())
+                .is_none()
         {
             return Err("当前配置缺少 SmoothPowerSave，请使用本版配置".into());
         }

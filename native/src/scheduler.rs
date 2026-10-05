@@ -405,6 +405,12 @@ impl Scheduler {
         resolved
     }
 
+    /// Drops the enforcement queue; used while a foreign scheduler owns the
+    /// nodes so background re-writes never fight it.
+    pub fn clear_pending(&mut self) {
+        self.pending_enforcement.clear();
+    }
+
     /// One info line per distinct set of vendor-held ceilings, plus a
     /// positive line when the kernel finally accepts the values.
     fn report_pending(&mut self) {

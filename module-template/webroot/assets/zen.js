@@ -1,4 +1,4 @@
-/* NovaSched Zen UI v1.0.3.
+/* NovaSched Zen UI v1.0.4.
  * Original Web implementation; the Rust command protocol is unchanged.
  * Rendering never equates sending a command with successful application.
  */
@@ -241,8 +241,8 @@
     present("#processor-tag", s.online && s.socId ? s.socId : "自动识别");
     present("#service-state", s.online ? "已连接" : s.connecting ? "连接中" : "离线");
     present("#diagnostics-summary", s.online && s.error ? "检测到下发错误 · 点按查看" : "真实状态、错误与只读诊断");
-    present("#build-version", s.version ? "v" + s.version.replace(/^v/, "") : "v1.0.3");
-    present("#footer-version", (s.version ? "v" + s.version.replace(/^v/, "") : "v1.0.3") + " · ZenJooo");
+    present("#build-version", s.version ? "v" + s.version.replace(/^v/, "") : "v1.0.4");
+    present("#footer-version", (s.version ? "v" + s.version.replace(/^v/, "") : "v1.0.4") + " · ZenJooo");
     renderRules(); renderSheetLive();
   }
   function emptyState(title, description, symbol = "apps", button = "") {
@@ -800,7 +800,7 @@
     $$("[data-theme-choice]").forEach(button => button.onclick = () => { ui.theme = button.dataset.themeChoice; saveUI(); applyAppearance(); closeSheet(); toast("外观已切换为" + THEME_NAMES[ui.theme]); });
   }
   function showAbout() {
-    openSheet("about","NovaSched Zen Edition","作者 ZenJooo", `<dl class="detail-list">${detailRow("模块版本",s.version ? "v" + s.version.replace(/^v/,"") : "未连接")}${detailRow("界面版本","1.0.3")}${detailRow("当前处理器",s.online ? s.soc || "待识别" : "未连接")}${detailRow("配置文件",s.online ? s.configProfile || "待识别" : "未连接")}${detailRow("配置格式","NovaSched 2")}${detailRow("许可证","GPL-3.0-only")}</dl><p>按处理器和内核能力映射 CPU 策略，支持应用单独设置和 Scene 联动。流畅省电与极限节能默认关闭。</p><p class="sheet-caption">覆盖安装后请重启，让新的调度核心生效。开源许可与图标授权见模块内 NOTICE。</p>`);
+    openSheet("about","NovaSched Zen Edition","作者 ZenJooo", `<dl class="detail-list">${detailRow("模块版本",s.version ? "v" + s.version.replace(/^v/,"") : "未连接")}${detailRow("界面版本","1.0.4")}${detailRow("当前处理器",s.online ? s.soc || "待识别" : "未连接")}${detailRow("配置文件",s.online ? s.configProfile || "待识别" : "未连接")}${detailRow("配置格式","NovaSched 2")}${detailRow("许可证","GPL-3.0-only")}</dl><p>按处理器和内核能力映射 CPU 策略，支持应用单独设置和 Scene 联动。流畅省电与极限节能默认关闭。</p><p class="sheet-caption">覆盖安装后请重启，让新的调度核心生效。开源许可与图标授权见模块内 NOTICE。</p>`);
   }
   function rootExec(command, timeout = 12000, negotiate = true) {
     return new Promise((resolve,reject) => {
