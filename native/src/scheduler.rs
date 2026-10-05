@@ -21,6 +21,8 @@ pub struct Scheduler {
     smooth_powersave: bool,
     current_power_kind: PowerSaveKind,
     hardware: Hardware,
+    tolerated_note: String,
+    open_drift: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +92,8 @@ impl Scheduler {
             smooth_powersave: false,
             current_power_kind: PowerSaveKind::Standard,
             hardware,
+            tolerated_note: String::new(),
+            open_drift: None,
         })
     }
 
@@ -277,15 +281,30 @@ impl Scheduler {
                 self.config.functions.launch_boost.rate_limit_ms,
             ));
         }
-        self.apply_frequency(&profile)?;
+        let mut tolerated = Vec::new();
+        self.apply_frequency(&profile, &mut tolerated)?;
         self.apply_sched_params(&profile)?;
         self.apply_online(&profile)?;
         self.apply_mode_cpuset(power_kind)?;
         self.apply_mode_power_limits(power_kind)?;
         let drift = mismatched_controls(&expected)?;
-        if !drift.is_empty() {
-            return Err(format!("下发后关键节点读回不一致: {}", drift.join("；")));
+        // A ceiling a vendor service keeps overriding is recorded as tolerated
+        // (one info line, re-asserted by the watchdog) instead of failing the
+        // whole dispatch — the remaining controls still apply.
+        let hard: Vec<String> = drift
+            .iter()
+            .filter(|line| {
+                !tolerated
+                    .iter()
+                    .any(|(path, _)| line.starts_with(&*path.to_string_lossy()))
+            })
+            .cloned()
+            .collect();
+        if !hard.is_empty() {
+            return Err(format!("下发后关键节点读回不一致: {}", hard.join("；")));
         }
+        self.report_tolerated(&tolerated);
+        self.open_drift = None;
         self.expected_controls = expected;
         self.current_mode = mode.to_string();
         self.current_power_kind = power_kind;
@@ -309,6 +328,12 @@ impl Scheduler {
         }
         let drift = mismatched_controls(&self.expected_controls)?;
         if drift.is_empty() {
+            self.open_drift = None;
+            return Ok(false);
+        }
+        if self.open_drift.as_ref() == Some(&drift) {
+            // The same divergence already failed a repair; keep re-asserting
+            // quietly instead of spamming the log every audit cycle.
             return Ok(false);
         }
         self.logger
@@ -319,8 +344,39 @@ impl Scheduler {
         snapshot.apply_transaction(|| {
             self.apply_inner(&package, &mode, false, true, self.last_explicit, true)
         })?;
-        self.logger.info("检测到漂移已纠正（关键节点读回一致）");
-        Ok(true)
+        let remaining = mismatched_controls(&self.expected_controls)?;
+        self.open_drift = if remaining.is_empty() {
+            self.logger.info("检测到漂移已纠正（关键节点读回一致）");
+            None
+        } else {
+            self.logger
+                .warn(format!("部分节点仍未生效，持续重试: {}", remaining.join("；")));
+            Some(remaining)
+        };
+        Ok(self.open_drift.is_none())
+    }
+
+    /// One info line per distinct set of vendor-held ceilings, plus a
+    /// positive line when the kernel accepts the configured values again.
+    fn report_tolerated(&mut self, tolerated: &[(PathBuf, String)]) {
+        if tolerated.is_empty() {
+            if !self.tolerated_note.is_empty() {
+                self.tolerated_note.clear();
+                self.logger
+                    .info("被系统服务占用的频率上限已恢复，配置完整生效");
+            }
+            return;
+        }
+        let note = tolerated
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("；");
+        if self.tolerated_note != note {
+            self.tolerated_note = note.clone();
+            self.logger
+                .info(format!("部分频率上限被系统服务占用，守护会持续自动重申: {note}"));
+        }
     }
 
     fn node(&self, path: impl AsRef<Path>) -> PathBuf {
@@ -521,7 +577,11 @@ impl Scheduler {
         self.snapshot.capture_batch(paths, services)
     }
 
-    fn apply_frequency(&self, profile: &ModeProfile) -> Result<()> {
+    fn apply_frequency(
+        &self,
+        profile: &ModeProfile,
+        tolerated: &mut Vec<(PathBuf, String)>,
+    ) -> Result<()> {
         for cluster in 0..4 {
             let policy = self.config.policy[cluster];
             if policy < 0 {
@@ -534,6 +594,7 @@ impl Scheduler {
                 &data.min_freq,
                 &data.max_freq,
                 &data.governor,
+                tolerated,
             )?;
         }
         Ok(())
@@ -574,12 +635,14 @@ impl Scheduler {
             if policy < 0 {
                 continue;
             }
+            let mut ignored = Vec::new();
             self.write_frequency(
                 policy,
                 cluster,
                 &profile.clusters[cluster].min_freq,
                 &self.config.functions.launch_boost.frequencies[cluster],
                 &profile.clusters[cluster].governor,
+                &mut ignored,
             )?;
         }
         Ok(())
@@ -675,6 +738,7 @@ impl Scheduler {
         min: &str,
         max: &str,
         governor: &str,
+        tolerated: &mut Vec<(PathBuf, String)>,
     ) -> Result<()> {
         let base = self.node(format!("/sys/devices/system/cpu/cpufreq/policy{policy}"));
         let (effective_min, effective_max) = frequency_range(&base, min, max)?;
@@ -692,21 +756,23 @@ impl Scheduler {
             self.required_write(base.join("scaling_governor"), governor)?;
         }
         // A vendor thermal/perf service can rewrite the ceiling between our
-        // write and the readback, especially right after boot. Re-assert
-        // briefly before reporting; the degraded retry loop handles the rest.
+        // write and the readback, especially around mode switches. Re-assert
+        // with a short backoff before recording the override; the watchdog
+        // keeps re-asserting afterwards until the kernel accepts the value.
         let ceiling = base.join("scaling_max_freq");
         let mut observed_max = util::read_trimmed(&ceiling)?;
-        for _ in 0..2 {
+        for delay in [15, 30, 60, 120] {
             if frequency_ceiling_matches(&observed_max, &effective_max) {
                 break;
             }
-            util::sleep(Duration::from_millis(15));
+            util::sleep(Duration::from_millis(delay));
             self.required_write(base.join("scaling_max_freq"), &effective_max)?;
             observed_max = util::read_trimmed(&ceiling)?;
         }
         if !frequency_ceiling_matches(&observed_max, &effective_max) {
-            return Err(format!(
-                "CPU policy{policy} 上限未按请求生效: 请求={effective_max} 读回={observed_max}"
+            tolerated.push((
+                ceiling.clone(),
+                format!("policy{policy} 上限保持 {observed_max}（请求 {effective_max} 被系统服务占用）"),
             ));
         }
         let observed_governor = util::read_trimmed(base.join("scaling_governor"))?;
@@ -1161,14 +1227,22 @@ fn apply_governor_params(
 ) -> Result<()> {
     // Empty Path fields mean this profile does not own the knob. Restore only
     // knobs previously captured by NovaSched, using their original values.
+    // A driver rejecting one knob must not fail the whole mode switch: the
+    // remaining scheduling keeps working and the failure stays visible in
+    // the log instead.
     for (path, stock) in snapshot.original_children(base)? {
         let owned = path
             .file_name()
             .and_then(|v| v.to_str())
             .is_some_and(|name| params.iter().any(|(key, _)| key == name));
         if !owned && path.exists() && util::read_trimmed(&path)? != stock.trim() {
-            snapshot.write(&path, stock.trim())?;
-            logger.info(format!("清理上一档残留参数: {}", path.display()));
+            match snapshot.write(&path, stock.trim()) {
+                Ok(()) => logger.info(format!("清理上一档残留参数: {}", path.display())),
+                Err(error) => logger.warn(format!(
+                    "恢复上一档参数失败，保持当前值: {} ({error})",
+                    path.display()
+                )),
+            }
         }
     }
     for (name, value) in params {
@@ -1177,7 +1251,12 @@ fn apply_governor_params(
             continue;
         }
         if util::read_trimmed(&path)? != value.trim() {
-            snapshot.write(path, value)?;
+            if let Err(error) = snapshot.write(path, value) {
+                logger.warn(format!(
+                    "调速器参数写入失败，保持当前值: {} ({error})",
+                    base.join(name).display()
+                ));
+            }
         }
     }
     Ok(())

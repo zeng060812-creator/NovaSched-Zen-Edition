@@ -1,6 +1,6 @@
 # NovaSched · Zen Edition
 
-[![version](https://img.shields.io/badge/version-v1.0.1-green)](#安装)
+[![version](https://img.shields.io/badge/version-v1.0.2-green)](#安装)
 [![platform](https://img.shields.io/badge/platform-arm64--v8a-blue)](#安装)
 [![license](https://img.shields.io/badge/license-GPL--3.0--only-important)](LICENSE)
 
