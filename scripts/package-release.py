@@ -63,6 +63,7 @@ assert len(list((MODULE/'config').glob('*.json'))) == 6
 for retired in [ROOT/'profile-references',MODULE/'profile-migrations']:
     assert not retired.exists(), 'Historical template copies must not ship'
 assert json.loads((MODULE/'vtools/powercfg.json').read_text())['versionCode'] == 233
+assert json.loads((MODULE/'vtools/powercfg.json').read_text())['version'] == f'v{VERSION}', 'powercfg.json version string must track VERSION'
 assert f'version = "{VERSION}"' in (ROOT/'native/Cargo.toml').read_text()
 
 js = (MODULE/'webroot/assets/zen.js').read_text()
