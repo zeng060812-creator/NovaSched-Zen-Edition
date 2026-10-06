@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 228,
+    "version": 229,
     "soc": "SM8650",
     "loglevel": "INFO"
   },
@@ -205,10 +205,18 @@
         "auto"
       ],
       "params": [
-        {},
-        {},
-        {},
-        {}
+        {
+          "hispeed_freq": "30%"
+        },
+        {
+          "hispeed_freq": "50%"
+        },
+        {
+          "hispeed_freq": "55%"
+        },
+        {
+          "hispeed_freq": "65%"
+        }
       ],
       "online": [
         true,

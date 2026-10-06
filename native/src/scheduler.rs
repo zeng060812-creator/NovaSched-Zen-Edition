@@ -867,11 +867,23 @@ impl Scheduler {
                 continue;
             }
             let data = &profile.clusters[cluster];
-            let base = self.node(format!(
-                "/sys/devices/system/cpu/cpufreq/policy{policy}/{}",
-                data.governor
-            ));
-            apply_governor_params(&self.snapshot, &self.logger, &base, &data.sched_params)?;
+            let policy_base =
+                self.node(format!("/sys/devices/system/cpu/cpufreq/policy{policy}"));
+            let base = policy_base.join(&data.governor);
+            // Governor knobs accept raw kHz, but percent values resolve against
+            // this policy's own maximum and snap to its frequency table — the
+            // same contract as min/max, so configs stay device-independent.
+            let resolved: Vec<(String, String)> = data
+                .sched_params
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        resolve_param_frequency(value, &policy_base),
+                    )
+                })
+                .collect();
+            apply_governor_params(&self.snapshot, &self.logger, &base, &resolved)?;
         }
         Ok(())
     }
@@ -1361,6 +1373,31 @@ fn is_kgsl_optional_force_node(name: &str) -> bool {
         name,
         "force_bus_on" | "force_clk_on" | "force_no_nap" | "force_rail_on"
     )
+}
+
+/// Resolve a governor parameter value: raw strings pass through untouched,
+/// "N%" resolves against the policy's physical maximum and snaps down to the
+/// nearest available OPP. Unreadable nodes keep the raw value; the param
+/// write itself is best-effort anyway.
+fn resolve_param_frequency(value: &str, policy_base: &Path) -> String {
+    let Some(percent) = value.strip_suffix('%') else {
+        return value.to_string();
+    };
+    let Ok(n) = percent.parse::<u64>() else {
+        return value.to_string();
+    };
+    if n > 100 {
+        return value.to_string();
+    }
+    let max = match util::read_trimmed(policy_base.join("cpuinfo_max_freq"))
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(max) if max > 0 => max,
+        _ => return value.to_string(),
+    };
+    let target = max.saturating_mul(n) / 100;
+    normalize_frequency(policy_base, &target.to_string(), false)
 }
 
 fn optional_node_not_supported(error: &str) -> bool {

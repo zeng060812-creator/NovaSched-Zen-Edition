@@ -36,10 +36,22 @@ MODE_OVERRIDES = {
     # keeps a 1.92GHz burst ceiling so launches stay snappy, mid/big trim the
     # heavy-worker power, little stays cheap but instant. Fast floors hold
     # game threads (X4 ~1.8GHz); powersave min stays 0% for deep idle.
+    # hispeed_freq (percent of each cluster max, resolved at runtime) makes
+    # walt JUMP above the floor on load spikes instead of ramping — the
+    # system-scheduler trick for steady frametimes at low idle power. Nodes
+    # missing on some kernels are skipped silently.
     'SM8650': {
         'powersave': {'max': ['62%', '55%', '52%', '58%']},
         'performance': {'min': ['15%', '20%', '25%', '25%']},
-        'fast': {'min': ['30%', '40%', '50%', '55%']},
+        'fast': {
+            'min': ['30%', '40%', '50%', '55%'],
+            'params': [
+                {'hispeed_freq': '30%'},
+                {'hispeed_freq': '50%'},
+                {'hispeed_freq': '55%'},
+                {'hispeed_freq': '65%'},
+            ],
+        },
     },
     # 8 Elite / 8 Elite Gen 5: c0=6x Oryon efficiency, c1=Oryon prime.
     # Two wide dynamic clocks; 45% keeps the ~4.3GHz prime near 1.9GHz.
@@ -66,10 +78,11 @@ def profile(soc, policies):
         }
     for name, fields in MODE_OVERRIDES.get(soc, {}).items():
         for key, values in fields.items():
-            modes[name][key] = [values[i] if p >= 0 else '0' for i, p in enumerate(policies)]
+            empty = {} if key == 'params' else '0'
+            modes[name][key] = [values[i] if p >= 0 else empty for i, p in enumerate(policies)]
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 228,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 229,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': {
