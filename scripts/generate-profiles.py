@@ -14,9 +14,12 @@ LAYOUTS = {
 # Percentages resolve against each cluster's physical max on the device.
 # All six SoCs share the same QCOM kernel convention (little-first cpu
 # numbering), verified on 8 Gen 3 and consistent with every anchor set.
-# Every SoC ships: per-cluster powersave ceilings, performance/fast floors,
-# fast-mode WALT hispeed jumps (skipped silently on kernels without the
-# node), cpuset core placement and cpuctl uclamp clamps.
+# Every SoC ships: per-cluster powersave ceilings, performance/fast floors
+# and fast-mode WALT hispeed jumps (skipped silently on kernels without
+# the node). cpuset/cpuctl placement stays DISABLED: a static top-app
+# uclamp floor forces mid frequencies during video/feed playback (6-7W
+# reported), and little-shedding placement hurts non-game workloads.
+# They return only behind an event-driven transient design.
 SOC_TUNING = {
     # 8 Gen 1: c0=4xA510@1.8 little, c1=3xA710@2.5 big, c2=X2@3.0 prime.
     # A710 runs hot: floors and ceilings stay moderate.
@@ -26,18 +29,6 @@ SOC_TUNING = {
         'fast': {
             'min': ['30%', '40%', '45%', '0%'],
             'params': [{}, {'hispeed_freq': '50%'}, {'hispeed_freq': '55%'}, {}],
-        },
-        'cpuset': {
-            'enabled': True, 'top_app': '0-7', 'foreground': '0-7',
-            'restricted': '0-3', 'system_background': '0-3', 'background': '0-3',
-            'modes': {'fast': {'top_app': '4-7', 'foreground': '4-7'}},
-        },
-        'cpuctl': {
-            'enabled': True,
-            'modes': {
-                'fast': {'top_app_min': '25'},
-                'powersave': {'background_max': '60'},
-            },
         },
     },
     # 8+ Gen 1: X2@3.2 — same shape as SM8450 with a slightly higher
@@ -49,18 +40,6 @@ SOC_TUNING = {
             'min': ['30%', '40%', '45%', '0%'],
             'params': [{}, {'hispeed_freq': '50%'}, {'hispeed_freq': '55%'}, {}],
         },
-        'cpuset': {
-            'enabled': True, 'top_app': '0-7', 'foreground': '0-7',
-            'restricted': '0-3', 'system_background': '0-3', 'background': '0-3',
-            'modes': {'fast': {'top_app': '4-7', 'foreground': '4-7'}},
-        },
-        'cpuctl': {
-            'enabled': True,
-            'modes': {
-                'fast': {'top_app_min': '25'},
-                'powersave': {'background_max': '60'},
-            },
-        },
     },
     # 8 Gen 2: c0=3xA520@1.8 little, c1=4xA715/A710@2.8 big, c2=X3@3.2 prime.
     'SM8550': {
@@ -69,18 +48,6 @@ SOC_TUNING = {
         'fast': {
             'min': ['35%', '45%', '50%', '0%'],
             'params': [{}, {'hispeed_freq': '55%'}, {'hispeed_freq': '60%'}, {}],
-        },
-        'cpuset': {
-            'enabled': True, 'top_app': '0-7', 'foreground': '0-7',
-            'restricted': '0-2', 'system_background': '0-2', 'background': '0-2',
-            'modes': {'fast': {'top_app': '3-7', 'foreground': '3-7'}},
-        },
-        'cpuctl': {
-            'enabled': True,
-            'modes': {
-                'fast': {'top_app_min': '30'},
-                'powersave': {'background_max': '60'},
-            },
         },
     },
     # 8 Gen 3: c0=2xA520@2.27 little, c1=3xA720@3.2 big, c2=2xA720@3.0 mid,
@@ -100,18 +67,6 @@ SOC_TUNING = {
                 {'hispeed_freq': '65%'},
             ],
         },
-        'cpuset': {
-            'enabled': True, 'top_app': '0-7', 'foreground': '0-7',
-            'restricted': '0-1', 'system_background': '0-1', 'background': '0-1',
-            'modes': {'fast': {'top_app': '2-7', 'foreground': '2-7'}},
-        },
-        'cpuctl': {
-            'enabled': True,
-            'modes': {
-                'fast': {'top_app_min': '30'},
-                'powersave': {'background_max': '60'},
-            },
-        },
     },
     # 8 Elite / 8 Elite Gen 5: c0=6x Oryon-E@3.53, c1=2x Oryon-P@4.32.
     # E cores are performance-class: fast mode keeps all 8 cores for
@@ -123,17 +78,6 @@ SOC_TUNING = {
             'min': ['35%', '45%', '0%', '0%'],
             'params': [{}, {'hispeed_freq': '60%'}, {}, {}],
         },
-        'cpuset': {
-            'enabled': True, 'top_app': '0-7', 'foreground': '0-7',
-            'restricted': '0-5', 'system_background': '0-5', 'background': '0-5',
-        },
-        'cpuctl': {
-            'enabled': True,
-            'modes': {
-                'fast': {'top_app_min': '30'},
-                'powersave': {'background_max': '55'},
-            },
-        },
     },
     'SM8850': {
         'powersave': {'max': ['62%', '55%', '0%', '0%']},
@@ -141,17 +85,6 @@ SOC_TUNING = {
         'fast': {
             'min': ['35%', '45%', '0%', '0%'],
             'params': [{}, {'hispeed_freq': '60%'}, {}, {}],
-        },
-        'cpuset': {
-            'enabled': True, 'top_app': '0-7', 'foreground': '0-7',
-            'restricted': '0-5', 'system_background': '0-5', 'background': '0-5',
-        },
-        'cpuctl': {
-            'enabled': True,
-            'modes': {
-                'fast': {'top_app_min': '30'},
-                'powersave': {'background_max': '55'},
-            },
         },
     },
 }
@@ -193,7 +126,7 @@ def profile(soc, policies):
             modes[name][key] = [values[i] if p >= 0 else empty for i, p in enumerate(policies)]
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 231,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 232,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': features,

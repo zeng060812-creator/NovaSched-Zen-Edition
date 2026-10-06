@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 231,
+    "version": 232,
     "soc": "SM8750",
     "loglevel": "INFO"
   },
@@ -17,12 +17,12 @@
   "features": {
     "node_watchdog": true,
     "cpuset": {
-      "enabled": true,
+      "enabled": false,
       "top_app": "0-7",
       "foreground": "0-7",
-      "restricted": "0-5",
-      "system_background": "0-5",
-      "background": "0-5"
+      "restricted": "0-3",
+      "system_background": "0-3",
+      "background": "0-1"
     },
     "launch_boost": {
       "enabled": false,
@@ -74,17 +74,6 @@
     "perf_lock": {
       "enabled": false,
       "services": []
-    },
-    "cpuctl": {
-      "enabled": true,
-      "modes": {
-        "fast": {
-          "top_app_min": "30"
-        },
-        "powersave": {
-          "background_max": "55"
-        }
-      }
     }
   },
   "modes": {
