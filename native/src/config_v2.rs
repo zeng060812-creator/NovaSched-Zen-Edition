@@ -76,6 +76,71 @@ fn strings(node: &Value) -> Result<Vec<String>> {
         .map(|value| Ok(value.as_str()?.to_owned()))
         .collect()
 }
+/// Per-mode cpuset overrides: {"fast": {"top_app": "2-7", "foreground": "2-7"}}.
+/// Mode names must be the four scheduler modes; groups are optional.
+fn parse_cpuset_modes(cpuset: &Value) -> Result<BTreeMap<String, CpusetMode>> {
+    let mut modes = BTreeMap::new();
+    let Some(Value::Object(entries)) = field(cpuset, "modes") else {
+        return Ok(modes);
+    };
+    for (name, value) in entries {
+        if !crate::config::MODES.contains(&name.as_str()) {
+            return Err(format!("cpuset.modes 含未知档位: {name}"));
+        }
+        let top_app = field(value, "top_app")
+            .map(|_| cpus(value, "top_app"))
+            .transpose()?;
+        let foreground = field(value, "foreground")
+            .map(|_| cpus(value, "foreground"))
+            .transpose()?;
+        modes.insert(name.clone(), CpusetMode { top_app, foreground });
+    }
+    Ok(modes)
+}
+
+/// cpu.uclamp values accept "max" or a 0..=100 percent.
+fn clamp_percent(node: &Value, key: &str) -> Result<String> {
+    let value = string(node, key)?;
+    if value == "max" {
+        return Ok(value);
+    }
+    let n = value
+        .parse::<u32>()
+        .map_err(|_| format!("{key} 必须为 0..100 或 max: {value}"))?;
+    if n > 100 {
+        return Err(format!("{key} 必须为 0..100 或 max: {value}"));
+    }
+    Ok(value)
+}
+
+/// Per-mode cpuctl clamps: {"fast": {"top_app_min": "30"},
+/// "powersave": {"background_max": "60"}}.
+fn parse_cpuctl_modes(cpuctl: &Value) -> Result<BTreeMap<String, CpuctlMode>> {
+    let mut modes = BTreeMap::new();
+    let Some(Value::Object(entries)) = field(cpuctl, "modes") else {
+        return Ok(modes);
+    };
+    for (name, value) in entries {
+        if !crate::config::MODES.contains(&name.as_str()) {
+            return Err(format!("cpuctl.modes 含未知档位: {name}"));
+        }
+        let top_app_min = field(value, "top_app_min")
+            .map(|_| clamp_percent(value, "top_app_min"))
+            .transpose()?;
+        let background_max = field(value, "background_max")
+            .map(|_| clamp_percent(value, "background_max"))
+            .transpose()?;
+        modes.insert(
+            name.clone(),
+            CpuctlMode {
+                top_app_min,
+                background_max,
+            },
+        );
+    }
+    Ok(modes)
+}
+
 fn limits(node: &Value) -> Result<ExtremePowerSave> {
     let gpu = field(node, "gpu_max_pwrlevel")
         .map(|value| -> Result<u32> {
@@ -139,6 +204,7 @@ pub fn parse(root: &Value) -> Result<Config> {
         restricted: cpus(c, "restricted")?,
         system_background: cpus(c, "system_background")?,
         background: cpus(c, "background")?,
+        modes: parse_cpuset_modes(c)?,
     };
     let l = features.get("launch_boost")?;
     let rate = l.get("rate_limit_ms")?.as_i64()?;
@@ -171,6 +237,19 @@ pub fn parse(root: &Value) -> Result<Config> {
         ignored_packages.insert(package);
     }
     let extreme_powersave = limits(features.get("extreme")?)?;
+    // cpuctl is optional so older configs keep parsing; absent means the
+    // feature stays off until a template that ships it is applied.
+    let cpuctl = match field(features, "cpuctl") {
+        Some(block) => {
+            let enable = flag(block, "enabled")?;
+            let modes = parse_cpuctl_modes(block)?;
+            if enable && modes.is_empty() {
+                return Err("cpuctl 已启用但未提供任何档位钳制".into());
+            }
+            Cpuctl { enable, modes }
+        }
+        None => Cpuctl::default(),
+    };
     let smooth_powersave = field(features, "smooth")
         .map(|s| -> Result<SmoothPowerSave> {
             let limits = limits(s)?;
@@ -262,6 +341,7 @@ pub fn parse(root: &Value) -> Result<Config> {
         modes,
         functions: Functions {
             cpuset,
+            cpuctl,
             launch_boost,
             scheduler,
             node_watchdog: flag(features, "node_watchdog")?,
@@ -324,19 +404,71 @@ pub fn encode(config: &Config, soc: Soc) -> Value {
         ("util_clamp_min", text(&s.util_clamp_min)),
         ("util_clamp_max", text(&s.util_clamp_max)),
     ]);
+    let mut cpuset = object([
+        ("enabled", Value::Bool(c.enable)),
+        ("top_app", text(&c.top_app)),
+        ("foreground", text(&c.foreground)),
+        ("restricted", text(&c.restricted)),
+        ("system_background", text(&c.system_background)),
+        ("background", text(&c.background)),
+    ]);
+    if !c.modes.is_empty() {
+        if let Value::Object(map) = &mut cpuset {
+            map.insert(
+                "modes".into(),
+                Value::Object(
+                    c.modes
+                        .iter()
+                        .map(|(mode, entry)| {
+                            let mut entry_out = object([]);
+                            if let Value::Object(fields) = &mut entry_out {
+                                if let Some(value) = &entry.top_app {
+                                    fields.insert("top_app".into(), text(value));
+                                }
+                                if let Some(value) = &entry.foreground {
+                                    fields.insert("foreground".into(), text(value));
+                                }
+                            }
+                            (mode.clone(), entry_out)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    let mut cpuctl_out = object([
+        ("enabled", Value::Bool(f.cpuctl.enable)),
+        (
+            "modes",
+            Value::Object(
+                f.cpuctl
+                    .modes
+                    .iter()
+                    .map(|(mode, entry)| {
+                        let mut entry_out = object([]);
+                        if let Value::Object(fields) = &mut entry_out {
+                            if let Some(value) = &entry.top_app_min {
+                                fields.insert("top_app_min".into(), text(value));
+                            }
+                            if let Some(value) = &entry.background_max {
+                                fields.insert("background_max".into(), text(value));
+                            }
+                        }
+                        (mode.clone(), entry_out)
+                    })
+                    .collect(),
+            ),
+        ),
+    ]);
+    if let Value::Object(map) = &mut cpuctl_out {
+        if f.cpuctl.modes.is_empty() {
+            map.remove("modes");
+        }
+    }
     let mut features = object([
         ("node_watchdog", Value::Bool(f.node_watchdog)),
-        (
-            "cpuset",
-            object([
-                ("enabled", Value::Bool(c.enable)),
-                ("top_app", text(&c.top_app)),
-                ("foreground", text(&c.foreground)),
-                ("restricted", text(&c.restricted)),
-                ("system_background", text(&c.system_background)),
-                ("background", text(&c.background)),
-            ]),
-        ),
+        ("cpuset", cpuset),
+        ("cpuctl", cpuctl_out),
         (
             "launch_boost",
             object([
@@ -456,6 +588,32 @@ pub fn migrate(root: &Value, config: &Config, soc: Soc) -> Result<Value> {
                 fields.insert("soc".into(), text(soc.id()));
             }
             map.insert("meta".into(), meta);
+            // Feature blocks the user's config predates: inject only missing
+            // blocks from the template so hand-edits survive the upgrade.
+            let template = encode(config, soc);
+            if let (Value::Object(map), Value::Object(defaults)) = (&mut out, &template) {
+                if let (Some(Value::Object(features)), Some(Value::Object(default_features))) = (
+                    map.get_mut("features"),
+                    defaults.get("features"),
+                ) {
+                    if !features.contains_key("cpuctl") {
+                        if let Some(cpuctl) = default_features.get("cpuctl") {
+                            features.insert("cpuctl".into(), cpuctl.clone());
+                        }
+                    }
+                    if let Some(Value::Object(cpuset_block)) = features.get_mut("cpuset") {
+                        if !cpuset_block.contains_key("modes") {
+                            if let Some(Value::Object(default_cpuset)) =
+                                default_features.get("cpuset")
+                            {
+                                if let Some(modes) = default_cpuset.get("modes") {
+                                    cpuset_block.insert("modes".into(), modes.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         return Ok(out);
     }

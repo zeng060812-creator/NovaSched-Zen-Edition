@@ -251,7 +251,7 @@ impl Scheduler {
             return Ok(());
         }
 
-        let expected = self.mode_controls(&profile, power_kind)?;
+        let expected = self.mode_controls(mode, &profile, power_kind)?;
         if preserve_lower_caps {
             for cluster in 0..4 {
                 let policy = self.config.policy[cluster];
@@ -289,7 +289,8 @@ impl Scheduler {
         self.apply_frequency(&profile)?;
         self.apply_sched_params(&profile)?;
         self.apply_online(&profile)?;
-        self.apply_mode_cpuset(power_kind)?;
+        self.apply_mode_cpuset(mode, power_kind)?;
+        self.apply_mode_cpuctl(mode)?;
         self.apply_mode_power_limits(power_kind)?;
         let drift = mismatched_controls(&expected)?;
         // The per-cluster readbacks and this final sweep are separate reads:
@@ -472,6 +473,7 @@ impl Scheduler {
 
     fn mode_controls(
         &self,
+        mode: &str,
         profile: &ModeProfile,
         kind: PowerSaveKind,
     ) -> Result<Vec<ExpectedControl>> {
@@ -509,21 +511,28 @@ impl Scheduler {
         }
         let limits = power_limits(&self.config, kind);
         let cpuset = &self.config.functions.cpuset;
-        for (group, normal, cap) in [
+        // Must mirror apply_mode_cpuset's precedence: power-kind limits, then
+        // the per-mode override, then the static values.
+        for (group, normal, cap, mode_override) in [
             (
                 "top-app",
                 &cpuset.top_app,
                 limits.and_then(|v| v.cpuset_top_app.as_ref()),
+                cpuset.modes.get(mode).and_then(|o| o.top_app.as_ref()),
             ),
             (
                 "foreground",
                 &cpuset.foreground,
                 limits.and_then(|v| v.cpuset_foreground.as_ref()),
+                cpuset
+                    .modes
+                    .get(mode)
+                    .and_then(|o| o.foreground.as_ref()),
             ),
         ] {
             let path = self.cpuset_path(group);
             let value = if cpuset.enable {
-                Some(cap.unwrap_or(normal).clone())
+                Some(cap.or(mode_override).unwrap_or(normal).clone())
             } else {
                 self.snapshot.original_value(&path)?
             };
@@ -600,6 +609,15 @@ impl Scheduler {
                 paths.insert(self.cpuset_path(group));
             }
         }
+        if self.config.functions.cpuctl.enable {
+            for group in ["top-app", "background"] {
+                for field in ["cpu.uclamp.min", "cpu.uclamp.max"] {
+                    paths.insert(
+                        self.node(format!("/dev/cpuctl/{group}/{field}")),
+                    );
+                }
+            }
+        }
         if self.config.functions.scheduler.enable {
             for name in [
                 "sched_schedstats",
@@ -671,23 +689,23 @@ impl Scheduler {
         Ok(())
     }
 
-    fn apply_mode_cpuset(&self, kind: PowerSaveKind) -> Result<()> {
+    fn apply_mode_cpuset(&mut self, mode: &str, kind: PowerSaveKind) -> Result<()> {
         let cpuset = &self.config.functions.cpuset;
         if !cpuset.enable {
-            for group in ["top-app", "foreground"] {
-                let path = self.cpuset_path(group);
-                if let Some(stock) = self.snapshot.original_value(&path)? {
-                    write_mode_control(&self.snapshot, &path, stock.trim(), ControlKind::CpuList)?;
-                }
-            }
+            // Stock was never captured for a disabled feature and the enable
+            // flag cannot change at runtime; nothing to write or audit.
             return Ok(());
         }
         let limits = power_limits(&self.config, kind);
+        // Precedence: power-kind limits (extreme/smooth), then the mode
+        // override, then the static values.
         let top_app = limits
             .and_then(|v| v.cpuset_top_app.as_deref())
+            .or_else(|| cpuset.modes.get(mode).and_then(|o| o.top_app.as_deref()))
             .unwrap_or(&cpuset.top_app);
         let foreground = limits
             .and_then(|v| v.cpuset_foreground.as_deref())
+            .or_else(|| cpuset.modes.get(mode).and_then(|o| o.foreground.as_deref()))
             .unwrap_or(&cpuset.foreground);
         for (group, value) in [("top-app", top_app), ("foreground", foreground)] {
             write_mode_control(
@@ -696,6 +714,52 @@ impl Scheduler {
                 value,
                 ControlKind::CpuList,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort cgroup-v2 uclamp clamps for the mode (cpuctl). Nodes
+    /// missing on kernels without CONFIG_UCLAMP_TASK_GROUP are skipped;
+    /// failures degrade to warnings because foreground scheduling keeps
+    /// working without them. Groups without a mode entry return to stock.
+    fn apply_mode_cpuctl(&mut self, mode: &str) -> Result<()> {
+        let cpuctl = &self.config.functions.cpuctl;
+        if !cpuctl.enable {
+            return Ok(());
+        }
+        let entry = cpuctl.modes.get(mode);
+        for (group, knob, field) in [
+            ("top-app", "top_app_min", "min"),
+            ("background", "background_max", "max"),
+        ] {
+            let requested = entry.and_then(|entry| match knob {
+                "top_app_min" => entry.top_app_min.as_deref(),
+                _ => entry.background_max.as_deref(),
+            });
+            let path = self.node(format!("/dev/cpuctl/{group}/cpu.uclamp.{field}"));
+            let stock = if requested.is_none() {
+                self.snapshot.original_value(&path).ok().flatten()
+            } else {
+                None
+            };
+            let Some(value) = requested.or(stock.as_deref()) else {
+                continue;
+            };
+            if !path.exists() {
+                continue;
+            }
+            if util::read_trimmed(&path).ok().as_deref() == Some(value.trim()) {
+                continue;
+            }
+            match self.snapshot.write(&path, value.trim()) {
+                Ok(()) => self
+                    .logger
+                    .debug(format!("cpuctl 钳制已写入: {} = {value}", path.display())),
+                Err(error) => self.logger.warn(format!(
+                    "cpuctl 钳制写入失败，保持当前值: {} ({error})",
+                    path.display()
+                )),
+            }
         }
         Ok(())
     }

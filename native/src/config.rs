@@ -24,6 +24,31 @@ pub struct Cpuset {
     pub restricted: String,
     pub system_background: String,
     pub background: String,
+    /// Per-mode top_app/foreground overrides, e.g. shedding little cores in
+    /// fast mode. Modes without an entry keep the static values.
+    pub modes: BTreeMap<String, CpusetMode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpusetMode {
+    pub top_app: Option<String>,
+    pub foreground: Option<String>,
+}
+
+/// cgroup-v2 cpuctl group clamps (cpu.uclamp.min/max), applied per mode as a
+/// best-effort refinement: foreground keeps a util floor in fast mode,
+/// background gets a util ceiling in powersave. Nodes missing on kernels
+/// without CONFIG_UCLAMP_TASK_GROUP are skipped silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuctlMode {
+    pub top_app_min: Option<String>,
+    pub background_max: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cpuctl {
+    pub enable: bool,
+    pub modes: BTreeMap<String, CpuctlMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +119,7 @@ pub struct SmoothPowerSave {
 pub struct Functions {
     pub node_watchdog: bool,
     pub cpuset: Cpuset,
+    pub cpuctl: Cpuctl,
     pub launch_boost: LaunchBoost,
     pub disable_gpu_boost: bool,
     pub scheduler: SchedulerConfig,
@@ -191,6 +217,7 @@ impl Config {
             restricted: cpu_list(cpuset_node, "restricted")?,
             system_background: cpu_list(cpuset_node, "system_background")?,
             background: cpu_list(cpuset_node, "background")?,
+            modes: BTreeMap::new(),
         };
         let launch_node = function.get("LaunchBoost")?;
         let rate = integer(launch_node, "boost_rate_limit_ms")?;
@@ -308,6 +335,7 @@ impl Config {
             functions: Functions {
                 node_watchdog,
                 cpuset,
+                cpuctl: Cpuctl::default(),
                 launch_boost,
                 disable_gpu_boost,
                 scheduler,

@@ -80,27 +80,46 @@ def profile(soc, policies):
         for key, values in fields.items():
             empty = {} if key == 'params' else '0'
             modes[name][key] = [values[i] if p >= 0 else empty for i, p in enumerate(policies)]
+    features = {
+        'node_watchdog': True,
+        'cpuset': {'enabled': False, 'top_app': '0-7', 'foreground': '0-7',
+                   'restricted': '0-3', 'system_background': '0-3', 'background': '0-1'},
+        'launch_boost': {'enabled': False, 'rate_limit_ms': 500, 'min': ['0'] * 4},
+        'disable_gpu_boost': False,
+        'scheduler': {'enabled': False, 'energy_aware': True, 'schedstats': False,
+                      'latency_ns': '10000000', 'migration_cost_ns': '500000',
+                      'min_granularity_ns': '1000000', 'wakeup_granularity_ns': '1000000',
+                      'nr_migrate': '32', 'util_clamp_min': '0', 'util_clamp_max': '1024'},
+        'foreground_ignore': [],
+        'extreme': {'enabled': False, 'max': slots('50%'), 'uclamp_max': '1024'},
+        'smooth': {'enabled': False, 'max': slots('70%'), 'uclamp_max': '1024',
+                   'uclamp_min_limit': '1024', 'up_rate_limit_us': '0', 'restore_stock_response': True},
+        'perf_lock': {'enabled': False, 'services': []},
+    }
+    if soc == 'SM8650':
+        # 8 Gen 3 verified layout (little-first): little cpu0-1, big cpu2-4,
+        # mid cpu5-6, prime cpu7. cpuset sheds little cores from foreground
+        # in fast mode and pins background there; cpuctl clamps give the
+        # foreground a util floor in fast mode and cap background util in
+        # powersave (cgroup-v2 nodes, skipped where unsupported).
+        features['cpuset'] = {
+            'enabled': True, 'top_app': '0-7', 'foreground': '0-7',
+            'restricted': '0-1', 'system_background': '0-1', 'background': '0-1',
+            'modes': {'fast': {'top_app': '2-7', 'foreground': '2-7'}},
+        }
+        features['cpuctl'] = {
+            'enabled': True,
+            'modes': {
+                'fast': {'top_app_min': '30'},
+                'powersave': {'background_max': '60'},
+            },
+        }
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 229,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 230,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
-        'features': {
-            'node_watchdog': True,
-            'cpuset': {'enabled': False, 'top_app': '0-7', 'foreground': '0-7',
-                       'restricted': '0-3', 'system_background': '0-3', 'background': '0-1'},
-            'launch_boost': {'enabled': False, 'rate_limit_ms': 500, 'min': ['0'] * 4},
-            'disable_gpu_boost': False,
-            'scheduler': {'enabled': False, 'energy_aware': True, 'schedstats': False,
-                          'latency_ns': '10000000', 'migration_cost_ns': '500000',
-                          'min_granularity_ns': '1000000', 'wakeup_granularity_ns': '1000000',
-                          'nr_migrate': '32', 'util_clamp_min': '0', 'util_clamp_max': '1024'},
-            'foreground_ignore': [],
-            'extreme': {'enabled': False, 'max': slots('50%'), 'uclamp_max': '1024'},
-            'smooth': {'enabled': False, 'max': slots('70%'), 'uclamp_max': '1024',
-                       'uclamp_min_limit': '1024', 'up_rate_limit_us': '0', 'restore_stock_response': True},
-            'perf_lock': {'enabled': False, 'services': []},
-        },
+        'features': features,
         'modes': modes,
     }
 
