@@ -31,7 +31,7 @@ function harness({noMetadata=false, noExec=false, port=31415, cachedPort=port, t
     'org.example.adversarial': '<img src=x onerror=alert(1)>',
   };
   let state={mode:'balance',effective:'balance',package:'org.example.photoalbum',controller:'WebUI',sceneActive:'false',sceneLinked:'false',phase:'ready',heartbeatMs:'0',port:String(port),extremePowerSave:'false',smoothPowerSave:'false',powerSaveProfile:''};
-  let app={type:'app-modes',rules:[],defaultMode:'balance',currentPackage:state.package,effectiveMode:'balance',controller:'WebUI',locked:false,sceneAvailable:false,sceneLinked:false,phase:'ready',error:'',version:'1.3.1',port,extremePowerSave:false,smoothPowerSave:false,powerSaveProfile:''};
+  let app={type:'app-modes',rules:[],defaultMode:'balance',currentPackage:state.package,effectiveMode:'balance',controller:'WebUI',locked:false,sceneAvailable:false,sceneLinked:false,phase:'ready',error:'',version:'1.3.2',port,extremePowerSave:false,smoothPowerSave:false,powerSaveProfile:''};
   const setTimer = (fn,ms=0) => {timers.set(++next,{fn,at:now+ms});return next;};
   const clearTimer = id => timers.delete(id);
   const advance = ms => {

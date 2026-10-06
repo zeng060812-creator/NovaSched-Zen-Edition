@@ -323,7 +323,17 @@ pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<St
             root.get("schema").is_err()
                 && stock_fingerprint(root).is_ok_and(|hash| STOCK_FINGERPRINTS.contains(&hash))
         });
-    let replace = current.is_none() || previous_soc != Some(hardware.soc) || stock_upgrade;
+    // The shipped template IS the tuning. A runtime config whose version
+    // differs from the template's is an upgrade candidate: adopt the template
+    // (with backup) so retunes reach upgrading users instead of living only
+    // in fresh installs. Hand-edits are preserved via the timestamped backup.
+    let version_upgrade = parsed
+        .as_ref()
+        .is_some_and(|parsed| parsed.meta.version != candidate.meta.version);
+    let replace = current.is_none()
+        || previous_soc != Some(hardware.soc)
+        || stock_upgrade
+        || version_upgrade;
     let mut next = if replace {
         Some(template.clone())
     } else {

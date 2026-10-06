@@ -5,7 +5,10 @@ use crate::json::{self, Value};
 use crate::util::{self, Result};
 
 pub const MODES: [&str; 4] = ["powersave", "balance", "performance", "fast"];
-pub const PROFILE_VERSION: i64 = 218;
+/// Tracks the template/config schema generation; must equal the release
+/// versionCode so upgrades replace the runtime config when the shipped
+/// tuning changes (see profiles::initialize version_upgrade).
+pub const PROFILE_VERSION: i64 = 233;
 
 #[derive(Clone, Debug)]
 pub struct Meta {

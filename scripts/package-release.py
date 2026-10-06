@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / 'module-template'
 DIST = ROOT / 'dist'
 DIST.mkdir(exist_ok=True)
-VERSION = '1.3.1'
+VERSION = '1.3.2'
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -51,18 +51,18 @@ for index, line in enumerate(program_lines):
 for record in load_records:
     assert record.split()[-1] == '0x4000', 'ELF LOAD alignment is not 16KB'
 assert f'version=v{VERSION}' in (MODULE/'module.prop').read_text()
-assert 'versionCode=232' in (MODULE/'module.prop').read_text()
+assert 'versionCode=233' in (MODULE/'module.prop').read_text()
 runpy.run_path(str(ROOT/'scripts/generate-profiles.py'))['generate'](check=True)
 for soc in ['SM8450','SM8475','SM8550','SM8650','SM8750','SM8850']:
     profile=json.loads((MODULE/'config'/(soc+'.json')).read_text())
     assert set(profile['modes']) == {'powersave','balance','performance','fast'}
     assert profile['schema'] == 'novasched/2' and profile['module'] == 'NovaSched_Zen_Edition'
-    assert profile['meta']['author'] == 'ZenJooo' and profile['meta']['version'] == 232
+    assert profile['meta']['author'] == 'ZenJooo' and profile['meta']['version'] == 233
     assert profile['meta']['soc'] == soc
 assert len(list((MODULE/'config').glob('*.json'))) == 6
 for retired in [ROOT/'profile-references',MODULE/'profile-migrations']:
     assert not retired.exists(), 'Historical template copies must not ship'
-assert json.loads((MODULE/'vtools/powercfg.json').read_text())['versionCode'] == 232
+assert json.loads((MODULE/'vtools/powercfg.json').read_text())['versionCode'] == 233
 assert f'version = "{VERSION}"' in (ROOT/'native/Cargo.toml').read_text()
 
 js = (MODULE/'webroot/assets/zen.js').read_text()
@@ -96,6 +96,6 @@ with zipfile.ZipFile(flashable) as z:
 
 print('Final release archive passed CRC, metadata, executable modes, protocol key and ELF consistency checks.')
 
-sums = DIST / 'NovaSched-v0232-SHA256SUMS.txt'
+sums = DIST / 'NovaSched-v0233-SHA256SUMS.txt'
 sums.write_text(''.join(digest(path)+'  '+path.name+'\n' for path in [flashable,binary]))
 print(sums.name)
