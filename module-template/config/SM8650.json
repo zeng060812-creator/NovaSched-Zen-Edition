@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 227,
+    "version": 228,
     "soc": "SM8650",
     "loglevel": "INFO"
   },
@@ -51,10 +51,10 @@
     "extreme": {
       "enabled": false,
       "max": [
-        "55%",
-        "55%",
-        "55%",
-        "55%"
+        "50%",
+        "50%",
+        "50%",
+        "50%"
       ],
       "uclamp_max": "1024"
     },
@@ -85,10 +85,10 @@
         "0%"
       ],
       "max": [
-        "70%",
-        "70%",
-        "70%",
-        "70%"
+        "62%",
+        "55%",
+        "52%",
+        "58%"
       ],
       "governors": [
         "auto",

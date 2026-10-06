@@ -31,11 +31,13 @@ MODE_OVERRIDES = {
         'performance': {'min': ['20%', '25%', '25%', '0%']},
         'fast': {'min': ['35%', '45%', '50%', '0%']},
     },
-    # 8 Gen 3: c0=2xA520 little, c1=3xA720@3.0 mid, c2=2xA720@3.2 big,
-    # c3=X4@3.3 prime. Prime gets the highest floor (X4 55% ~ 1.8GHz) so
-    # game main threads stop re-ramping from deep idle; little stays low
-    # to keep background work cheap.
+    # 8 Gen 3: c0=2xA520@2.27 little, c1=3xA720@3.2 big, c2=2xA720@3.0 mid,
+    # c3=X4@3.3 prime. Powersave caps target a ~1.8W daily profile: prime
+    # keeps a 1.92GHz burst ceiling so launches stay snappy, mid/big trim the
+    # heavy-worker power, little stays cheap but instant. Fast floors hold
+    # game threads (X4 ~1.8GHz); powersave min stays 0% for deep idle.
     'SM8650': {
+        'powersave': {'max': ['62%', '55%', '52%', '58%']},
         'performance': {'min': ['15%', '20%', '25%', '25%']},
         'fast': {'min': ['30%', '40%', '50%', '55%']},
     },
@@ -67,7 +69,7 @@ def profile(soc, policies):
             modes[name][key] = [values[i] if p >= 0 else '0' for i, p in enumerate(policies)]
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 227,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 228,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': {
@@ -81,7 +83,7 @@ def profile(soc, policies):
                           'min_granularity_ns': '1000000', 'wakeup_granularity_ns': '1000000',
                           'nr_migrate': '32', 'util_clamp_min': '0', 'util_clamp_max': '1024'},
             'foreground_ignore': [],
-            'extreme': {'enabled': False, 'max': slots('55%'), 'uclamp_max': '1024'},
+            'extreme': {'enabled': False, 'max': slots('50%'), 'uclamp_max': '1024'},
             'smooth': {'enabled': False, 'max': slots('70%'), 'uclamp_max': '1024',
                        'uclamp_min_limit': '1024', 'up_rate_limit_us': '0', 'restore_stock_response': True},
             'perf_lock': {'enabled': False, 'services': []},
