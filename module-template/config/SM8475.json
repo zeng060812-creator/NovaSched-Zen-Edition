@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 230,
+    "version": 231,
     "soc": "SM8475",
     "loglevel": "INFO"
   },
@@ -17,12 +17,18 @@
   "features": {
     "node_watchdog": true,
     "cpuset": {
-      "enabled": false,
+      "enabled": true,
       "top_app": "0-7",
       "foreground": "0-7",
       "restricted": "0-3",
       "system_background": "0-3",
-      "background": "0-1"
+      "background": "0-3",
+      "modes": {
+        "fast": {
+          "top_app": "4-7",
+          "foreground": "4-7"
+        }
+      }
     },
     "launch_boost": {
       "enabled": false,
@@ -74,6 +80,17 @@
     "perf_lock": {
       "enabled": false,
       "services": []
+    },
+    "cpuctl": {
+      "enabled": true,
+      "modes": {
+        "fast": {
+          "top_app_min": "25"
+        },
+        "powersave": {
+          "background_max": "60"
+        }
+      }
     }
   },
   "modes": {
@@ -86,8 +103,8 @@
       ],
       "max": [
         "70%",
-        "70%",
-        "70%",
+        "58%",
+        "58%",
         "0"
       ],
       "governors": [
@@ -206,8 +223,12 @@
       ],
       "params": [
         {},
-        {},
-        {},
+        {
+          "hispeed_freq": "50%"
+        },
+        {
+          "hispeed_freq": "55%"
+        },
         {}
       ],
       "online": [
