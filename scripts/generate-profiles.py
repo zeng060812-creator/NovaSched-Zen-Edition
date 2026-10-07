@@ -27,7 +27,6 @@ SOC_TUNING = {
         'powersave': {'max': ['70%', '58%', '60%', '0%']},
         'performance': {'min': ['20%', '25%', '25%', '0%']},
         'fast': {
-            'min': ['30%', '40%', '45%', '0%'],
             'params': [{}, {'hispeed_freq': '50%'}, {'hispeed_freq': '55%'}, {}],
         },
     },
@@ -37,7 +36,6 @@ SOC_TUNING = {
         'powersave': {'max': ['70%', '58%', '58%', '0%']},
         'performance': {'min': ['20%', '25%', '25%', '0%']},
         'fast': {
-            'min': ['30%', '40%', '45%', '0%'],
             'params': [{}, {'hispeed_freq': '50%'}, {'hispeed_freq': '55%'}, {}],
         },
     },
@@ -46,7 +44,6 @@ SOC_TUNING = {
         'powersave': {'max': ['68%', '55%', '58%', '0%']},
         'performance': {'min': ['20%', '25%', '25%', '0%']},
         'fast': {
-            'min': ['35%', '45%', '50%', '0%'],
             'params': [{}, {'hispeed_freq': '55%'}, {'hispeed_freq': '60%'}, {}],
         },
     },
@@ -59,7 +56,6 @@ SOC_TUNING = {
         'powersave': {'max': ['62%', '55%', '52%', '58%']},
         'performance': {'min': ['15%', '20%', '25%', '25%']},
         'fast': {
-            'min': ['30%', '40%', '50%', '55%'],
             'params': [
                 {'hispeed_freq': '30%'},
                 {'hispeed_freq': '50%'},
@@ -75,7 +71,6 @@ SOC_TUNING = {
         'powersave': {'max': ['62%', '55%', '0%', '0%']},
         'performance': {'min': ['15%', '20%', '0%', '0%']},
         'fast': {
-            'min': ['35%', '45%', '0%', '0%'],
             'params': [{}, {'hispeed_freq': '60%'}, {}, {}],
         },
     },
@@ -83,7 +78,6 @@ SOC_TUNING = {
         'powersave': {'max': ['62%', '55%', '0%', '0%']},
         'performance': {'min': ['15%', '20%', '0%', '0%']},
         'fast': {
-            'min': ['35%', '45%', '0%', '0%'],
             'params': [{}, {'hispeed_freq': '60%'}, {}, {}],
         },
     },
@@ -94,7 +88,7 @@ def profile(soc, policies):
         return [value if policy >= 0 else '0' for policy in policies]
     modes = {}
     for name, minimum, maximum in [('powersave', '0%', '70%'), ('balance', '0%', '100%'),
-                                   ('performance', '15%', '100%'), ('fast', '25%', '100%')]:
+                                   ('performance', '15%', '100%'), ('fast', '0%', '100%')]:
         modes[name] = {
             'min': slots(minimum), 'max': slots(maximum),
             'governors': ['auto' if p >= 0 else '' for p in policies],
@@ -126,7 +120,7 @@ def profile(soc, policies):
             modes[name][key] = [values[i] if p >= 0 else empty for i, p in enumerate(policies)]
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 233,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 234,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': features,

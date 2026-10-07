@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 233,
+    "version": 234,
     "soc": "SM8650",
     "loglevel": "INFO"
   },
@@ -187,10 +187,10 @@
     },
     "fast": {
       "min": [
-        "30%",
-        "40%",
-        "50%",
-        "55%"
+        "0%",
+        "0%",
+        "0%",
+        "0%"
       ],
       "max": [
         "100%",
