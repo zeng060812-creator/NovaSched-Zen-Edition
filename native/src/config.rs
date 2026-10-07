@@ -8,7 +8,7 @@ pub const MODES: [&str; 4] = ["powersave", "balance", "performance", "fast"];
 /// Tracks the template/config schema generation; must equal the release
 /// versionCode so upgrades replace the runtime config when the shipped
 /// tuning changes (see profiles::initialize version_upgrade).
-pub const PROFILE_VERSION: i64 = 233;
+pub const PROFILE_VERSION: i64 = 236;
 
 #[derive(Clone, Debug)]
 pub struct Meta {
@@ -30,6 +30,9 @@ pub struct Cpuset {
     /// Per-mode top_app/foreground overrides, e.g. shedding little cores in
     /// fast mode. Modes without an entry keep the static values.
     pub modes: BTreeMap<String, CpusetMode>,
+    /// Applied only while an explicitly ruled app (a user-marked game) is
+    /// foreground: the per-app game placement. Absent on other SoCs.
+    pub app_rule: Option<CpusetMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +48,9 @@ pub struct CpusetMode {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CpuctlMode {
     pub top_app_min: Option<String>,
+    /// Applied only while an explicitly ruled app is foreground: the
+    /// per-app transient game floor (replaces the reverted static floor).
+    pub top_app_min_rule: Option<String>,
     pub background_max: Option<String>,
 }
 
@@ -118,11 +124,33 @@ pub struct SmoothPowerSave {
     pub restore_stock_response: bool,
 }
 
+/// Touch-event-driven transient boost: while input activity is detected the
+/// top-app group carries a uclamp.min pulse for `duration_ms`, then returns
+/// to the dispatcher-maintained baseline. Event-driven and transient by
+/// design - never a static floor (the v1.2.0 power bomb).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputBoost {
+    pub enabled: bool,
+    pub top_app_min: String,
+    pub duration_ms: u64,
+}
+
+impl Default for InputBoost {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            top_app_min: "30".into(),
+            duration_ms: 300,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Functions {
     pub node_watchdog: bool,
     pub cpuset: Cpuset,
     pub cpuctl: Cpuctl,
+    pub input_boost: InputBoost,
     pub launch_boost: LaunchBoost,
     pub disable_gpu_boost: bool,
     pub scheduler: SchedulerConfig,
@@ -220,6 +248,7 @@ impl Config {
             restricted: cpu_list(cpuset_node, "restricted")?,
             system_background: cpu_list(cpuset_node, "system_background")?,
             background: cpu_list(cpuset_node, "background")?,
+            app_rule: None,
             modes: BTreeMap::new(),
         };
         let launch_node = function.get("LaunchBoost")?;
@@ -339,6 +368,7 @@ impl Config {
                 node_watchdog,
                 cpuset,
                 cpuctl: Cpuctl::default(),
+                input_boost: InputBoost::default(),
                 launch_boost,
                 disable_gpu_boost,
                 scheduler,

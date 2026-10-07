@@ -120,7 +120,7 @@ def profile(soc, policies):
             modes[name][key] = [values[i] if p >= 0 else empty for i, p in enumerate(policies)]
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 235,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 236,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': features,

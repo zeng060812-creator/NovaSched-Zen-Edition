@@ -6,6 +6,7 @@ mod event_loop;
 mod ffi;
 mod game_diagnostics;
 mod hardware;
+mod input_boost;
 mod json;
 mod lifecycle;
 mod logging;

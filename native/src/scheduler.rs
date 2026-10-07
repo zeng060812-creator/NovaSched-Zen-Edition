@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{Config, ExtremePowerSave, ModeProfile};
@@ -7,6 +8,26 @@ use crate::hardware::{self, Hardware};
 use crate::logging::Logger;
 use crate::snapshot::Snapshot;
 use crate::util::{self, Result};
+
+/// Shared live state for the cpuctl top-app clamp, updated by the dispatch
+/// loop and read by the input-boost thread.
+#[derive(Default)]
+pub struct CpuctlLive {
+    pub inner: Mutex<CpuctlLiveState>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CpuctlLiveState {
+    /// The baseline cpu.uclamp.min the dispatcher maintains for top-app
+    /// (rule floor while an explicitly ruled app is foreground, stock
+    /// otherwise). Input-boost pulses expire back to this value.
+    pub top_app_min: String,
+    /// The pulse value applied on input activity; empty = disabled.
+    pub boost_min: String,
+    pub duration_ms: u64,
+    /// False while a foreign scheduler owns the nodes.
+    pub allowed: bool,
+}
 
 pub struct Scheduler {
     config: Config,
@@ -25,6 +46,7 @@ pub struct Scheduler {
     /// Ceilings the kernel or a vendor service refused; re-written every tick
     /// until they stick, so a refused value never rolls back the dispatch.
     pending_enforcement: Vec<(PathBuf, String)>,
+    cpuctl_live: Arc<CpuctlLive>,
     open_drift: Option<Vec<String>>,
 }
 
@@ -78,6 +100,7 @@ impl Scheduler {
         snapshot: Snapshot,
         logger: Logger,
         hardware: Hardware,
+        cpuctl_live: Arc<CpuctlLive>,
     ) -> Result<Self> {
         for change in hardware.adapt_config(&mut config)? {
             logger.info(format!("内核兼容适配: {change}"));
@@ -97,6 +120,7 @@ impl Scheduler {
             hardware,
             pending_note: String::new(),
             pending_enforcement: Vec::new(),
+            cpuctl_live,
             open_drift: None,
         })
     }
@@ -251,7 +275,7 @@ impl Scheduler {
             return Ok(());
         }
 
-        let expected = self.mode_controls(mode, &profile, power_kind)?;
+        let expected = self.mode_controls(mode, explicit, &profile, power_kind)?;
         if preserve_lower_caps {
             for cluster in 0..4 {
                 let policy = self.config.policy[cluster];
@@ -289,8 +313,8 @@ impl Scheduler {
         self.apply_frequency(&profile)?;
         self.apply_sched_params(&profile)?;
         self.apply_online(&profile)?;
-        self.apply_mode_cpuset(mode, power_kind)?;
-        self.apply_mode_cpuctl(mode)?;
+        self.apply_mode_cpuset(mode, explicit, power_kind)?;
+        self.apply_mode_cpuctl(mode, explicit)?;
         self.apply_mode_power_limits(power_kind)?;
         let drift = mismatched_controls(&expected)?;
         // The per-cluster readbacks and this final sweep are separate reads:
@@ -474,6 +498,7 @@ impl Scheduler {
     fn mode_controls(
         &self,
         mode: &str,
+        explicit: bool,
         profile: &ModeProfile,
         kind: PowerSaveKind,
     ) -> Result<Vec<ExpectedControl>> {
@@ -511,8 +536,14 @@ impl Scheduler {
         }
         let limits = power_limits(&self.config, kind);
         let cpuset = &self.config.functions.cpuset;
-        // Must mirror apply_mode_cpuset's precedence: power-kind limits, then
-        // the per-mode override, then the static values.
+        // Must mirror apply_mode_cpuset's precedence: the per-app rule (only
+        // while an explicitly ruled app is foreground), then power-kind
+        // limits, then the per-mode override, then the static values.
+        let rule = if explicit {
+            cpuset.app_rule.as_ref()
+        } else {
+            None
+        };
         for (group, normal, cap, mode_override) in [
             (
                 "top-app",
@@ -532,7 +563,17 @@ impl Scheduler {
         ] {
             let path = self.cpuset_path(group);
             let value = if cpuset.enable {
-                Some(cap.or(mode_override).unwrap_or(normal).clone())
+                let rule_value = rule.and_then(|r| match group {
+                    "top-app" => r.top_app.as_ref(),
+                    _ => r.foreground.as_ref(),
+                });
+                Some(
+                    rule_value
+                        .or(cap)
+                        .or(mode_override)
+                        .unwrap_or(normal)
+                        .clone(),
+                )
             } else {
                 self.snapshot.original_value(&path)?
             };
@@ -609,7 +650,7 @@ impl Scheduler {
                 paths.insert(self.cpuset_path(group));
             }
         }
-        if self.config.functions.cpuctl.enable {
+        if self.config.functions.cpuctl.enable || self.config.functions.input_boost.enabled {
             for group in ["top-app", "background"] {
                 for field in ["cpu.uclamp.min", "cpu.uclamp.max"] {
                     paths.insert(
@@ -689,7 +730,7 @@ impl Scheduler {
         Ok(())
     }
 
-    fn apply_mode_cpuset(&mut self, mode: &str, kind: PowerSaveKind) -> Result<()> {
+    fn apply_mode_cpuset(&mut self, mode: &str, explicit: bool, kind: PowerSaveKind) -> Result<()> {
         let cpuset = &self.config.functions.cpuset;
         if !cpuset.enable {
             // Stock was never captured for a disabled feature and the enable
@@ -697,14 +738,22 @@ impl Scheduler {
             return Ok(());
         }
         let limits = power_limits(&self.config, kind);
-        // Precedence: power-kind limits (extreme/smooth), then the mode
-        // override, then the static values.
-        let top_app = limits
-            .and_then(|v| v.cpuset_top_app.as_deref())
+        // Precedence: the per-app game placement (only while an explicitly
+        // ruled app is foreground), then power-kind limits (extreme/smooth),
+        // then the mode override, then the static values.
+        let rule = if explicit {
+            cpuset.app_rule.as_ref()
+        } else {
+            None
+        };
+        let top_app = rule
+            .and_then(|r| r.top_app.as_deref())
+            .or_else(|| limits.and_then(|v| v.cpuset_top_app.as_deref()))
             .or_else(|| cpuset.modes.get(mode).and_then(|o| o.top_app.as_deref()))
             .unwrap_or(&cpuset.top_app);
-        let foreground = limits
-            .and_then(|v| v.cpuset_foreground.as_deref())
+        let foreground = rule
+            .and_then(|r| r.foreground.as_deref())
+            .or_else(|| limits.and_then(|v| v.cpuset_foreground.as_deref()))
             .or_else(|| cpuset.modes.get(mode).and_then(|o| o.foreground.as_deref()))
             .unwrap_or(&cpuset.foreground);
         for (group, value) in [("top-app", top_app), ("foreground", foreground)] {
@@ -722,18 +771,31 @@ impl Scheduler {
     /// missing on kernels without CONFIG_UCLAMP_TASK_GROUP are skipped;
     /// failures degrade to warnings because foreground scheduling keeps
     /// working without them. Groups without a mode entry return to stock.
-    fn apply_mode_cpuctl(&mut self, mode: &str) -> Result<()> {
+    /// The rule-gated top-app floor is transient: it applies only while an
+    /// explicitly ruled app is foreground, and the live baseline is shared
+    /// with the input-boost thread for pulse expiry.
+    fn apply_mode_cpuctl(&mut self, mode: &str, explicit: bool) -> Result<()> {
         let cpuctl = &self.config.functions.cpuctl;
         if !cpuctl.enable {
             return Ok(());
         }
         let entry = cpuctl.modes.get(mode);
+        let mut top_app_baseline = String::from("0");
         for (group, knob, field) in [
             ("top-app", "top_app_min", "min"),
             ("background", "background_max", "max"),
         ] {
             let requested = entry.and_then(|entry| match knob {
-                "top_app_min" => entry.top_app_min.as_deref(),
+                "top_app_min" => {
+                    if explicit {
+                        entry
+                            .top_app_min_rule
+                            .as_deref()
+                            .or(entry.top_app_min.as_deref())
+                    } else {
+                        entry.top_app_min.as_deref()
+                    }
+                }
                 _ => entry.background_max.as_deref(),
             });
             let path = self.node(format!("/dev/cpuctl/{group}/cpu.uclamp.{field}"));
@@ -745,6 +807,9 @@ impl Scheduler {
             let Some(value) = requested.or(stock.as_deref()) else {
                 continue;
             };
+            if group == "top-app" {
+                top_app_baseline = value.to_string();
+            }
             if !path.exists() {
                 continue;
             }
@@ -760,6 +825,15 @@ impl Scheduler {
                     path.display()
                 )),
             }
+        }
+        if let Ok(mut state) = self.cpuctl_live.inner.lock() {
+            state.top_app_min = top_app_baseline;
+            state.boost_min = if self.config.functions.input_boost.enabled {
+                self.config.functions.input_boost.top_app_min.clone()
+            } else {
+                String::new()
+            };
+            state.duration_ms = self.config.functions.input_boost.duration_ms;
         }
         Ok(())
     }

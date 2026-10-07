@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::app_modes::{self, AppModes};
 use crate::config::Config;
 use crate::event_loop::{EventLoop, WakeReason};
+use crate::scheduler::CpuctlLive;
 use crate::ffi;
 use crate::logging::Logger;
 use crate::options::Options;
@@ -149,7 +150,15 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         app_modes.default_mode()
     };
     let selected_soc = hardware.soc;
-    let mut scheduler = match Scheduler::new(config, snapshot.clone(), logger.clone(), hardware) {
+    let input_boost_cfg = config.functions.input_boost.clone();
+    let cpuctl_live = Arc::new(CpuctlLive::default());
+    let mut scheduler = match Scheduler::new(
+        config,
+        snapshot.clone(),
+        logger.clone(),
+        hardware,
+        cpuctl_live.clone(),
+    ) {
         Ok(value) => value,
         Err(error) => return startup_fail(&logger, state_dir, "内核能力适配", error),
     };
@@ -214,6 +223,34 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             }
             return startup_fail(&logger, state_dir, "启动 WebUI", error);
         }
+    };
+    // Touch-driven transient boost: input thread applies a short uclamp.min
+    // pulse on activity and expires back to the dispatcher baseline. Skipped
+    // while a foreign scheduler owns the nodes (allowed flag per tick).
+    let _input_thread = if input_boost_cfg.enabled && !scene.controls_locked() {
+        let node = PathBuf::from("/dev/cpuctl/top-app/cpu.uclamp.min");
+        let stock = snapshot
+            .original_value(&node)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "0".into());
+        let ctx = crate::input_boost::InputBoostContext {
+            live: cpuctl_live.clone(),
+            node,
+            stock,
+            stop: web_stop.clone(),
+            snapshot: snapshot.clone(),
+            logger: logger.clone(),
+        };
+        match crate::input_boost::spawn(ctx) {
+            Some(handle) => Some(handle),
+            None => {
+                logger.debug("输入突频未启用（无可用输入设备）");
+                None
+            }
+        }
+    } else {
+        None
     };
     if let Err(e) = util::remove_if_exists(&state_dir.join("last_error")) {
         logger.error(e);
@@ -351,9 +388,13 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         }
         let option_changed = scheduler.set_extreme_powersave(options.extreme_powersave());
         let smooth_changed = scheduler.set_smooth_powersave(options.smooth_powersave());
+        // The input-boost thread pulses only while no foreign scheduler owns
+        // the nodes.
+        if let Ok(mut state) = cpuctl_live.inner.lock() {
+            state.allowed = !scene.controls_locked();
+        }
         // Re-write ceilings that a vendor service refused until they stick.
-        // Cheap when the queue is empty; skipped while a foreign scheduler
-        // owns the nodes, and its queue is dropped to avoid write wars.
+        // Cheap when the queue is empty; revision bump refreshes the WebUI.
         if !scene.controls_locked() && scheduler.enforce_pending() {
             revision.fetch_add(1, Ordering::Relaxed);
         }

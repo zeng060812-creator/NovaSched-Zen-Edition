@@ -98,6 +98,33 @@ fn parse_cpuset_modes(cpuset: &Value) -> Result<BTreeMap<String, CpusetMode>> {
     Ok(modes)
 }
 
+/// Optional named cpuset override block (currently the per-app game rule).
+fn parse_cpuset_mode_optional(cpuset: &Value, key: &str) -> Result<Option<CpusetMode>> {
+    let Some(value) = field(cpuset, key) else {
+        return Ok(None);
+    };
+    let top_app = field(value, "top_app")
+        .map(|_| cpus(value, "top_app"))
+        .transpose()?;
+    let foreground = field(value, "foreground")
+        .map(|_| cpus(value, "foreground"))
+        .transpose()?;
+    if top_app.is_none() && foreground.is_none() {
+        return Err(format!("cpuset.{key} 不能为空"));
+    }
+    Ok(Some(CpusetMode { top_app, foreground }))
+}
+
+/// cpu.uclamp values accept "max" or a 0..=100 percent. The strict variant
+/// rejects "max": a max util floor on any group is the reverted power bomb.
+fn clamp_percent_strict(node: &Value, key: &str) -> Result<String> {
+    let value = clamp_percent(node, key)?;
+    if value == "max" {
+        return Err(format!("{key} 不允许 max"));
+    }
+    Ok(value)
+}
+
 /// cpu.uclamp values accept "max" or a 0..=100 percent.
 fn clamp_percent(node: &Value, key: &str) -> Result<String> {
     let value = string(node, key)?;
@@ -127,6 +154,9 @@ fn parse_cpuctl_modes(cpuctl: &Value) -> Result<BTreeMap<String, CpuctlMode>> {
         let top_app_min = field(value, "top_app_min")
             .map(|_| clamp_percent(value, "top_app_min"))
             .transpose()?;
+        let top_app_min_rule = field(value, "top_app_min_rule")
+            .map(|_| clamp_percent_strict(value, "top_app_min_rule"))
+            .transpose()?;
         let background_max = field(value, "background_max")
             .map(|_| clamp_percent(value, "background_max"))
             .transpose()?;
@@ -134,6 +164,7 @@ fn parse_cpuctl_modes(cpuctl: &Value) -> Result<BTreeMap<String, CpuctlMode>> {
             name.clone(),
             CpuctlMode {
                 top_app_min,
+                top_app_min_rule,
                 background_max,
             },
         );
@@ -205,6 +236,7 @@ pub fn parse(root: &Value) -> Result<Config> {
         system_background: cpus(c, "system_background")?,
         background: cpus(c, "background")?,
         modes: parse_cpuset_modes(c)?,
+        app_rule: parse_cpuset_mode_optional(c, "app_rule")?,
     };
     let l = features.get("launch_boost")?;
     let rate = l.get("rate_limit_ms")?.as_i64()?;
@@ -249,6 +281,24 @@ pub fn parse(root: &Value) -> Result<Config> {
             Cpuctl { enable, modes }
         }
         None => Cpuctl::default(),
+    };
+    // Input boost is optional so older configs keep parsing; absent means
+    // the touch-pulse feature stays off.
+    let input_boost = match field(features, "input_boost") {
+        Some(block) => {
+            let enabled = flag(block, "enabled")?;
+            let top_app_min = clamp_percent_strict(block, "top_app_min")?;
+            let rate = number(block, "duration_ms")?;
+            if !(50..=5000).contains(&rate.parse::<u64>().map_err(|e| e.to_string())?) {
+                return Err("输入突频持续时间必须在 50..5000 ms".into());
+            }
+            InputBoost {
+                enabled,
+                top_app_min,
+                duration_ms: rate.parse::<u64>().map_err(|e| e.to_string())?,
+            }
+        }
+        None => InputBoost::default(),
     };
     let smooth_powersave = field(features, "smooth")
         .map(|s| -> Result<SmoothPowerSave> {
@@ -342,6 +392,7 @@ pub fn parse(root: &Value) -> Result<Config> {
         functions: Functions {
             cpuset,
             cpuctl,
+            input_boost,
             launch_boost,
             scheduler,
             node_watchdog: flag(features, "node_watchdog")?,
