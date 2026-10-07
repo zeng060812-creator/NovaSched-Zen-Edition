@@ -2,7 +2,7 @@
 
 SKIPUNZIP=0
 
- ui_print "- NovaSched Zen Edition v1.0.0"
+ui_print "- NovaSched Zen Edition v1.4.0"
 ui_print "- 作者：ZenJooo"
 ui_print "- 骁龙 8 Gen 1 / 8+ Gen 1 / 8 Gen 2 / 8 Gen 3 / 8 Elite / 8 Elite Gen 5"
 ui_print "- 按处理器与内核能力校验，不限制手机品牌或机型"
@@ -45,6 +45,23 @@ NOVA_STATE="/data/adb/novasched"
 mkdir -p "$NOVA_STATE" || abort "! 无法创建运行时目录"
 run_check prepare-config || abort "! 处理器配置初始化失败；原配置已保留，请保留输出"
 ui_print "- 使用 NovaSched 自有配置格式；保留手动参数，转换前保存原配置"
+
+# ---------- ASoulOpt 交互安装：音量键选择预设 ----------
+NOVA_KEY_TIMEOUT=6
+
+asoul_key() {
+  # 等待一次音量键：输出 UP / DOWN，超时输出空。
+  deadline=$(( $(date +%s) + NOVA_KEY_TIMEOUT ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    event=$(timeout 1 getevent -qlc 1 /dev/input 2>/dev/null | awk 'NF>=3 {print $3; exit}')
+    case "$event" in
+      KEY_VOLUMEUP) echo UP; return 0 ;;
+      KEY_VOLUMEDOWN) echo DOWN; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 if [ -f "$NOVA_STATE/options.txt" ]; then
   # 覆盖安装保留已有选择，只为旧格式补上新增开关。
   if ! grep -q '^extreme_powersave=' "$NOVA_STATE/options.txt"; then
@@ -53,11 +70,69 @@ if [ -f "$NOVA_STATE/options.txt" ]; then
   if ! grep -q '^smooth_powersave=' "$NOVA_STATE/options.txt"; then
     printf '\nsmooth_powersave=0\n' >> "$NOVA_STATE/options.txt" || abort "! 无法写入流畅省电选项"
   fi
+  ui_print "- 检测到已有 ASoulOpt 配置，保留你的选择（重装本模块可重新配置）"
 else
-  printf '# NovaSched Zen Edition\nextreme_powersave=0\nsmooth_powersave=0\n' > "$NOVA_STATE/options.txt" || abort "! 无法初始化选项"
+  ui_print " "
+  ui_print "  ╔══════════════════════════════╗"
+  ui_print "  ║  ASoulOpt · 交互式安装向导   ║"
+  ui_print "  ╚══════════════════════════════╝"
+  if ! command -v getevent >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+    ui_print "- 当前环境不支持按键交互，使用均衡预设"
+    preset_mode=balance
+    extreme=0
+  else
+    idx=2
+    while :; do
+      case $idx in
+        1) name=省电 ;;
+        2) name=均衡 ;;
+        3) name=性能 ;;
+        4) name=极速（游戏线程） ;;
+      esac
+      ui_print "  当前预设：$name"
+      ui_print "- 音量上=切换  音量下=确认（${NOVA_KEY_TIMEOUT}s 内无操作=当前）"
+      key=$(asoul_key)
+      if [ -z "$key" ]; then
+        ui_print "  未检测到按键，使用当前预设"
+        break
+      fi
+      if [ "$key" = UP ]; then idx=$(( idx % 4 + 1 )); else break; fi
+    done
+    case $idx in
+      1) preset_mode=powersave ;;
+      2) preset_mode=balance ;;
+      3) preset_mode=performance ;;
+      4) preset_mode=fast ;;
+    esac
+    extreme=0
+    if [ "$preset_mode" = powersave ]; then
+      ui_print "  省电预设进阶：是否同时开启极限节能？"
+      ui_print "- 音量上=开启  音量下=跳过（${NOVA_KEY_TIMEOUT}s 内）"
+      key=$(asoul_key)
+      if [ "$key" = UP ]; then
+        extreme=1
+        ui_print "- 极限节能将在省电档生效"
+      fi
+    fi
+  fi
+  case $preset_mode in
+    powersave) preset_name=省电 ;;
+    performance) preset_name=性能 ;;
+    fast) preset_name=极速 ;;
+    *) preset_name=均衡 ;;
+  esac
+  printf '# NovaSched Zen Edition（ASoulOpt 交互安装）\nextreme_powersave=%s\nsmooth_powersave=0\n' "$extreme" > "$NOVA_STATE/options.txt" || abort "! 无法初始化选项"
+  printf '%s\n' "$preset_mode" > "$NOVA_STATE/mode.txt" || abort "! 无法写入默认档位"
+  set_perm "$NOVA_STATE/options.txt" 0 0 0664
+  set_perm "$NOVA_STATE/mode.txt" 0 0 0664
+  ui_print "- 已选择：$preset_name 预设（默认档位已写入）"
+  if [ "$preset_mode" = fast ]; then
+    ui_print "- ASoulOpt 游戏线程：突频+满频上限已就绪"
+    ui_print "- 建议在 WebUI→应用 为常玩游戏配置专属规则"
+  fi
 fi
 set_perm "$NOVA_STATE/options.txt" 0 0 0664
-ui_print "- 新装默认关闭极限节能与流畅省电；覆盖安装保留已有选择"
+ui_print "- 极限节能/流畅省电随预设写入；覆盖安装保留已有选择"
 
 ui_print "- 安装完成；首次启动将自动保存原厂节点快照"
 ui_print "- 检测到已安装 Scene 时自动注册联动；卸载后由 WebUI 接管"
