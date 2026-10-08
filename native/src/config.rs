@@ -8,7 +8,7 @@ pub const MODES: [&str; 4] = ["powersave", "balance", "performance", "fast"];
 /// Tracks the template/config schema generation; must equal the release
 /// versionCode so upgrades replace the runtime config when the shipped
 /// tuning changes (see profiles::initialize version_upgrade).
-pub const PROFILE_VERSION: i64 = 236;
+pub const PROFILE_VERSION: i64 = 237;
 
 #[derive(Clone, Debug)]
 pub struct Meta {

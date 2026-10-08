@@ -438,6 +438,11 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             );
             (selected, explicit && !pedestal)
         };
+        // The input-boost pulse is a responsiveness feature for marked apps:
+        // it fires only while the foreground app carries an explicit rule.
+        if let Ok(mut state) = cpuctl_live.inner.lock() {
+            state.active = explicit;
+        }
         let force_apply = forced
             || config_changed
             || rules_changed
@@ -590,6 +595,59 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     }
     drop(cleanup);
     restore.map(|_| ())
+}
+
+/// Per-cluster audit for the diagnose command: what the config requests vs
+/// what the kernel actually runs right now. This is the definitive answer to
+/// "功耗为什么高" - one table showing whether the caps are applied, being
+/// overridden by a QoS/thermal floor, or applied while the cluster simply
+/// carries real load.
+pub fn print_policy_audit(config: &Config) -> String {
+    let active_mode = app_modes::read_mode_file()
+        .unwrap_or_else(|| config.modes.keys().next().cloned().unwrap_or_default());
+    let Some(profile) = config.modes.get(active_mode.as_str()) else {
+        return format!("当前档位 {active_mode} 不在配置中，无法审计");
+    };
+    let mut out = String::from(
+        "cluster           配置min/max     实际min/max      当前频率(两次采样)   判定\n",
+    );
+    for (cluster, policy) in config.policy.iter().enumerate() {
+        if *policy < 0 {
+            continue;
+        }
+        let base: PathBuf = format!("/sys/devices/system/cpu/cpufreq/policy{policy}").into();
+        let read = |name: &str| -> String {
+            util::read_trimmed(base.join(name)).unwrap_or_else(|_| "?".into())
+        };
+        let configured_min = profile.clusters[cluster].min_freq.clone();
+        let configured_max = profile.clusters[cluster].max_freq.clone();
+        let actual_min = read("scaling_min_freq");
+        let actual_max = read("scaling_max_freq");
+        let cur_a = read("scaling_cur_freq");
+        std::thread::sleep(Duration::from_millis(400));
+        let cur_b = read("scaling_cur_freq");
+        let ceiling_matches = actual_max
+            .parse::<u64>()
+            .ok()
+            .zip(
+                scheduler::normalize_frequency(&base, &configured_max, false)
+                    .parse::<u64>()
+                    .ok(),
+            )
+            .is_some_and(|(actual, requested)| actual > 0 && actual <= requested);
+        let verdict = if ceiling_matches {
+            "已生效"
+        } else {
+            "上限被系统服务占用(温控/QoS/boost)"
+        };
+        out.push_str(&format!(
+            "policy{policy}(c{cluster})  {configured_min}/{configured_max}  {actual_min}/{actual_max}  {cur_a}..{cur_b}  {verdict}\n"
+        ));
+    }
+    out.push_str("当前档位: ");
+    out.push_str(&active_mode);
+    out.push_str("；当前频率长期贴近配置上限=负载真实存在；上限显示被占用=厂商服务在钳制该簇；已生效但仍高=瓶颈在 GPU/屏幕/网络而非 CPU\n");
+    out
 }
 
 pub fn send_signal(module: &Path, signal: i32) -> Result<()> {

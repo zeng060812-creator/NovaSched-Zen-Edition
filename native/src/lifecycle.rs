@@ -2,7 +2,7 @@ use crate::{
     daemon, ffi,
     logging::Logger,
     process_identity,
-    util::{self, Result, STATE_DIR},
+    util::{self, Result, CONFIG_PATH, STATE_DIR},
 };
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -290,6 +290,10 @@ pub fn diagnose(module: &Path) -> Result<()> {
         "\n[scene-telemetry]\n{}",
         crate::telemetry::inspect_scene().diagnostic_text()
     );
+    match crate::config::Config::load(Path::new(crate::util::CONFIG_PATH)) {
+        Ok(config) => println!("\n[policy-audit]\n{}", daemon::print_policy_audit(&config)),
+        Err(e) => println!("\n[policy-audit] 配置读取失败: {e}"),
+    }
     Ok(())
 }
 /// Preserve identity verification and add context, without guessing which

@@ -27,6 +27,9 @@ pub struct CpuctlLiveState {
     pub duration_ms: u64,
     /// False while a foreign scheduler owns the nodes.
     pub allowed: bool,
+    /// True while the foreground app has an explicit rule (the pulse is a
+    /// responsiveness feature for marked apps, not for every screen).
+    pub active: bool,
 }
 
 pub struct Scheduler {

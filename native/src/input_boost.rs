@@ -104,7 +104,7 @@ fn run(ctx: InputBoostContext, mut files: Vec<File>) {
         let Ok(state) = ctx.live.inner.lock() else {
             continue;
         };
-        if !state.allowed || state.boost_min.is_empty() {
+        if !state.allowed || !state.active || state.boost_min.is_empty() {
             continue;
         }
         if boosted {
