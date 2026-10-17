@@ -63,7 +63,7 @@ impl Session {
         // A new daemon session starts with only the built-in manager origin.
         // Custom exact origins are registered again by an authenticated root read.
         util::atomic_write(
-            &state.join(ORIGINS_FILE),
+            &crate::storage::path(&state, ORIGINS_FILE),
             format!("{DEFAULT_ORIGIN}\n").as_bytes(),
             0o600,
         )
@@ -73,7 +73,7 @@ impl Session {
 
     fn persist(&self, state: &Path) -> Result<()> {
         util::atomic_write(
-            &state.join(SESSION_FILE),
+            &crate::storage::path(&state, SESSION_FILE),
             format!(
                 "pid={}\nport={}\ntoken={}\n",
                 self.pid, self.port, self.token
@@ -159,7 +159,7 @@ fn read_protected(state: &Path, expected_uid: u32) -> Result<Session> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW)
-        .open(state.join(SESSION_FILE))
+        .open(crate::storage::path(&state, SESSION_FILE))
         .map_err(|_| "WebUI 凭据不可读取，请确认守护已启动".to_string())?;
     let metadata = file
         .metadata()
@@ -313,7 +313,8 @@ fn register_origin_owned(state: &Path, origin: &str, expected_uid: u32) -> Resul
     if origin == DEFAULT_ORIGIN {
         return Ok(());
     }
-    let _lock = util::acquire_flock(&state.join(ORIGINS_LOCK))?;
+    let deadline=std::time::Instant::now()+std::time::Duration::from_millis(500);
+    let _lock=loop{match util::acquire_flock(&crate::storage::path(&state,ORIGINS_LOCK)){Ok(l)=>break l,Err(_) if std::time::Instant::now()<deadline=>util::sleep(std::time::Duration::from_millis(5)),Err(e)=>return Err(e)}};
     let mut origins = read_origins(state, expected_uid)?;
     if origins.iter().any(|item| item.as_str() == origin) {
         return Ok(());
@@ -326,7 +327,7 @@ fn register_origin_owned(state: &Path, origin: &str, expected_uid: u32) -> Resul
     }
     let mut contents = origins.join("\n");
     contents.push('\n');
-    util::atomic_write(&state.join(ORIGINS_FILE), contents.as_bytes(), 0o600)
+    util::atomic_write(&crate::storage::path(&state, ORIGINS_FILE), contents.as_bytes(), 0o600)
         .map_err(|_| "无法安全登记 WebUI 页面来源".into())
 }
 
@@ -346,7 +347,7 @@ fn origin_is_allowed_in(state: &Path, origin: &str, expected_uid: u32) -> bool {
 }
 
 fn read_origins(state: &Path, expected_uid: u32) -> Result<Vec<String>> {
-    let path = state.join(ORIGINS_FILE);
+    let path = crate::storage::path(&state, ORIGINS_FILE);
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW)
@@ -406,7 +407,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&dir).unwrap();
+        crate::storage::prepare(&dir).unwrap();
         dir
     }
     fn session() -> Session {
@@ -456,7 +457,7 @@ mod tests {
     fn persisted_session_is_owner_only_and_unsafe_permissions_are_rejected() {
         let dir = fixture();
         session().persist(&dir).unwrap();
-        let path = dir.join(SESSION_FILE);
+        let path = dir.join("run/webui.session");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
         let uid = unsafe { crate::ffi::geteuid() };
         assert_eq!(read_protected(&dir, uid).unwrap().port, 31421);
@@ -470,8 +471,8 @@ mod tests {
         session().persist(&dir).unwrap();
         let uid = unsafe { crate::ffi::geteuid() };
         assert!(read_protected(&dir, uid.wrapping_add(1)).is_err());
-        fs::rename(dir.join(SESSION_FILE), dir.join("saved")).unwrap();
-        std::os::unix::fs::symlink(dir.join("saved"), dir.join(SESSION_FILE)).unwrap();
+        fs::rename(dir.join("run/webui.session"), dir.join("saved")).unwrap();
+        std::os::unix::fs::symlink(dir.join("saved"), dir.join("run/webui.session")).unwrap();
         assert!(read_protected(&dir, uid).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -483,7 +484,7 @@ mod tests {
     #[test]
     fn credential_write_failure_does_not_fall_back_to_public_protocol() {
         let dir = fixture();
-        fs::create_dir(dir.join(SESSION_FILE)).unwrap();
+        fs::create_dir(dir.join("run/webui.session")).unwrap();
         assert!(session().persist(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -547,7 +548,7 @@ mod tests {
         let dir = fixture();
         let uid = unsafe { crate::ffi::geteuid() };
         util::atomic_write(
-            &dir.join(ORIGINS_FILE),
+            &dir.join("run/webui.origins"),
             format!("{DEFAULT_ORIGIN}\n").as_bytes(),
             0o600,
         )
@@ -564,14 +565,14 @@ mod tests {
         assert_eq!(read_origins(&dir, uid).unwrap().len(), MAX_ORIGINS);
         assert!(!origin_is_allowed_in(&dir, custom, uid));
         util::atomic_write(
-            &dir.join(ORIGINS_FILE),
+            &dir.join("run/webui.origins"),
             format!("{DEFAULT_ORIGIN}\n").as_bytes(),
             0o600,
         )
         .unwrap();
         assert!(!origin_is_allowed_in(&dir, "https://ui-9.example", uid));
         register_origin_owned(&dir, custom, uid).unwrap();
-        fs::set_permissions(dir.join(ORIGINS_FILE), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(dir.join("run/webui.origins"), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!origin_is_allowed_in(&dir, custom, uid));
         fs::remove_dir_all(dir).unwrap();
     }

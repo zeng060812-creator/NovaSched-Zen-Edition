@@ -2,7 +2,9 @@
 import ctypes as c, ctypes.util, re, os
 from pathlib import Path
 os.environ['EGL_PLATFORM']='surfaceless'
-e=c.CDLL(ctypes.util.find_library('EGL'))
+egl_name=ctypes.util.find_library('EGL')
+if not egl_name:print('UNAVAILABLE: Mesa EGL library not found on this host');raise SystemExit(2)
+e=c.CDLL(egl_name)
 e.eglGetProcAddress.argtypes=[c.c_char_p];e.eglGetProcAddress.restype=c.c_void_p
 getdisplay=c.CFUNCTYPE(c.c_void_p,c.c_uint,c.c_void_p,c.POINTER(c.c_int))(e.eglGetProcAddress(b'eglGetPlatformDisplayEXT'))
 display=getdisplay(0x31dd,None,None)

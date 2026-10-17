@@ -18,11 +18,11 @@ use crate::ffi;
 pub const MODULE_DIR_DEFAULT: &str = "/data/adb/modules/NovaSched_Zen_Edition";
 pub const STATE_DIR: &str = "/data/adb/novasched";
 pub const RUNTIME_DIR: &str = STATE_DIR;
-pub const CONFIG_PATH: &str = "/data/adb/novasched/config.json";
-pub const MODE_PATH: &str = "/data/adb/novasched/mode.txt";
-pub const SCENE_REQUEST_PATH: &str = "/data/adb/novasched/scene-request.txt";
-pub const APP_MODES_PATH: &str = "/data/adb/novasched/app_modes.txt";
-pub const AUTO_POLICY_PATH: &str = "/data/adb/novasched/automatic.json";
+pub const CONFIG_PATH: &str = "/data/adb/novasched/config/config.json";
+pub const MODE_PATH: &str = "/data/adb/novasched/run/mode.txt";
+pub const SCENE_REQUEST_PATH: &str = "/data/adb/novasched/run/scene-request.txt";
+pub const APP_MODES_PATH: &str = "/data/adb/novasched/config/app_modes.txt";
+pub const AUTO_POLICY_PATH: &str = "/data/adb/novasched/config/automatic.json";
 
 pub type Result<T> = std::result::Result<T, String>;
 /// The constant is a last-resort fallback, not a root-framework path gate.
@@ -178,6 +178,7 @@ fn atomic_inner(
     mode: u32,
     preserve: Option<(&File, &[u8])>,
 ) -> Result<()> {
+    reject_symlink(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| format!("路径没有父目录: {}", path.display()))?;
@@ -264,6 +265,20 @@ fn cleanup(path: &Path) {
         eprintln!("novasched: {e}");
     }
 }
+
+/// A planted symlink at a destination means the private layout was tampered
+/// with. rename(2) would only replace the link itself, but the unexpected
+/// layout must be reported instead of silently accepted.
+fn reject_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(format!("拒绝覆盖符号链接: {}", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("检查 {} 失败: {e}", path.display())),
+    }
+}
 pub fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -272,28 +287,28 @@ pub fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn open_write_value(path: &Path, value: &str) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("打开节点 {} 失败: {e}", path.display()))?;
+fn open_write_value(path: &Path, value: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
     file.write_all(value.as_bytes())
-        .map_err(|e| format!("写入节点 {}={} 失败: {e}", path.display(), value))
 }
 
 pub fn write_node(path: &Path, value: &str) -> Result<()> {
     let original_mode = fs::metadata(path).ok().map(|m| m.mode() & 0o7777);
+    let describe = |error: &std::io::Error| {
+        format!("写入节点 {}={} 失败: {error}", path.display(), value)
+    };
     match open_write_value(path, value) {
         Ok(()) => Ok(()),
         Err(first_error) => {
             // Retrying a semantic sysfs rejection after chmod produces a
             // duplicate error and cannot make the node supported. Only retry
-            // genuine access-denied failures.
+            // genuine access-denied failures, identified by errno rather than
+            // by matching a localized message string.
             if !permission_retry_warranted(&first_error) {
-                return Err(first_error);
+                return Err(describe(&first_error));
             }
             let Some(mode) = original_mode else {
-                return Err(first_error);
+                return Err(describe(&first_error));
             };
             fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o600))
                 .map_err(|e| format!("节点 {} 不可写且修改权限失败: {e}", path.display()))?;
@@ -301,7 +316,7 @@ pub fn write_node(path: &Path, value: &str) -> Result<()> {
             let restore = fs::set_permissions(path, fs::Permissions::from_mode(mode));
             match (result, restore) {
                 (Ok(()), Ok(())) => Ok(()),
-                (Err(e), _) => Err(e),
+                (Err(e), _) => Err(describe(&e)),
                 (Ok(()), Err(e)) => Err(format!(
                     "写入成功但恢复节点权限 {} 失败: {e}",
                     path.display()
@@ -311,11 +326,10 @@ pub fn write_node(path: &Path, value: &str) -> Result<()> {
     }
 }
 
-fn permission_retry_warranted(error: &str) -> bool {
-    error.contains("Permission denied")
-        || error.contains("Operation not permitted")
-        || error.contains("os error 13)")
-        || error.contains("os error 1)")
+fn permission_retry_warranted(error: &std::io::Error) -> bool {
+    // EACCES (13) / EPERM (1): a chmod may grant write access. Anything else
+    // (EINVAL, EIO, ENOSPC, …) is semantic and retrying cannot help.
+    matches!(error.raw_os_error(), Some(13) | Some(1))
 }
 
 pub fn getprop(name: &str) -> String {
@@ -553,6 +567,7 @@ pub fn current_pid() -> i32 {
 }
 
 pub fn acquire_flock(path: &Path) -> Result<File> {
+    reject_symlink(path)?;
     if let Some(parent) = path.parent() {
         create_dir(parent)?;
     }
@@ -622,9 +637,14 @@ mod regression_tests {
         ] {
             assert!(!valid_package(p));
         }
-        assert!(!permission_retry_warranted("io (os error 110)"));
-        assert!(!permission_retry_warranted("io (os error 95)"));
-        assert!(permission_retry_warranted("io (os error 13)"));
+        assert!(!permission_retry_warranted(&std::io::Error::from_raw_os_error(110)));
+        assert!(!permission_retry_warranted(&std::io::Error::from_raw_os_error(95)));
+        assert!(permission_retry_warranted(&std::io::Error::from_raw_os_error(13)));
+        assert!(permission_retry_warranted(&std::io::Error::from_raw_os_error(1)));
+        assert!(!permission_retry_warranted(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied"
+        )));
     }
 }
 

@@ -17,6 +17,7 @@ const OUTPUT_LIMIT: u64 = 1_048_576;
 
 pub fn run(module: &Path, phase: &str) -> Result<()> {
     let (seconds, waiting) = match phase {
+        "prepare-storage" => (15,"正在整理模块数据目录。"),
         "self-test" => (20, "等待核心自检结果。"),
         "probe" => (20, "正在读取处理器与内核能力。"),
         "prepare-config" => (30, "正在准备配置和备份。"),
@@ -25,8 +26,11 @@ pub fn run(module: &Path, phase: &str) -> Result<()> {
         "scene-install" => (20, "正在备份并接管 Scene 调度。"),
         _ => return Err("未知安装检查，拒绝执行".into()),
     };
-    let log = module.join(format!("install-{phase}.log"));
-    let receipt = module.join(format!("install-{phase}.exit"));
+    let state=Path::new(util::STATE_DIR);
+    let temp=state.join("run/install");
+    util::create_dir(&temp)?;
+    let log=temp.join(format!("{phase}.log"));
+    let receipt=temp.join(format!("{phase}.exit"));
     util::remove_if_exists(&receipt)?;
     let mut command = Command::new(module.join("bin/novasched"));
     command.arg(phase).arg("--module-dir").arg(module);
@@ -43,25 +47,23 @@ pub fn run(module: &Path, phase: &str) -> Result<()> {
         Ok(code) => (code, None),
         Err(error) => (1, Some(error)),
     };
+    // The check binary prints Chinese text, but a child killed mid-write can
+    // leave truncated multi-byte sequences. Lossy decoding keeps the rest of
+    // the report readable instead of aborting the whole installation chain.
     let mut output = String::new();
     if let Ok(file) = File::open(&log) {
+        let mut bytes = Vec::new();
         file.take(OUTPUT_LIMIT)
-            .read_to_string(&mut output)
+            .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
+        output = String::from_utf8_lossy(&bytes).into_owned();
     }
     let detail = error.unwrap_or_else(|| match code {
         0 => String::new(),
         124 => format!("{phase} 超过 {seconds} 秒，已终止该检查及其查询子进程"),
         _ => format!("{phase} 退出码 {code}"),
     });
-    let mut all = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(module.join("install-check.log"))
-        .map_err(|e| e.to_string())?;
-    writeln!(all, "\n[{phase}]\n{output}\nexit={code}\n{detail}").map_err(|e| e.to_string())?;
-    all.flush().map_err(|e| e.to_string())?;
+    crate::logging::append_bounded(&state.join("logs/install.log"),&format!("\n[{phase}]\n{output}\nexit={code}\n{detail}\n")).map_err(|e|e.to_string())?;
     if code != 0 {
         if !output.is_empty() {
             println!("{output}");
@@ -70,7 +72,8 @@ pub fn run(module: &Path, phase: &str) -> Result<()> {
     } else {
         // Keep the console readable; the full hardware report stays in logs.
         for line in output.lines().filter(|line| {
-            line.starts_with("soc=")
+            line.starts_with("storage_deferred=")
+                || line.starts_with("soc=")
                 || line.starts_with("profile=")
                 || line.starts_with("config=")
                 || line.starts_with("backup=")

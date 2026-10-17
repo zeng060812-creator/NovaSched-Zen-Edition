@@ -21,11 +21,6 @@ pub fn run(module: &Path) -> Result<()> {
     if let Err(error) = crate::daemon::print_status(module) {
         println!("status_error={error}");
     }
-    let scene = crate::scene::detect();
-    println!(
-        "scene_pedestal_active={}",
-        crate::app_modes::scene_pedestal_active(scene.linked())
-    );
     print!("{}", kernel_report(Path::new("/")));
     print_configured_limits();
     print!("\n[fas]\n{}", crate::fas::inspect(Path::new("/")).report());
@@ -61,7 +56,7 @@ pub fn run(module: &Path) -> Result<()> {
         crate::telemetry::inspect_scene().diagnostic_text()
     );
     println!("\n[recent-log]");
-    match crate::lifecycle::tail(&Path::new(STATE_DIR).join("novasched.log"), 8192) {
+    match crate::lifecycle::tail(&crate::storage::path(Path::new(STATE_DIR), "novasched.log"), 8192) {
         Ok(text) => print!("{text}"),
         Err(error) => println!("unavailable: {error}"),
     }

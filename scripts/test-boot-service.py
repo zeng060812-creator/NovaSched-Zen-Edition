@@ -11,7 +11,8 @@ with tempfile.TemporaryDirectory(prefix="nova-boot-", dir=os.environ.get("TMPDIR
     (module / "bin").mkdir(parents=True)
     service = root / "service.sh"
     service.write_text((project / "module-template/service.sh").read_text().replace(
-        "MODDIR=${0%/*}", 'MODDIR="$NOVA_TEST_MODULE"'))
+        "MODDIR=${0%/*}", 'MODDIR="$NOVA_TEST_MODULE"').replace("NOVA_STATE=/data/adb/novasched", 'NOVA_STATE="$NOVA_TEST_STATE"'))
+    (root/"state/logs").mkdir(parents=True)
     core = module / "bin/novasched"
     core.write_text('''#!/usr/bin/env python3
 import os, sys
@@ -43,9 +44,12 @@ sleep() {
     def run(**options):
         for name in ["calls", "started", "disable", "boot-entry.log"]:
             (module / name).unlink(missing_ok=True)
-        env = dict(os.environ, NOVA_TEST_MODULE=str(module), NOVA_SERVICE=str(service), NOVA_SLEEP_COUNT="0")
+        env = dict(os.environ, NOVA_TEST_MODULE=str(module), NOVA_SERVICE=str(service), NOVA_SLEEP_COUNT="0", NOVA_TEST_STATE=str(root/"state"))
         env.update(options)
-        return subprocess.run(["sh", "-c", harness], env=env, capture_output=True, text=True, timeout=10)
+        # Sandboxed Windows hosts can take seconds per spawned process and the
+        # happy path alone needs ~19 stand-in invocations; 10 s only suffices
+        # on Unix. The logic under test is unchanged.
+        return subprocess.run(["sh", "-c", harness], env=env, capture_output=True, text=True, timeout=600)
 
     result = run()
     assert result.returncode == 0, result.stderr
@@ -60,6 +64,12 @@ sleep() {
         assert not (module / "started").exists()
         assert "start" not in (module / "calls").read_text().splitlines()
     print("PASS: disabling during unlock or settle cancels all startup writes")
+    import shutil
+    shutil.rmtree(root/'state')
+    result=run(NOVA_DISABLE_AFTER='1')
+    assert result.returncode==0 and not (root/'state').exists()
+    (root/'state/logs').mkdir(parents=True)
+    print('PASS: late boot does not recreate removed data directories')
     result = run(NOVA_BROKEN="1")
     assert result.returncode == 1
     assert (module / 'calls').read_text().splitlines() == ['boot-ready', 'version']
@@ -68,7 +78,7 @@ sleep() {
     result = run(NOVA_USER_FAILURE="1", NOVA_DISABLE_AFTER="12")
     assert result.returncode == 0
     assert not (module / 'started').exists()
-    entry = (module / 'boot-entry.log').read_text()
+    entry = (root / 'state/logs/boot-entry.log').read_text()
     assert entry.count('startup-gate:') == 2, entry
     assert 'Binder stdout denied' in entry
     print("PASS: a failed user query remains blocked and its actual cause is logged without flooding")

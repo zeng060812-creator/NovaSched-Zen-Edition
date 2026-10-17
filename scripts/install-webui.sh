@@ -12,8 +12,9 @@ MODULE_DIR=${1:-/data/adb/modules/NovaSched_Zen_Edition}
 if [ ! -f "$MODULE_DIR/module.prop" ] && [ "$#" -eq 0 ]; then
   MODULE_DIR=/data/adb/ap/modules/NovaSched_Zen_Edition
 fi
-if [ ! -f "$MODULE_DIR/module.prop" ] || ! grep -q '^id=NovaSched_Zen_Edition$' "$MODULE_DIR/module.prop" || ! grep -qE '^version=v2\.(2\.8|6\.[0-9]+|7\.[0-9]+)$' "$MODULE_DIR/module.prop" || [ ! -x "$MODULE_DIR/bin/novasched" ]; then
-  echo "没有找到已安装的 NovaSched Zen Edition。此更新支持 v2.2.8 与 v2.6.x；其它版本请完整安装。" >&2
+NOVA_VERSION=$(sed -n 's/^version=//p' "$SCRIPT_DIR/../module-template/module.prop")
+if [ -z "$NOVA_VERSION" ] || [ ! -f "$MODULE_DIR/module.prop" ] || ! grep -q '^id=NovaSched_Zen_Edition$' "$MODULE_DIR/module.prop" || ! grep -qx "version=$NOVA_VERSION" "$MODULE_DIR/module.prop" || [ ! -x "$MODULE_DIR/bin/novasched" ]; then
+  echo "请先完整安装 $NOVA_VERSION，再更新同一版本的界面。" >&2
   exit 1
 fi
 for file in index.html assets/app.js assets/app.css assets/liquid-glass.js assets/host.js assets/version.js; do
@@ -23,7 +24,9 @@ for file in index.html assets/app.js assets/app.css assets/liquid-glass.js asset
   fi
 done
 STAGING="$MODULE_DIR/.webroot-new-$$"
-BACKUP="$MODULE_DIR/.webroot-before-update-$(date +%Y%m%d-%H%M%S)-$$"
+BACKUP="$MODULE_DIR/.webroot-before-update-$$"
+LOCK="$MODULE_DIR/.webui-update.lock"
+mkdir "$LOCK" 2>/dev/null || { echo "另一个界面更新正在进行" >&2; exit 1; }
 rollback() {
   code=$?
   trap - EXIT HUP INT TERM
@@ -31,6 +34,8 @@ rollback() {
     mv "$BACKUP" "$MODULE_DIR/webroot" || true
   fi
   [ ! -d "$STAGING" ] || rm -rf "$STAGING"
+  if [ "$code" -eq 0 ]; then [ ! -d "$BACKUP" ] || rm -rf "$BACKUP"; fi
+  rmdir "$LOCK" || true
   exit "$code"
 }
 trap rollback EXIT
@@ -43,4 +48,4 @@ if [ -d "$MODULE_DIR/webroot" ]; then mv "$MODULE_DIR/webroot" "$BACKUP"; fi
 mv "$STAGING" "$MODULE_DIR/webroot"
 echo "WebUI 已更新。关闭管理器内的页面，再重新打开。"
 echo "此脚本仅更新界面；FAS 后端与四档新策略需要完整编译安装并重启。"
-if [ -d "$BACKUP" ]; then echo "旧 WebUI 已备份到：$BACKUP"; fi
+echo "临时回滚副本已清理。"

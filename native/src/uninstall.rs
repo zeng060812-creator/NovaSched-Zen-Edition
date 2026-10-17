@@ -6,18 +6,25 @@ use crate::{
     snapshot::Snapshot,
     util::{self, Result, STATE_DIR},
 };
-use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 pub fn run(module: &Path) -> Result<()> {
     if unsafe { ffi::geteuid() } != 0 {
         return Err("卸载需要 root".into());
     }
-    let prop = util::read_text(&module.join("module.prop"))?;
+    let prop = match util::read_text(&module.join("module.prop")) {
+        Ok(prop) => prop,
+        Err(error) => {
+            // The manager may already have removed the module directory (or
+            // an interrupted flash left it incomplete). The in-module binary
+            // and identity checks are unavailable then, so degrade to data
+            // cleanup only instead of failing the whole uninstall.
+            println!("模块目录不可用（{error}），仅清理 NovaSched 运行数据。");
+            return cleanup_data_only();
+        }
+    };
     if !prop.lines().any(|line| line == "id=NovaSched_Zen_Edition") {
         return Err("模块身份不匹配，取消清理".into());
     }
@@ -26,10 +33,10 @@ pub fn run(module: &Path) -> Result<()> {
     if fs::symlink_metadata(state).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("运行目录被替换为符号链接，拒绝访问链接目标".into());
     }
-    println!("[1/4] 请调度下班：停止守护和启动监督。");
+    println!("[1/4] 停止守护和启动监督。");
     let deadline = Instant::now() + Duration::from_secs(10);
     let _control = loop {
-        match util::acquire_flock(&state.join("control.lock")) {
+        match util::acquire_flock(&crate::storage::path(&state, "control.lock")) {
             Ok(lock) => break lock,
             Err(error) if Instant::now() >= deadline => {
                 return Err(format!("等待控制锁失败：{error}"))
@@ -42,55 +49,63 @@ pub fn run(module: &Path) -> Result<()> {
         // Only an identity-verified pidfd may force a hung daemon to exit.
         // Keep stop.requested in place so the supervisor will not restart it.
         println!("  正常停止未完成，正在核验进程身份后结束卡住的守护。");
-        process_identity::verify(state, module)?.signal(ffi::SIGKILL)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !idle(state)? && Instant::now() < deadline {
-            util::sleep(Duration::from_millis(100));
+        match process_identity::verify(state, module)
+            .and_then(|identity| identity.signal(ffi::SIGKILL))
+        {
+            Ok(()) => {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !idle(state)? && Instant::now() < deadline {
+                    util::sleep(Duration::from_millis(100));
+                }
+            }
+            // Identity verification failing must not abort the uninstall:
+            // require_idle below still guarantees nothing is deleted while a
+            // live scheduler holds the locks.
+            Err(error) => println!("  ! 无法核验或结束残留进程：{error}"),
         }
     }
     require_idle(state)?;
     if let Err(error) = stopped {
         println!("  停止记录：{error}；已确认所有运行锁释放，继续恢复。");
     }
-    let _daemon = util::acquire_flock(&state.join("daemon.lock"))?;
-    let _supervisor = util::acquire_flock(&state.join("supervisor.lock"))?;
+    let _daemon = util::acquire_flock(&crate::storage::path(&state, "daemon.lock"))?;
+    let _supervisor = util::acquire_flock(&crate::storage::path(&state, "supervisor.lock"))?;
 
-    println!("[2/4] 把系统交还原厂：恢复节点值、权限、属性和服务。");
+    println!("[2/4] 恢复节点值、权限、属性和服务。");
     let mut warnings = Vec::new();
-    if state.join("stock_snapshot.tsv").exists() {
+    let mut errors = Vec::new();
+    if scene::detect().controls_locked() {
+        // A foreign scheduler owns the nodes right now and this daemon has
+        // not written anything since the takeover. Restoring the snapshot
+        // would overwrite the foreign controller's live values.
+        println!("  节点由外部调度器接管，NovaSched 自接管起未修改节点，跳过恢复。");
+    } else if crate::storage::path(&state, "stock_snapshot.tsv").exists() {
         match Snapshot::load(state, Logger::new(state)).and_then(|snapshot| snapshot.restore()) {
             Ok(count) => println!("  已恢复 {count} 项原厂设置。"),
-            Err(error) => warnings.push(format!("部分原厂设置未恢复：{error}；卸载后请重启手机")),
+            Err(error) => errors.push(format!("部分原厂设置未恢复：{error}")),
         }
     } else {
         println!("  没有原厂快照，本次无需恢复节点。");
     }
 
     println!("[3/4] Scene 收尾：恢复原回调，移除 NovaSched 自己的回调。");
-    let mut errors = Vec::new();
     match scene::uninstall_provider() {
         Ok(notes) => warnings.extend(notes),
         Err(error) => errors.push(format!("Scene 清理未完成：{error}")),
     }
 
-    println!("[4/4] 行李带走：清理配置、规则、凭据、备份、缓存和日志。");
+    if !errors.is_empty(){return Err(format!("恢复未完成，已保留配置、日志和 restore 恢复数据：{}；请重启后重试卸载",errors.join("；")));}
+    println!("[4/4] 清理配置、规则、凭据、备份、缓存和日志。");
     let storage_roots = [
         PathBuf::from("/storage/emulated"),
         PathBuf::from("/data/media"),
     ];
     let mirrors = mirror_paths(&storage_roots);
-    let pending_users = pending_storage_users(&storage_roots);
     let pending = [
         PathBuf::from("/data/adb/modules_update/NovaSched_Zen_Edition"),
         PathBuf::from("/data/adb/ap/modules_update/NovaSched_Zen_Edition"),
     ];
     errors.extend(cleanup(module, state, &mirrors, &pending));
-    if !pending_users.is_empty() {
-        match defer_storage_cleanup(&pending_users) {
-            Ok(()) => println!("  加密存储尚未就绪：解锁后清理日志，一次性清理脚本随后自删。"),
-            Err(error) => errors.push(format!("安排解锁后的日志清理失败：{error}")),
-        }
-    }
     for warning in warnings {
         println!("  ! {warning}");
     }
@@ -98,13 +113,13 @@ pub fn run(module: &Path) -> Result<()> {
         return Err(format!("卸载清理未完成：{}", errors.join("；")));
     }
     println!("  ✓ 模块运行目录、可访问的日志镜像和待更新副本已清理。");
-    println!("NovaSched 已下班。模块本体由 root 管理器移除，感谢使用 · ZenJooo");
+    println!("NovaSched 数据已清理。模块本体由 root 管理器移除 · ZenJooo");
     Ok(())
 }
 
 fn idle(state: &Path) -> Result<bool> {
-    Ok(!process_identity::lock_held(&state.join("daemon.lock"))?
-        && !process_identity::lock_held(&state.join("supervisor.lock"))?)
+    Ok(!process_identity::lock_held(&crate::storage::path(&state, "daemon.lock"))?
+        && !process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))?)
 }
 fn require_idle(state: &Path) -> Result<()> {
     if idle(state)? {
@@ -134,80 +149,6 @@ fn mirror_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
     result
 }
 
-fn pending_storage_users(roots: &[PathBuf]) -> BTreeSet<u32> {
-    let mut users = BTreeSet::new();
-    let mut seen = false;
-    for root in roots {
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let Ok(id) = entry.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            seen = true;
-            let accessible = roots.iter().any(|base| {
-                fs::symlink_metadata(base.join(id.to_string()).join("Android"))
-                    .is_ok_and(|meta| meta.is_dir())
-            });
-            if !accessible {
-                users.insert(id);
-            }
-        }
-    }
-    if !seen && !Path::new("/sdcard/Android").is_dir() {
-        users.insert(0);
-    }
-    users
-}
-
-fn defer_storage_cleanup(users: &BTreeSet<u32>) -> Result<()> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_nanos();
-    let script = PathBuf::from(format!(
-        "/data/adb/service.d/novasched-uninstall-cleanup-{}-{stamp}.sh",
-        util::current_pid()
-    ));
-    util::atomic_write(&script, storage_cleanup_script(users).as_bytes(), 0o700)?;
-    // Root managers also run this one-time service.d script on subsequent
-    // boots if storage stays locked or the phone reboots before cleanup.
-    let mut command = Command::new("/system/bin/sh");
-    command
-        .arg(&script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if ffi::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    if let Err(error) = command.spawn() {
-        println!("  清理脚本已保存，将在下次开机解锁后执行：{error}");
-    }
-    Ok(())
-}
-
-fn storage_cleanup_script(users: &BTreeSet<u32>) -> String {
-    let ids = users
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "#!/system/bin/sh\nNOVA_USERS='{ids}'\n{}",
-        include_str!("storage_cleanup.sh")
-    )
-}
-
 fn remove_owned_tree(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
@@ -218,16 +159,12 @@ fn remove_owned_tree(path: &Path) -> Result<()> {
     .map_err(|e| format!("清理 {} 失败：{e}", path.display()))
 }
 
-fn cleanup(module: &Path, state: &Path, mirrors: &[PathBuf], pending: &[PathBuf]) -> Vec<String> {
-    let mut errors = Vec::new();
-    // All supplied paths belong to this module. Never recurse into a symlink.
-    for mirror in mirrors {
-        if let Err(error) = remove_owned_tree(mirror) {
-            errors.push(error);
-        }
-    }
+/// Pending module copies in modules_update must only be removed after
+/// verifying they belong to this module; `exclude` protects the live module
+/// directory when it is passed as one of the candidates.
+fn remove_pending_module_copies(pending: &[PathBuf], exclude: &Path, errors: &mut Vec<String>) {
     for path in pending {
-        if path == module {
+        if path == exclude {
             continue;
         }
         let missing_owned = path
@@ -248,6 +185,17 @@ fn cleanup(module: &Path, state: &Path, mirrors: &[PathBuf], pending: &[PathBuf]
             _ => {}
         }
     }
+}
+
+fn cleanup(module: &Path, state: &Path, mirrors: &[PathBuf], pending: &[PathBuf]) -> Vec<String> {
+    let mut errors = Vec::new();
+    // All supplied paths belong to this module. Never recurse into a symlink.
+    for mirror in mirrors {
+        if let Err(error) = remove_owned_tree(mirror) {
+            errors.push(error);
+        }
+    }
+    remove_pending_module_copies(pending, module, &mut errors);
     if let Ok(entries) = fs::read_dir(module) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -265,7 +213,52 @@ fn cleanup(module: &Path, state: &Path, mirrors: &[PathBuf], pending: &[PathBuf]
     if let Err(error) = remove_owned_tree(state) {
         errors.push(error);
     }
+    // Deferred cleanup scripts left in service.d from earlier interrupted
+    // uninstalls would otherwise run forever on every boot.
+    if let Err(error) = crate::storage::cleanup_deferred_scripts(Path::new("/data/adb/service.d")) {
+        errors.push(error);
+    }
     errors
+}
+
+/// Data-only cleanup used when the module directory itself is already gone:
+/// stop signalling, snapshot restore and Scene teardown all require the
+/// in-module binary, so only NovaSched-owned data can be removed safely.
+fn cleanup_data_only() -> Result<()> {
+    let state = Path::new(STATE_DIR);
+    if fs::symlink_metadata(state).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("运行目录被替换为符号链接，拒绝访问链接目标".into());
+    }
+    if state.exists() && !idle(state)? {
+        return Err("调度进程仍在运行，未删除运行数据；请先停止模块后再清理".into());
+    }
+    let mut errors = Vec::new();
+    let mirrors = mirror_paths(&[
+        PathBuf::from("/storage/emulated"),
+        PathBuf::from("/data/media"),
+    ]);
+    for mirror in &mirrors {
+        if let Err(error) = remove_owned_tree(mirror) {
+            errors.push(error);
+        }
+    }
+    let pending = [
+        PathBuf::from("/data/adb/modules_update/NovaSched_Zen_Edition"),
+        PathBuf::from("/data/adb/ap/modules_update/NovaSched_Zen_Edition"),
+    ];
+    remove_pending_module_copies(&pending, Path::new(""), &mut errors);
+    if let Err(error) = remove_owned_tree(state) {
+        errors.push(error);
+    }
+    if let Err(error) = crate::storage::cleanup_deferred_scripts(Path::new("/data/adb/service.d")) {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        println!("NovaSched 数据已清理（模块本体已由管理器移除）。");
+        Ok(())
+    } else {
+        Err(format!("数据清理未完成：{}", errors.join("；")))
+    }
 }
 
 #[cfg(test)]
@@ -275,7 +268,7 @@ mod tests {
     fn fixture(name: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("nova-uninstall-{}-{name}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        crate::storage::prepare(&root).unwrap();
         root
     }
     #[test]
@@ -289,7 +282,7 @@ mod tests {
         let incomplete = root.join("incomplete/NovaSched_Zen_Edition");
         for dir in [
             &module,
-            &state.join("scene-provider"),
+            &crate::storage::path(&state, "scene-provider"),
             &mirror,
             &pending,
             &foreign,
@@ -306,7 +299,8 @@ mod tests {
             "novasched.log",
             "scene-provider/powercfg.json.backup",
         ] {
-            fs::write(state.join(file), b"saved").unwrap();
+            let path=if file.starts_with("scene-provider/"){state.join("restore/scene/powercfg.json.backup")}else{crate::storage::path(&state,file)};
+            fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,b"saved").unwrap();
         }
         fs::write(module.join("install-check.log"), b"log").unwrap();
         fs::write(module.join("install-scene-status.exit"), b"124").unwrap();
@@ -350,11 +344,11 @@ mod tests {
     #[test]
     fn running_daemon_or_supervisor_blocks_deletion() {
         let state = fixture("locks");
-        fs::write(state.join("stock_snapshot.tsv"), b"backup").unwrap();
+        fs::write(crate::storage::path(&state, "stock_snapshot.tsv"), b"backup").unwrap();
         for file in ["daemon.lock", "supervisor.lock"] {
             let lock = util::acquire_flock(&state.join(file)).unwrap();
             assert!(require_idle(&state).is_err());
-            assert!(state.join("stock_snapshot.tsv").exists());
+            assert!(crate::storage::path(&state, "stock_snapshot.tsv").exists());
             drop(lock);
         }
         require_idle(&state).unwrap();
@@ -376,20 +370,5 @@ mod tests {
             || p.starts_with(storage.join("legacy"))));
         fs::remove_dir_all(root).unwrap();
     }
-    #[test]
-    fn queues_locked_users_but_accessible_storage_is_cleaned_immediately() {
-        let root = fixture("locked");
-        let raw = root.join("media");
-        let mounted = root.join("emulated");
-        fs::create_dir_all(raw.join("0")).unwrap();
-        fs::create_dir_all(raw.join("10")).unwrap();
-        fs::create_dir_all(mounted.join("0/Android")).unwrap();
-        assert_eq!(
-            pending_storage_users(&[raw.clone(), mounted.clone()]),
-            BTreeSet::from([10])
-        );
-        fs::create_dir(raw.join("10/Android")).unwrap();
-        assert!(pending_storage_users(&[raw, mounted]).is_empty());
-        fs::remove_dir_all(root).unwrap();
-    }
+
 }

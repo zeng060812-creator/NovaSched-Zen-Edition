@@ -42,18 +42,26 @@ impl Snapshot {
 
     fn load_for_boot(state_dir: &Path, logger: Logger, boot: &str) -> Result<Self> {
         util::create_dir(state_dir)?;
-        let file = state_dir.join("stock_snapshot.tsv");
+        let file = crate::storage::path(&state_dir, "stock_snapshot.tsv");
+        util::create_dir(file.parent().ok_or("快照目录无效")?)?;
         let mut renew = false;
         let (entries, properties) = if file.exists() {
             let text = util::read_text(&file)?;
             let (entries, properties, saved_boot) = parse(&text)?;
             if !boot.is_empty() && saved_boot.as_deref() != Some(boot) {
-                util::atomic_write(
-                    &state_dir.join("stock_snapshot.previous.tsv"),
-                    text.as_bytes(),
-                    0o600,
-                )?;
-                logger.info("开机周期已改变或旧快照没有开机标识，重新采集当前内核原始值");
+                // Keep the previous boot's snapshot for manual inspection
+                // instead of discarding it: if the daemon crashed after
+                // writing but before restoring, these are the only records
+                // of what the kernel values were before that boot's session.
+                let previous = file.with_file_name("stock_snapshot.previous.tsv");
+                match fs::rename(&file, &previous) {
+                    Ok(()) => logger.info(
+                        "开机周期已改变或旧快照没有开机标识；上一周期的快照已转存为 stock_snapshot.previous.tsv，重新采集当前内核原始值",
+                    ),
+                    Err(error) => logger.warn(format!(
+                        "开机周期已改变，但转存上一周期快照失败: {error}；重新采集当前内核原始值"
+                    )),
+                }
                 renew = true;
                 Default::default()
             } else {
@@ -446,11 +454,18 @@ impl Snapshot {
             };
             match result {
                 Ok(()) => {
+                    // The value itself is restored. A chmod rejection (e.g.
+                    // SELinux neverallow on sysfs) must not fail the whole
+                    // restore or block uninstall; it only leaves the node
+                    // with its current, usually stricter, mode.
                     if let Err(error) = fs::set_permissions(
                         path,
                         std::os::unix::fs::PermissionsExt::from_mode(entry.mode),
                     ) {
-                        failures.push(format!("恢复权限 {} 失败: {error}", path.display()));
+                        self.logger.warn(format!(
+                            "节点值已恢复，但权限 {} 恢复失败（已忽略）: {error}",
+                            path.display()
+                        ));
                     }
                     restored += 1;
                 }
@@ -633,23 +648,25 @@ mod tests {
     #[test]
     fn boot_identity_retains_same_boot_and_renews_stale_or_unbound_snapshots() {
         let dir = std::env::temp_dir().join(format!("nova-snapshot-boots-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("restore")).unwrap();
         let nodes = "N\t2f7379732f74657374\t644\t3132330a\nP\t40736572766963653a7065726664\t72756e6e696e67\n";
         let current = format!("{HEADER}\nB\t{}\n{nodes}", util::hex_encode(b"boot-a"));
-        fs::write(dir.join("stock_snapshot.tsv"), &current).unwrap();
+        fs::write(dir.join("restore/stock_snapshot.tsv"), &current).unwrap();
         let same = Snapshot::load_for_boot(&dir, Logger::new(&dir), "boot-a").unwrap();
         assert_eq!(same.count(), 2);
         let new = Snapshot::load_for_boot(&dir, Logger::new(&dir), "boot-b").unwrap();
         assert_eq!(new.count(), 0);
-        assert_eq!(
-            fs::read_to_string(dir.join("stock_snapshot.previous.tsv")).unwrap(),
-            current
-        );
+        // The stale snapshot is kept as restore/stock_snapshot.previous.tsv
+        // instead of being silently discarded.
+        let previous =
+            fs::read_to_string(dir.join("restore/stock_snapshot.previous.tsv")).unwrap();
+        let (_, _, previous_boot) = parse(&previous).unwrap();
+        assert_eq!(previous_boot.as_deref(), Some("boot-a"));
         let (_, _, boot) =
-            parse(&fs::read_to_string(dir.join("stock_snapshot.tsv")).unwrap()).unwrap();
+            parse(&fs::read_to_string(dir.join("restore/stock_snapshot.tsv")).unwrap()).unwrap();
         assert_eq!(boot.as_deref(), Some("boot-b"));
         fs::write(
-            dir.join("stock_snapshot.tsv"),
+            dir.join("restore/stock_snapshot.tsv"),
             format!("{LEGACY_HEADER}\n{nodes}"),
         )
         .unwrap();
@@ -671,7 +688,7 @@ mod regression_tests {
         let node = dir.join("node");
         fs::write(&node, b"old\n").unwrap();
         let snap = Snapshot::load(&dir, Logger::new(&dir)).unwrap();
-        fs::create_dir(dir.join("stock_snapshot.tsv")).unwrap();
+        fs::create_dir(dir.join("restore/stock_snapshot.tsv")).unwrap();
         for _ in 0..2 {
             assert!(snap.write_unlogged(&node, "new\n").is_err());
             assert_eq!(snap.count(), 0);
@@ -740,7 +757,7 @@ mod batch_tests {
         snap.capture_batch(nodes.clone(), &[]).unwrap();
         assert_eq!(snap.persists.load(Ordering::Relaxed), 1);
         assert!(snap.written_nodes().is_empty());
-        let saved = fs::read_to_string(dir.join("stock_snapshot.tsv")).unwrap();
+        let saved = fs::read_to_string(dir.join("restore/stock_snapshot.tsv")).unwrap();
         assert_eq!(
             saved.lines().filter(|line| line.starts_with("N\t")).count(),
             64
@@ -773,12 +790,12 @@ mod batch_tests {
         let node = dir.join("node");
         fs::write(&node, "stock").unwrap();
         let snap = Snapshot::load(&dir, Logger::new(&dir)).unwrap();
-        fs::create_dir(dir.join("stock_snapshot.tsv")).unwrap();
+        fs::create_dir(dir.join("restore/stock_snapshot.tsv")).unwrap();
         assert!(snap.capture_batch([node.clone()], &[]).is_err());
         assert_eq!(snap.count(), 0);
         assert!(snap.write(&node, "apply").is_err());
         assert_eq!(fs::read_to_string(&node).unwrap(), "stock");
-        fs::remove_dir(dir.join("stock_snapshot.tsv")).unwrap();
+        fs::remove_dir(dir.join("restore/stock_snapshot.tsv")).unwrap();
         snap.capture_batch([node.clone()], &[]).unwrap();
         snap.write(&node, "apply").unwrap();
         fs::remove_dir_all(dir).unwrap();

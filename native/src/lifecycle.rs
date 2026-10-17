@@ -23,10 +23,10 @@ pub fn start(module: &Path, restart: bool) -> Result<()> {
     ensure_not_removing(module)?;
     crate::boot_guard::ensure_ready()?;
     let state = Path::new(STATE_DIR);
-    let _control = util::acquire_flock(&state.join("control.lock"))?;
+    let _control = util::acquire_flock(&crate::storage::path(&state, "control.lock"))?;
     ensure_not_removing(module)?;
-    let daemon_running = process_identity::lock_held(&state.join("daemon.lock"))?;
-    let supervisor_running = process_identity::lock_held(&state.join("supervisor.lock"))?;
+    let daemon_running = process_identity::lock_held(&crate::storage::path(&state, "daemon.lock"))?;
+    let supervisor_running = process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))?;
     if daemon_running && !restart {
         return daemon::print_status(module);
     }
@@ -36,21 +36,22 @@ pub fn start(module: &Path, restart: bool) -> Result<()> {
         return Err("崩溃监督正在恢复守护；请稍后再启动".into());
     }
     for _ in 0..100 {
-        if !process_identity::lock_held(&state.join("supervisor.lock"))? {
+        if !process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))? {
             break;
         }
         util::sleep(Duration::from_millis(100));
     }
-    if process_identity::lock_held(&state.join("supervisor.lock"))? {
+    if process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))? {
         return Err("已有启动监督，未创建第二实例，请稍后重试".into());
     }
-    util::remove_if_exists(&state.join("last_error"))?;
-    util::remove_if_exists(&state.join("stop.requested"))?;
-    util::atomic_write(&state.join("startup"), b"state=launching\n", 0o600)?;
+    util::remove_if_exists(&crate::storage::path(&state, "last_error"))?;
+    util::remove_if_exists(&crate::storage::path(&state, "stop.requested"))?;
+    util::atomic_write(&crate::storage::path(&state, "startup"), b"state=launching\n", 0o600)?;
+    crate::logging::append_bounded(&crate::storage::path(state,"bootstrap.log"),"\n-- start --\n").map_err(|e|e.to_string())?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(state.join("bootstrap.log"))
+        .open(crate::storage::path(&state, "bootstrap.log"))
         .map_err(|e| e.to_string())?;
     let stderr = log.try_clone().map_err(|e| e.to_string())?;
     let exe = fs::canonicalize(module.join("bin/novasched")).map_err(|e| e.to_string())?;
@@ -80,11 +81,11 @@ pub fn start(module: &Path, restart: bool) -> Result<()> {
         if let Some(exit) = child.try_wait().map_err(|e| e.to_string())? {
             return Err(format!(
                 "调度未就绪，监督退出 {exit}；{}",
-                util::read_trimmed(state.join("last_error"))
+                util::read_trimmed(crate::storage::path(&state, "last_error"))
                     .unwrap_or_else(|_| "请运行 diagnose".into())
             ));
         }
-        if util::read_trimmed(state.join("startup")).ok().as_deref() == Some("state=running")
+        if util::read_trimmed(crate::storage::path(&state, "startup")).ok().as_deref() == Some("state=running")
             && daemon::health(module).is_ok()
         {
             println!("已验证进程身份、排他锁与调度心跳；实际下发状态见 phase");
@@ -97,8 +98,8 @@ pub fn start(module: &Path, restart: bool) -> Result<()> {
 pub fn supervise(module: &Path) -> Result<()> {
     root()?;
     let state = Path::new(STATE_DIR);
-    let _lock = util::acquire_flock(&state.join("supervisor.lock"))?;
-    if process_identity::lock_held(&state.join("daemon.lock"))? {
+    let _lock = util::acquire_flock(&crate::storage::path(&state, "supervisor.lock"))?;
+    if process_identity::lock_held(&crate::storage::path(&state, "daemon.lock"))? {
         return Err("已有守护持锁，取消重复启动".into());
     }
     let logger = Logger::new(state);
@@ -179,14 +180,14 @@ fn wait_child(child: &mut Child, module: &Path, state: &Path) -> Result<std::pro
 }
 
 fn stop_requested(state: &Path) -> bool {
-    state.join("stop.requested").exists()
+    crate::storage::path(&state, "stop.requested").exists()
 }
 
 fn finish_requested_stop(state: &Path) -> Result<()> {
-    if util::read_trimmed(state.join("startup")).ok().as_deref() != Some("state=failed") {
-        util::atomic_write(&state.join("startup"), b"state=stopped\n", 0o600)?;
+    if util::read_trimmed(crate::storage::path(&state, "startup")).ok().as_deref() != Some("state=failed") {
+        util::atomic_write(&crate::storage::path(&state, "startup"), b"state=stopped\n", 0o600)?;
     }
-    util::remove_if_exists(&state.join("stop.requested"))
+    util::remove_if_exists(&crate::storage::path(&state, "stop.requested"))
 }
 
 /// Returns true when a user stop arrived before the backoff expired.
@@ -202,12 +203,12 @@ fn wait_retry_or_stop(state: &Path, retry: usize) -> bool {
 }
 pub fn record_failure(state: &Path, stage: &str, error: &str, preserve: bool) -> Result<()> {
     let old = if preserve {
-        util::read_text(&state.join("last_error")).unwrap_or_default()
+        util::read_text(&crate::storage::path(&state, "last_error")).unwrap_or_default()
     } else {
         String::new()
     };
     util::atomic_write(
-        &state.join("last_error"),
+        &crate::storage::path(&state, "last_error"),
         format!(
             "{old}time={}\nstage={stage}\nerror={error}\n",
             util::local_timestamp()
@@ -215,23 +216,23 @@ pub fn record_failure(state: &Path, stage: &str, error: &str, preserve: bool) ->
         .as_bytes(),
         0o600,
     )?;
-    util::atomic_write(&state.join("startup"), b"state=failed\n", 0o600)
+    util::atomic_write(&crate::storage::path(&state, "startup"), b"state=failed\n", 0o600)
 }
 pub fn stop(module: &Path) -> Result<()> {
     root()?;
-    let _control = util::acquire_flock(&Path::new(STATE_DIR).join("control.lock"))?;
+    let _control = util::acquire_flock(&crate::storage::path(Path::new(STATE_DIR), "control.lock"))?;
     stop_inner(module)
 }
 pub(crate) fn stop_inner(module: &Path) -> Result<()> {
     let state = Path::new(STATE_DIR);
     util::create_dir(state)?;
-    let daemon_running = process_identity::lock_held(&state.join("daemon.lock"))?;
-    let supervisor_running = process_identity::lock_held(&state.join("supervisor.lock"))?;
+    let daemon_running = process_identity::lock_held(&crate::storage::path(&state, "daemon.lock"))?;
+    let supervisor_running = process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))?;
     if !daemon_running && !supervisor_running {
         println!("守护未持锁，无需发送信号");
         return Ok(());
     }
-    util::atomic_write(&state.join("stop.requested"), b"stop=1\n", 0o600)?;
+    util::atomic_write(&crate::storage::path(&state, "stop.requested"), b"stop=1\n", 0o600)?;
     if daemon_running {
         if let Err(error) =
             process_identity::verify(state, module).and_then(|process| process.signal(ffi::SIGTERM))
@@ -240,18 +241,18 @@ pub(crate) fn stop_inner(module: &Path) -> Result<()> {
         }
     }
     for _ in 0..300 {
-        if !process_identity::lock_held(&state.join("daemon.lock"))?
-            && !process_identity::lock_held(&state.join("supervisor.lock"))?
+        if !process_identity::lock_held(&crate::storage::path(&state, "daemon.lock"))?
+            && !process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))?
         {
-            util::remove_if_exists(&state.join("stop.requested"))?;
+            util::remove_if_exists(&crate::storage::path(&state, "stop.requested"))?;
             if !daemon_running {
                 println!("已取消守护重试；节点状态由最近一次失败恢复流程记录");
                 return Ok(());
             }
-            if util::read_trimmed(state.join("startup")).ok().as_deref() == Some("state=failed") {
+            if util::read_trimmed(crate::storage::path(&state, "startup")).ok().as_deref() == Some("state=failed") {
                 return Err(format!(
                     "守护已退出，但退出或回滚失败: {}",
-                    util::read_trimmed(state.join("last_error"))
+                    util::read_trimmed(crate::storage::path(&state, "last_error"))
                         .unwrap_or_else(|_| "请查看内部日志".into())
                 ));
             }
@@ -277,17 +278,17 @@ pub fn request_webui_start(module: &Path) -> Result<&'static str> {
     crate::boot_guard::ensure_ready()?;
     let state = Path::new(STATE_DIR);
     util::create_dir(state)?;
-    let _lock = util::acquire_flock(&state.join("webui-start.lock"))?;
-    let phase = util::read_trimmed(state.join("startup")).unwrap_or_default();
+    let _lock = util::acquire_flock(&crate::storage::path(&state, "webui-start.lock"))?;
+    let phase = util::read_trimmed(crate::storage::path(&state, "startup")).unwrap_or_default();
     if phase == "state=failed" || phase == "state=stopped" || stop_requested(state) {
         return Ok("服务已停止或启动失败；点状态卡读取诊断，可使用「启动服务」重试");
     }
-    if process_identity::lock_held(&state.join("daemon.lock"))?
-        || process_identity::lock_held(&state.join("supervisor.lock"))?
-        || process_identity::lock_held(&state.join("control.lock"))?
+    if process_identity::lock_held(&crate::storage::path(&state, "daemon.lock"))?
+        || process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))?
+        || process_identity::lock_held(&crate::storage::path(&state, "control.lock"))?
     { return Ok("服务正在启动，页面会自动重连"); }
     let boot = util::read_trimmed("/proc/sys/kernel/random/boot_id")?;
-    let ticket = state.join("webui-start.boot");
+    let ticket = crate::storage::path(&state, "webui-start.boot");
     if util::read_trimmed(&ticket).ok().as_deref() == Some(&boot) {
         return Ok("本次开机已尝试补启动；点状态卡读取诊断");
     }
@@ -339,16 +340,12 @@ pub fn diagnose(module: &Path) -> Result<()> {
         "novasched.log",
     ] {
         println!("\n[{name}]");
-        match tail(&Path::new(STATE_DIR).join(name), 32768) {
+        match tail(&crate::storage::path(Path::new(STATE_DIR), name), 32768) {
             Ok(s) => println!("{s}"),
             Err(e) => println!("{e}"),
         }
     }
-    println!("\n[module/boot-entry.log]");
-    match tail(&module.join("boot-entry.log"), 32768) {
-        Ok(log) => println!("{log}"),
-        Err(error) => println!("{error}"),
-    }
+    if module.join("boot-entry.log").exists(){println!("\n[legacy-module/boot-entry.log]\n{}",tail(&module.join("boot-entry.log"),32768)?);}
     println!(
         "\n[scene-telemetry]\n{}",
         crate::telemetry::inspect_scene().diagnostic_text()
@@ -371,10 +368,10 @@ pub fn connection_failure(state: &Path, module: &Path, identity_error: &str) -> 
     if module.join("remove").exists() {
         details.push("模块已标记待卸载".into());
     }
-    if let Ok(stage) = tail(&state.join("startup"), 256) {
+    if let Ok(stage) = tail(&crate::storage::path(&state, "startup"), 256) {
         details.push(format!("最近启动阶段: {}", stage.trim()));
     }
-    if let Ok(error) = tail(&state.join("last_error"), 2048) {
+    if let Ok(error) = tail(&crate::storage::path(&state, "last_error"), 2048) {
         if !error.trim().is_empty() {
             details.push(format!("启动错误: {}", error.trim()));
         }
@@ -404,16 +401,16 @@ mod compatibility_tests {
             std::env::temp_dir().join(format!("nova-startup-diagnostic-{}", std::process::id()));
         let state = root.join("state");
         let module = root.join("module");
-        fs::create_dir_all(&state).unwrap();
+        crate::storage::prepare(&state).unwrap();
         fs::create_dir_all(&module).unwrap();
-        fs::write(state.join("startup"), "state=failed\n").unwrap();
+        fs::write(crate::storage::path(&state, "startup"), "state=failed\n").unwrap();
         fs::write(
-            state.join("last_error"),
+            crate::storage::path(&state, "last_error"),
             "stage=环境校验\nerror=required cgroup missing\n",
         )
         .unwrap();
         fs::write(
-            state.join("webui.session"),
+            crate::storage::path(&state, "webui.session"),
             "PRIVATE_CREDENTIAL_MUST_NOT_BE_READ",
         )
         .unwrap();
@@ -424,8 +421,8 @@ mod compatibility_tests {
         assert!(report.contains("state=failed"));
         assert!(report.contains("boot-entry.log"));
         assert!(!report.contains("PRIVATE_CREDENTIAL"));
-        fs::remove_file(state.join("last_error")).unwrap();
-        fs::remove_file(state.join("startup")).unwrap();
+        fs::remove_file(crate::storage::path(&state, "last_error")).unwrap();
+        fs::remove_file(crate::storage::path(&state, "startup")).unwrap();
         assert!(!connection_failure(&state, &module, "identity missing").contains("启动错误:"));
         fs::remove_dir_all(root).unwrap();
     }

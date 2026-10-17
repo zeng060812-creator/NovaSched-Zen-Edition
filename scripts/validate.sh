@@ -12,6 +12,7 @@ python3 scripts/test-profiles.py
 python3 scripts/test-installer.py
 python3 scripts/test-boot-service.py
 python3 scripts/test-webui-updater.py
+python3 scripts/test-cloud-updater.py
 if command -v cargo >/dev/null 2>&1; then
   TEST_ARGS=()
   if [ ! -r /proc/self/stat ]; then

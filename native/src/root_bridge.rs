@@ -208,7 +208,7 @@ pub fn run(module: &Path, origin: &str, request: &str) -> Result<()> {
     }
     let (logs, cursor, reset) = if request.logs {
         log_chunk(
-            &Path::new(util::STATE_DIR).join("novasched.log"),
+            &crate::storage::path(Path::new(util::STATE_DIR),"novasched.log"),
             &request.cursor,
         )?
     } else {

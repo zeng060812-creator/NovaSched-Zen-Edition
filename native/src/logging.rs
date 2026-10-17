@@ -36,7 +36,6 @@ impl Level {
 }
 
 struct Inner {
-    mirror: PathBuf,
     persistent: PathBuf,
     level: AtomicU8,
     lock: Mutex<BTreeMap<PathBuf, String>>,
@@ -51,8 +50,7 @@ impl Logger {
     pub fn new(state_dir: &Path) -> Self {
         Self {
             inner: Arc::new(Inner {
-                mirror: PathBuf::from("/sdcard/Android/NovaSched/log.txt"),
-                persistent: state_dir.join("novasched.log"),
+                persistent: crate::storage::path(&state_dir, "novasched.log"),
                 level: AtomicU8::new(Level::Info as u8),
                 lock: Mutex::new(BTreeMap::new()),
             }),
@@ -102,74 +100,33 @@ impl Logger {
             eprintln!("novasched: 日志互斥锁损坏: {message}");
             return;
         };
-        let mut wrote = false;
-        for path in [&self.inner.persistent, &self.inner.mirror] {
-            // Shared storage is only a convenience mirror.  It may not be
-            // mounted yet at boot, and should never make the daemon noisy or
-            // unhealthy; the protected /data/adb log is authoritative.
-            let result = if path == &self.inner.mirror && !Path::new("/sdcard/Android").is_dir() {
-                continue;
-            } else {
-                append_bounded(path, &line)
-            };
-            match result {
-                Ok(()) => {
-                    wrote = true;
-                    failures.remove(path);
-                }
-                Err(error) => {
-                    let detail = error.to_string();
-                    if path == &self.inner.mirror {
-                        // Android scoped-storage and delayed emulated storage
-                        // are normal. Silently keep only the internal log.
-                        failures.insert(path.clone(), detail);
-                    } else if failures.get(path) != Some(&detail) {
-                        eprintln!("novasched: 日志 {} 写入失败: {detail}", path.display());
-                        failures.insert(path.clone(), detail);
-                    }
-                }
-            }
-        }
-        if !wrote {
-            eprint!("{line}");
+        let path=&self.inner.persistent;
+        match append_bounded(path,&line){
+            Ok(())=>{failures.remove(path);},
+            Err(error)=>{let detail=error.to_string();if failures.get(path)!=Some(&detail){eprintln!("novasched: 日志 {} 写入失败: {detail}",path.display());failures.insert(path.clone(),detail);}eprint!("{line}");}
         }
     }
 }
 
-fn append_bounded(path: &Path, line: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+pub fn append_bounded(path:&Path,line:&str)->std::io::Result<()> {
+    use std::io::{Read,Seek,SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    const LIMIT:usize=1024*1024;
+    if let Some(parent)=path.parent(){fs::create_dir_all(parent)?;}
+    if fs::symlink_metadata(path).is_ok_and(|m|!m.is_file()||m.file_type().is_symlink()){return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"日志路径不是普通文件"));}
+    let mut bytes=line.as_bytes();
+    if bytes.len()>LIMIT/2{let mut start=bytes.len()-LIMIT/2;while !line.is_char_boundary(start){start+=1;}bytes=&bytes[start..];}
+    // O_APPEND keeps concurrent writers (daemon, installer, uninstaller,
+    // legacy cleanup) from overwriting each other's lines: without it the
+    // seek-to-end + write pair is not atomic across processes.
+    let mut file=OpenOptions::new().create(true).read(true).append(true).mode(0o600).open(path)?;
+    let len=file.metadata()?.len() as usize;
+    if len.saturating_add(bytes.len())>LIMIT{
+        let keep=(LIMIT/2).min(len);file.seek(SeekFrom::End(-(keep as i64)))?;
+        let mut tail=Vec::with_capacity(keep);file.read_to_end(&mut tail)?;
+        let start=tail.iter().position(|c|*c==b'\n').map_or(tail.len(),|i|i+1);
+        file.set_len(0)?;file.write_all(&tail[start..])?;
     }
-    match fs::metadata(path) {
-        Ok(m) if m.len() >= 1024 * 1024 => fs::rename(path, path.with_extension("log.1"))?,
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?
-        .write_all(line.as_bytes())
+    file.write_all(bytes)
 }
-
-#[cfg(test)]
-mod regression_tests {
-    use super::*;
-    #[test]
-    fn logs_recreate_parent_and_rotate_instead_of_erasing_history() {
-        let dir = std::env::temp_dir().join(format!("novasched-logs-{}", std::process::id()));
-        let path = dir.join("nested/novasched.log");
-        append_bounded(&path, "previous\n").unwrap();
-        append_bounded(&path, "current\n").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "previous\ncurrent\n");
-        fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
-        append_bounded(&path, "after-rotation\n").unwrap();
-        assert_eq!(
-            fs::metadata(path.with_extension("log.1")).unwrap().len(),
-            1024 * 1024
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "after-rotation\n");
-        fs::remove_dir_all(dir).unwrap();
-    }
-}
+#[cfg(test)]mod regression_tests{use super::*;#[test]fn log_keeps_recent_lines_bounded_without_backups(){let dir=std::env::temp_dir().join(format!("nova-log-{}",std::process::id()));let p=dir.join("nested/novasched.log");append_bounded(&p,"old\n").unwrap();append_bounded(&p,"new\n").unwrap();assert_eq!(fs::read_to_string(&p).unwrap(),"old\nnew\n");fs::write(&p,"line\n".repeat(210000)).unwrap();append_bounded(&p,"latest\n").unwrap();assert!(fs::read_to_string(&p).unwrap().ends_with("latest\n"));assert!(fs::metadata(&p).unwrap().len()<=1048576);assert!(!p.with_extension("log.1").exists());append_bounded(&p,&"长".repeat(600000)).unwrap();assert!(fs::read_to_string(&p).unwrap().len()<=1048576);fs::remove_dir_all(dir).unwrap();}}

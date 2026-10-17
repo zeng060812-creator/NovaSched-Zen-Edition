@@ -115,7 +115,7 @@ for name in ['.gitignore', 'README.md', 'CHANGELOG.md', 'LICENSE', 'NOTICE',
 source_entries = []
 for path in sorted(source_paths):
     name = path.relative_to(ROOT).as_posix()
-    if (name.startswith('module-template/bin/') or '__pycache__' in path.parts
+    if (name == 'module-template/bin/novasched' or '__pycache__' in path.parts
             or path.suffix == '.pyc' or name.endswith('.log') or name.endswith('webui.session')):
         continue
     source_entries.append((path, f'NovaSched-Zen-Edition/{name}', path.suffix == '.sh' or path.name == 'update-binary'))
@@ -126,13 +126,9 @@ with zipfile.ZipFile(source_zip) as z:
     assert not any('/target/' in name or '/node_modules/' in name or name.endswith('/bin/novasched') for name in z.namelist())
     for soc in SUPPORTED:
         assert f'NovaSched-Zen-Edition/module-template/config/{soc}.json' in z.namelist()
-webui_zip = DIST / f'NovaSched-v{VERSION}-webui-update.zip'
-webui_sources = [path for path in source_paths if path.relative_to(ROOT).as_posix().startswith('module-template/webroot/')]
-webui_sources.extend([ROOT/'scripts/install-webui.sh', ROOT/f'docs/fix-v{VERSION}.md'])
-archive(webui_zip, [(path, path.relative_to(ROOT).as_posix(), path.suffix == '.sh') for path in sorted(webui_sources)])
 if args.source_only:
-    (DIST/f'NovaSched-v{VERSION}-SHA256SUMS.txt').write_text(''.join(digest(path)+'  '+path.name+'\n' for path in [source_zip,webui_zip]))
-    print('Source and WebUI update only. No Android ELF exists; these archives are not flashable.')
+    (DIST/f'NovaSched-v{VERSION}-SHA256SUMS.txt').write_text(''.join(digest(path)+'  '+path.name+'\n' for path in [source_zip]))
+    print('Source only. No Android ELF exists; these archives are not flashable.')
     raise SystemExit(0)
 
 binary = MODULE / 'bin/novasched'
@@ -157,6 +153,16 @@ for record in load_records:
 def executable(f):
     return f.suffix == '.sh' or f == binary or f.name == 'update-binary'
 
+allowed_roots={'META-INF','bin','config','vtools','webroot'}
+allowed_files={'LICENSE','NOTICE','action.sh','customize.sh','service.sh','uninstall.sh','module.prop','skip_mount'}
+for file in MODULE.rglob('*'):
+    if not file.is_file():continue
+    rel=file.relative_to(MODULE)
+    assert rel.parts[0] in allowed_roots or str(rel) in allowed_files, f'Unexpected module file: {rel}'
+    assert not file.is_symlink() and not any(p.startswith('.') for p in rel.parts), f'Hidden/link file: {rel}'
+    assert not any(s in file.name for s in ['.backup','.bak','.tmp','.log','.exit','session']), f'Runtime file: {rel}'
+assert (MODULE/'bin/cloud-update.sh').is_file(), 'Updater missing'
+assert json.loads((MODULE/'vtools/powercfg.json').read_text())['features']['pedestal'] is False
 module_entries = [(f, f.relative_to(MODULE).as_posix(), executable(f))
                   for f in sorted(MODULE.rglob('*')) if f.is_file() and f.suffix.lower() != '.md']
 flashable = DIST / f'NovaSched-v{VERSION}-release.zip'
@@ -165,11 +171,11 @@ with zipfile.ZipFile(flashable) as z:
     assert z.read('bin/novasched') == binary.read_bytes()
     assert not any(name.endswith('webui.session') for name in z.namelist()), 'Private session included in release archive'
     assert z.read('META-INF/com/google/android/updater-script').strip() == b'#MAGISK'
-    for name in ['bin/novasched','action.sh','service.sh','customize.sh','uninstall.sh','vtools/powercfg.sh','vtools/powercfg-base.sh','META-INF/com/google/android/update-binary']:
+    for name in ['bin/novasched','bin/cloud-update.sh','action.sh','service.sh','customize.sh','uninstall.sh','vtools/powercfg.sh','vtools/powercfg-base.sh','META-INF/com/google/android/update-binary']:
         assert (z.getinfo(name).external_attr >> 16) & 0o777 == 0o755
 
 print('Final release archive passed CRC, metadata, executable modes, protocol key and ELF consistency checks.')
 
 sums = DIST / f'NovaSched-v{VERSION}-SHA256SUMS.txt'
-sums.write_text(''.join(digest(path)+'  '+path.name+'\n' for path in [source_zip,webui_zip,flashable]))
+sums.write_text(''.join(digest(path)+'  '+path.name+'\n' for path in [source_zip,flashable]))
 print(sums.name)

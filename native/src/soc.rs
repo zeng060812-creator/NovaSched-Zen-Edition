@@ -7,20 +7,24 @@ pub enum Soc {
     Gen3,
     Elite,
     Elite5,
+    Gen5,
     Dimensity8350,
     Dimensity8400,
+    Dimensity9300Plus,
     Dimensity9400Plus,
     XringO3,
 }
-pub const SUPPORTED: [Soc; 10] = [
+pub const SUPPORTED: [Soc; 12] = [
     Soc::Gen1,
     Soc::Gen1Plus,
     Soc::Gen2,
     Soc::Gen3,
     Soc::Elite,
     Soc::Elite5,
+    Soc::Gen5,
     Soc::Dimensity8350,
     Soc::Dimensity8400,
+    Soc::Dimensity9300Plus,
     Soc::Dimensity9400Plus,
     Soc::XringO3,
 ];
@@ -33,8 +37,10 @@ impl Soc {
             Self::Gen3 => "SM8650",
             Self::Elite => "SM8750",
             Self::Elite5 => "SM8850",
+            Self::Gen5 => "SM8845",
             Self::Dimensity8350 => "DIMENSITY8350",
             Self::Dimensity8400 => "DIMENSITY8400",
+            Self::Dimensity9300Plus => "MT6989",
             Self::Dimensity9400Plus => "DIMENSITY9400PLUS",
             Self::XringO3 => "XRING_O3",
         }
@@ -47,8 +53,10 @@ impl Soc {
             Self::Gen3 => "Snapdragon 8 Gen 3",
             Self::Elite => "Snapdragon 8 Elite",
             Self::Elite5 => "Snapdragon 8 Elite Gen 5",
+            Self::Gen5 => "Snapdragon 8 Gen 5",
             Self::Dimensity8350 => "MediaTek Dimensity 8350",
             Self::Dimensity8400 => "MediaTek Dimensity 8400",
+            Self::Dimensity9300Plus => "MediaTek Dimensity 9300+",
             Self::Dimensity9400Plus => "MediaTek Dimensity 9400+",
             Self::XringO3 => "Xiaomi Xring O3",
         }
@@ -61,8 +69,10 @@ impl Soc {
             Self::Gen3 => "SM8650.json",
             Self::Elite => "SM8750.json",
             Self::Elite5 => "SM8850.json",
+            Self::Gen5 => "SM8845.json",
             Self::Dimensity8350 => "DIMENSITY8350.json",
             Self::Dimensity8400 => "DIMENSITY8400.json",
+            Self::Dimensity9300Plus => "MT6989.json",
             Self::Dimensity9400Plus => "DIMENSITY9400PLUS.json",
             Self::XringO3 => "XRING_O3.json",
         }
@@ -73,7 +83,13 @@ impl Soc {
             Self::Gen2 => [0, 3, 7, -1],
             Self::Gen3 => [0, 2, 5, 7],
             Self::Elite | Self::Elite5 => [0, 6, -1, -1],
+            // 骁龙 8 Gen 5（SM8845）：6 性能核 cpu0-5 + 2 超大核 cpu6-7，
+            // 与 8 Elite 同为 2+6 Oryon 布局（真机采集：一加 PLR110）。
+            Self::Gen5 => [0, 6, -1, -1],
             Self::Dimensity8350 | Self::Dimensity8400 => [0, 4, 7, -1],
+            // 天玑 9300+（MT6989）全大核：4×A720 cpu0-3、3×X4 cpu4-6、
+            // 1×X4 超大核 cpu7（真机采集：vivo V2417A）。
+            Self::Dimensity9300Plus => [0, 4, 7, -1],
             Self::Dimensity9400Plus => [0, 4, 7, -1],
             // The supplied O3 dump numbers A715 first, X3 next, A510 last.
             Self::XringO3 => [4, 0, 1, -1],
@@ -98,6 +114,7 @@ impl Soc {
                 | Self::Gen3
                 | Self::Elite
                 | Self::Elite5
+                | Self::Gen5
         )
     }
 }
@@ -140,11 +157,13 @@ pub fn marketing_model(value: &str) -> Option<Soc> {
         "snapdragon8gen3" => Some(Soc::Gen3),
         "snapdragon8elite" | "骁龙8至尊版" => Some(Soc::Elite),
         "snapdragon8elitegen5" | "骁龙8至尊版5" => Some(Soc::Elite5),
+        "snapdragon8gen5" => Some(Soc::Gen5),
         "dimensity8350" | "天玑8350" => Some(Soc::Dimensity8350),
         // 红米 K80 至尊版等 "Dimensity 8400-Ultra" 全大核布局与 8350 相同。
         "dimensity8400" | "dimensity8400ultra" | "天玑8400" | "天玑8400ultra" => {
             Some(Soc::Dimensity8400)
         }
+        "dimensity9300plus" | "天玑9300plus" => Some(Soc::Dimensity9300Plus),
         "dimensity9400plus" | "天玑9400plus" => Some(Soc::Dimensity9400Plus),
         "xringo3" | "玄戒o3" => Some(Soc::XringO3),
         _ => None,
@@ -158,6 +177,8 @@ pub fn kernel_id(value: u32) -> Option<Soc> {
         557 => Some(Soc::Gen3),
         618 => Some(Soc::Elite),
         660 => Some(Soc::Elite5),
+        // SM8845（骁龙 8 Gen 5）真机 soc_id：一加 PLR110 采集值 685。
+        685 => Some(Soc::Gen5),
         _ => None,
     }
 }
@@ -200,6 +221,8 @@ pub fn mtk_platform(value: &str) -> Option<Soc> {
         return None;
     }
     match code {
+        // vivo PD2417（天玑 9300+）以 MT6989 上报；红米 dali 以 MT6991 上报 9400+。
+        "6989" => Some(Soc::Dimensity9300Plus),
         "6991" => Some(Soc::Dimensity9400Plus),
         _ => None,
     }
@@ -228,11 +251,24 @@ mod tests {
     fn near_miss_families_stay_unsupported() {
         assert_eq!(marketing("Snapdragon 8 Elite 2"), None);
         assert_eq!(marketing("Snapdragon 8s Gen 3"), None);
+        assert_eq!(marketing("Snapdragon 8s Gen 5"), None);
+        assert_eq!(marketing("Dimensity 9300"), None);
         assert_eq!(marketing("Dimensity 9400"), None);
         assert_eq!(marketing("Dimensity 9400 Ultra"), None);
         assert_eq!(marketing("Dimensity 83500"), None);
         assert_eq!(marketing("Xring O1"), None);
         assert_eq!(marketing("骁龙8gen4"), None);
+    }
+    #[test]
+    fn gen5_and_dimensity9300plus_marketing_names_are_exact() {
+        assert_eq!(marketing("Snapdragon 8 Gen 5"), Some(Soc::Gen5));
+        assert_eq!(marketing("Snapdragon 8 Gen 5 Mobile Platform"), Some(Soc::Gen5));
+        assert_eq!(marketing("Dimensity 9300+"), Some(Soc::Dimensity9300Plus));
+        assert_eq!(marketing("天玑9300+"), Some(Soc::Dimensity9300Plus));
+        assert_eq!(marketing("MediaTek Dimensity 9300+"), Some(Soc::Dimensity9300Plus));
+        assert_eq!(mtk_platform("mt6989"), Some(Soc::Dimensity9300Plus));
+        assert_eq!(mtk_platform("mt69890"), None);
+        assert_eq!(kernel_id(685), Some(Soc::Gen5));
     }
     #[test]
     fn sm_tokens_split_model_from_alphanumeric_suffixes() {

@@ -28,11 +28,11 @@ pub fn scene_callback(mode: &str) -> Result<()> {
             util::atomic_write(
                 Path::new(MODE_PATH),
                 format!("{profile}\n").as_bytes(),
-                0o664,
+                0o600,
             )?;
         }
         // Keep the action separate from mode.txt, which the daemon also updates.
-        // A boot token prevents an old pedestal request surviving a reboot.
+        // Callbacks stay bound to the current boot session.
         util::atomic_write(
             Path::new(util::SCENE_REQUEST_PATH),
             format!("boot={boot}\naction={mode}\n").as_bytes(),
@@ -47,51 +47,20 @@ pub fn scene_callback(mode: &str) -> Result<()> {
 
 fn normalize_scene_action(action: &str) -> Option<&str> {
     match action {
-        "pedestal" => Some("fast"),
         "standby" => Some("powersave"),
         action if supported(action) => Some(action),
         _ => None,
     }
 }
 
-fn pedestal_request_matches(record: &str, boot: &str) -> bool {
-    let mut record_boot = None;
-    let mut action = None;
-    for line in record.lines() {
-        if let Some(value) = line.strip_prefix("boot=") {
-            record_boot = Some(value);
-        }
-        if let Some(value) = line.strip_prefix("action=") {
-            action = Some(value);
-        }
-    }
-    !boot.is_empty() && record_boot == Some(boot) && action == Some("pedestal")
-}
-
-pub fn scene_pedestal_active(linked: bool) -> bool {
-    if !linked {
-        return false;
-    }
-    let Ok(record) = util::read_text(Path::new(util::SCENE_REQUEST_PATH)) else {
-        return false;
-    };
-    let Ok(boot) = util::read_trimmed("/proc/sys/kernel/random/boot_id") else {
-        return false;
-    };
-    pedestal_request_matches(&record, &boot)
-}
-
 pub fn select_local_mode(
-    pedestal: bool,
     explicit: bool,
     configured: String,
     leaving_explicit: bool,
     default: String,
     saved: Option<String>,
 ) -> String {
-    if pedestal {
-        "fast".into()
-    } else if explicit {
+    if explicit {
         configured
     } else if leaving_explicit {
         default
@@ -116,7 +85,7 @@ impl AppModes {
             crate::profiles::initialize(module_dir, &hardware, Path::new(util::STATE_DIR))?;
         }
         if !Path::new(MODE_PATH).exists() {
-            util::atomic_write(Path::new(MODE_PATH), b"balance\n", 0o664)?;
+            util::atomic_write(Path::new(MODE_PATH), b"balance\n", 0o600)?;
         }
         let mut rules = if scene::detect().linked() {
             match scene::load_rules() {
@@ -307,7 +276,7 @@ impl AppModes {
         if read_mode_file().as_deref() == Some(mode) {
             return Ok(());
         }
-        util::atomic_write(Path::new(MODE_PATH), format!("{mode}\n").as_bytes(), 0o664)
+        util::atomic_write(Path::new(MODE_PATH), format!("{mode}\n").as_bytes(), 0o600)
     }
 
     pub fn sync_to_scene(&self) {
@@ -330,7 +299,7 @@ impl AppModes {
                 text.push_str(&format!("{package} {mode}\n"));
             }
         }
-        util::atomic_write(Path::new(APP_MODES_PATH), text.as_bytes(), 0o664)?;
+        util::atomic_write(Path::new(APP_MODES_PATH), text.as_bytes(), 0o600)?;
         if update_mode {
             self.write_current_mode(&fallback)?;
         }
@@ -396,52 +365,8 @@ fn valid_rule_package(package: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn scene_actions_include_pedestal_and_standby() {
-        assert_eq!(normalize_scene_action("pedestal"), Some("fast"));
-        assert_eq!(normalize_scene_action("standby"), Some("powersave"));
-        for mode in MODES {
-            assert_eq!(normalize_scene_action(mode), Some(mode));
-        }
-        assert_eq!(normalize_scene_action("init"), None);
-        assert_eq!(normalize_scene_action("unknown"), None);
-    }
-
-    #[test]
-    fn pedestal_is_limited_to_current_boot_and_cleared_by_regular_callbacks() {
-        assert!(pedestal_request_matches(
-            "boot=abc\naction=pedestal\n",
-            "abc"
-        ));
-        assert!(!pedestal_request_matches(
-            "boot=abc\naction=pedestal\n",
-            "def"
-        ));
-        assert!(!pedestal_request_matches(
-            "boot=abc\naction=balance\n",
-            "abc"
-        ));
-        assert!(!pedestal_request_matches("boot=abc\naction=init\n", "abc"));
-        assert!(!pedestal_request_matches("action=pedestal\n", ""));
-    }
-
-    #[test]
-    fn pedestal_overrides_app_rules_without_changing_normal_priority() {
-        let choose = |pedestal, explicit, leaving| {
-            select_local_mode(
-                pedestal,
-                explicit,
-                "performance".into(),
-                leaving,
-                "balance".into(),
-                Some("powersave".into()),
-            )
-        };
-        assert_eq!(choose(true, true, false), "fast");
-        assert_eq!(choose(false, true, false), "performance");
-        assert_eq!(choose(false, false, true), "balance");
-        assert_eq!(choose(false, false, false), "powersave");
-    }
+    #[test]fn scene_keeps_four_modes_and_ignores_removed_pedestal(){assert_eq!(normalize_scene_action("pedestal"),None);for mode in MODES{assert_eq!(normalize_scene_action(mode),Some(mode));}assert_eq!(normalize_scene_action("standby"),Some("powersave"));}
+    #[test]fn app_rules_keep_normal_priority(){let f=|e,l|select_local_mode(e,"performance".into(),l,"balance".into(),Some("powersave".into()));assert_eq!(f(true,false),"performance");assert_eq!(f(false,true),"balance");assert_eq!(f(false,false),"powersave");}
 
     #[test]
     fn parses_rules_and_base_processes() {

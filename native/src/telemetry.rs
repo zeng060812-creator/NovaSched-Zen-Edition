@@ -104,8 +104,22 @@ fn accessibility_enabled() -> bool {
         &["get", "secure", "enabled_accessibility_services"],
         std::time::Duration::from_secs(2),
     )
-    .map(|text| text.contains(SCENE_PACKAGE))
+    .map(|text| accessibility_lists_scene(&text))
     .unwrap_or(false)
+}
+
+/// enabled_accessibility_services is a colon-separated list of
+/// "package/ServiceClass" entries. A raw substring check would also credit
+/// look-alike packages (e.g. "com.omarea.vtools2"), so compare the package
+/// component of each entry exactly.
+fn accessibility_lists_scene(text: &str) -> bool {
+    text.split(':').any(|entry| {
+        entry
+            .trim()
+            .split('/')
+            .next()
+            .is_some_and(|package| package == SCENE_PACKAGE)
+    })
 }
 
 fn process_running() -> bool {
@@ -142,6 +156,18 @@ mod tests {
     fn normalizes_micro_units() {
         assert_eq!(normalize_power(2_000_000), Some(2.0));
         assert_eq!(normalize_current_voltage(500_000, 4_000_000), Some(2.0));
+    }
+    #[test]
+    fn accessibility_matching_is_exact_per_service_entry() {
+        let scene = "com.omarea.vtools/.accessibility.SceneAccessibilityService";
+        assert!(accessibility_lists_scene(scene));
+        assert!(accessibility_lists_scene(&format!(
+            "com.example.a11y/.Service:{scene}"
+        )));
+        assert!(!accessibility_lists_scene("com.omarea.vtools2/.Service"));
+        assert!(!accessibility_lists_scene("com.omarea.vtool/.Service"));
+        assert!(!accessibility_lists_scene("null"));
+        assert!(!accessibility_lists_scene(""));
     }
     #[test]
     fn low_current_keeps_the_same_abi_units() {

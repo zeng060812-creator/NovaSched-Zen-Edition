@@ -22,9 +22,19 @@ pub struct InputBoostContext {
     pub stop: Arc<AtomicBool>,
     pub snapshot: Snapshot,
     pub logger: Logger,
-    /// eventfd 写端（仅 fd 号，所有权在 EventLoop）：触摸按下沿写入 1，
-    /// 让主循环立即识别通知栏等 UI 突发。-1 表示不可用。
+    /// eventfd 写端（dup 出的独立 fd，所有权随线程，退出时关闭）：
+    /// 触摸按下沿写入 1，让主循环立即识别通知栏等 UI 突发。-1 表示不可用。
     pub touch_signal_fd: std::os::raw::c_int,
+}
+
+/// RAII：线程退出（无论何种路径）时关闭 dup 出的 eventfd 写端。
+struct TouchFd(std::os::raw::c_int);
+impl Drop for TouchFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { ffi::close(self.0) };
+        }
+    }
 }
 
 /// Opens every /dev/input/event* device and spawns the boost loop. Returns
@@ -76,6 +86,7 @@ pub fn spawn(ctx: InputBoostContext) -> Option<std::thread::JoinHandle<()>> {
 }
 
 fn run(ctx: InputBoostContext, mut files: Vec<File>) {
+    let _touch_fd = TouchFd(ctx.touch_signal_fd);
     let mut poll_fds: Vec<ffi::PollFd> = files
         .iter()
         .map(|file| ffi::PollFd {

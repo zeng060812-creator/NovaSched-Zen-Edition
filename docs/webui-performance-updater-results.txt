@@ -1,3 +1,0 @@
-PASS updater: installed UI, retained daemon, backed up previous UI
-PASS updater: rejects unrelated modules before changing files
-PASS updater: failed final swap restores old UI and removes staging

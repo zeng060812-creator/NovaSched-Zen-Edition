@@ -89,7 +89,7 @@ impl VerifiedProcess {
     }
 }
 pub fn verify(state: &Path, module: &Path) -> Result<VerifiedProcess> {
-    let saved = Identity::parse(&util::read_text(&state.join("daemon.identity"))?)?;
+    let saved = Identity::parse(&util::read_text(&crate::storage::path(&state, "daemon.identity"))?)?;
     let raw = unsafe { ffi::syscall(434, saved.pid, 0u32) };
     if raw < 0 {
         return Err(ffi::errno_message("获取进程 pidfd 失败"));
@@ -109,7 +109,7 @@ pub fn verify(state: &Path, module: &Path) -> Result<VerifiedProcess> {
     if cmd.split(|b| *b == 0).nth(1) != Some(b"daemon".as_slice()) {
         return Err("PID 不是调度守护".into());
     }
-    if !lock_held(&state.join("daemon.lock"))? {
+    if !lock_held(&crate::storage::path(&state, "daemon.lock"))? {
         return Err("守护没有持有排他锁".into());
     }
     let process = VerifiedProcess {

@@ -51,6 +51,9 @@ pub struct Scheduler {
     open_drift: Option<Vec<String>>,
     /// Last mode pushed to Scene N1's FAS node, for change-only logging.
     fas_mode: Option<String>,
+    /// 可调频 GPU 的 devfreq 目录（运行时能力检测；None = 本设备不可用，
+    /// gpu_devfreq 特性降级为停用，不影响其它功能）。
+    gpu_devfreq_base: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -100,6 +103,23 @@ impl Scheduler {
         for change in hardware.adapt_config(&mut config)? {
             logger.info(format!("内核兼容适配: {change}"));
         }
+        let gpu_devfreq_base = if config.functions.gpu_devfreq.enabled {
+            match detect_gpu_devfreq(Path::new("/")) {
+                Some(base) => {
+                    logger.info(format!("GPU 档位控制接口: {}", base.display()));
+                    Some(base)
+                }
+                None => {
+                    logger.warn(
+                        "未检测到可调频的 GPU devfreq 节点，gpu_devfreq 降级为停用；CPU 调度不受影响"
+                            .to_string(),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             config,
             snapshot,
@@ -117,6 +137,7 @@ impl Scheduler {
             cpuctl_live,
             open_drift: None,
             fas_mode: None,
+            gpu_devfreq_base,
         })
     }
 
@@ -136,6 +157,7 @@ impl Scheduler {
             || old.scheduler != new.scheduler
             || old.perf_service_lock != new.perf_service_lock
             || old.disable_gpu_boost != new.disable_gpu_boost
+            || old.gpu_devfreq != new.gpu_devfreq
             || hotplug_changed
         {
             return Err(
@@ -295,6 +317,7 @@ impl Scheduler {
         self.enforcement_attempts = 0;
         self.enforcement_after = std::time::Instant::now() + Duration::from_secs(10);
         self.apply_frequency(&profile)?;
+        self.apply_gpu_devfreq(mode);
         self.apply_sched_params(&profile)?;
         self.apply_online(&profile)?;
         self.apply_mode_cpuset(mode, explicit)?;
@@ -740,6 +763,12 @@ impl Scheduler {
         if self.config.functions.disable_gpu_boost {
             paths.insert(gpu.join("max_pwrlevel"));
         }
+        if self.config.functions.gpu_devfreq.enabled {
+            if let Some(base) = &self.gpu_devfreq_base {
+                paths.insert(base.join("min_freq"));
+                paths.insert(base.join("max_freq"));
+            }
+        }
         if self.config.functions.disable_gpu_boost {
             for name in [
                 "default_pwrlevel",
@@ -967,6 +996,69 @@ impl Scheduler {
         }
         self.logger.debug(format!("CPU簇: {policy} (c{cluster}) 最小频率: {effective_min} 最大频率: {effective_max} 调速器: {observed_governor}"));
         Ok(())
+    }
+
+    /// 按档位写 GPU devfreq min/max_freq。GPU 是可选功能：任何一步失败只
+    /// 记日志，绝不让 GPU 包络拖累 CPU 档位下发。0% = 频表物理端点（不限制）。
+    fn apply_gpu_devfreq(&mut self, mode: &str) {
+        if !self.config.functions.gpu_devfreq.enabled {
+            return;
+        }
+        let Some(base) = self.gpu_devfreq_base.clone() else {
+            return;
+        };
+        let Some(envelope) = self.config.functions.gpu_devfreq.modes.get(mode).cloned() else {
+            return;
+        };
+        let table = gpu_frequency_table(&base);
+        let (Some(bottom), Some(top)) = (table.first().copied(), table.last().copied()) else {
+            self.logger.debug(format!(
+                "GPU 频表不可读，本次跳过 GPU 包络下发: {}",
+                base.display()
+            ));
+            return;
+        };
+        let snap_down = |pct: u32| -> u64 {
+            let target = top.saturating_mul(pct as u64) / 100;
+            table.iter().copied().rev().find(|v| *v <= target).unwrap_or(bottom)
+        };
+        let snap_up = |pct: u32| -> u64 {
+            let target = top.saturating_mul(pct as u64) / 100;
+            table.iter().copied().find(|v| *v >= target).unwrap_or(top)
+        };
+        let target_max = if envelope.max == 0 { top } else { snap_down(envelope.max) };
+        let target_min = if envelope.min == 0 { bottom } else { snap_up(envelope.min) };
+        let target_min = target_min.min(target_max);
+        // 维持 min <= max 不变式：抬高下限超过当前上限时先写上限。
+        let current_max = util::read_trimmed(base.join("max_freq"))
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(top);
+        let ordered = if target_min > current_max {
+            [("max_freq", target_max), ("min_freq", target_min)]
+        } else {
+            [("min_freq", target_min), ("max_freq", target_max)]
+        };
+        for (name, value) in ordered {
+            let path = base.join(name);
+            let text = value.to_string();
+            if util::read_trimmed(&path).ok().as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            match self.snapshot.write(&path, &text) {
+                Ok(()) => {
+                    let observed = util::read_trimmed(&path).unwrap_or_default();
+                    if observed != text {
+                        self.logger.debug(format!(
+                            "GPU {name} 读回 {observed}（内核已按驱动边界钳制 {text}）"
+                        ));
+                    }
+                }
+                Err(error) => self.logger.warn(format!(
+                    "GPU {name} 写入失败，保持当前值: {error}"
+                )),
+            }
+        }
     }
 
     fn apply_sched_params(&self, profile: &ModeProfile) -> Result<()> {
@@ -1394,6 +1486,48 @@ fn is_kgsl_optional_force_node(name: &str) -> bool {
         name,
         "force_bus_on" | "force_clk_on" | "force_no_nap" | "force_rail_on"
     )
+}
+
+/// 读取 GPU devfreq 可用频表（升序、去重、去零）。
+fn gpu_frequency_table(base: &Path) -> Vec<u64> {
+    let mut table: Vec<u64> = util::read_trimmed(base.join("available_frequencies"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .collect();
+    table.sort_unstable();
+    table.dedup();
+    table
+}
+
+/// 能力检测：扫描 /sys/class/devfreq，找到第一个名称指向 GPU 且
+/// min/max/频表均可读的设备。总线监控（kgsl-busmon）、存储（ufshci）与
+/// MTK 内存降压（dvfsrc）等 devfreq 设备不算 GPU 调频接口。
+pub(crate) fn detect_gpu_devfreq(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root.join("sys/class/devfreq")).ok()?;
+    let mut candidates: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    candidates.sort();
+    for path in candidates {
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        let looks_gpu = lower.contains("kgsl-3d0")
+            || lower.contains("mali")
+            || lower.starts_with("gpu");
+        if !looks_gpu {
+            continue;
+        }
+        let readable = ["min_freq", "max_freq", "available_frequencies"]
+            .iter()
+            .all(|node| util::read_trimmed(path.join(node)).is_ok());
+        let table = gpu_frequency_table(&path);
+        if readable && table.len() >= 2 {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Resolve a governor parameter value: raw strings pass through untouched,
@@ -2109,7 +2243,7 @@ mod daemon_policy_tests {
             assert_eq!(util::read_trimmed(&path).unwrap(), expected);
             assert!(f.writes_since(before).iter().all(|(_, v)| v != "3000000"));
             assert!(!f.scheduler.audit_and_repair().unwrap());
-            let log = fs::read_to_string(f.root.join("state/novasched.log")).unwrap();
+            let log = fs::read_to_string(f.root.join("state/logs/novasched.log")).unwrap();
             assert_eq!(log.matches("检测到漂移已纠正").count(), 1);
         }
     }
@@ -2134,7 +2268,7 @@ mod daemon_policy_tests {
         assert!(f.scheduler.audit_and_repair().is_err());
         assert_eq!(util::read_trimmed(&max).unwrap(), "3000000");
         assert_eq!(f.scheduler.current_mode(), "balance");
-        assert!(!fs::read_to_string(f.root.join("state/novasched.log"))
+        assert!(!fs::read_to_string(f.root.join("state/logs/novasched.log"))
             .unwrap()
             .contains("漂移已纠正"));
         f.scheduler

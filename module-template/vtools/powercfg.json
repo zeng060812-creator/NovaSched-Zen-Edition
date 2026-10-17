@@ -1,14 +1,14 @@
 {
   "name": "NovaSched Zen Edition",
   "author": "ZenJooo",
-  "version": "v2.10.3",
-  "versionCode": 403,
+  "version": "v2.11.0",
+  "versionCode": 411,
   "features": {
     "strict": true,
-    "pedestal": true,
+    "pedestal": false,
     "fas": true
   },
   "module": "NovaSched_Zen_Edition",
-  "state": "/data/adb/novasched/mode.txt",
+  "state": "/data/adb/novasched/run/mode.txt",
   "entry": "/data/powercfg.sh"
 }

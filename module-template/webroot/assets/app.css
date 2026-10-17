@@ -312,3 +312,12 @@ body.overlay-open{overflow:hidden}
 .dock{transition:transform .16s cubic-bezier(.32,.72,0,1)}
 .dock.dock-pressing{transform:scale(.97)}
 @media(prefers-reduced-motion:reduce){.dock.dock-pressing{transform:none}}
+
+/* Motion follows overlay ownership and the user's reduced-motion preference. */
+.appearance-layer.open,.dialog-layer.open{animation:nova-overlay-in 220ms ease-out both}
+.appearance-layer.closing,.dialog-layer.closing{animation:nova-overlay-out 320ms ease-in both}
+@keyframes nova-overlay-in{from{background-color:transparent;backdrop-filter:blur(0);-webkit-backdrop-filter:blur(0)}to{}}
+@keyframes nova-overlay-out{to{background-color:transparent;backdrop-filter:blur(0);-webkit-backdrop-filter:blur(0)}}
+.page.leaving{contain:layout paint}.personal-title{touch-action:none}button:disabled{cursor:default}
+@media(prefers-reduced-motion:reduce){.appearance-layer,.dialog-layer{animation:none!important}}
+[data-motion=reduce] .appearance-layer,[data-motion=reduce] .dialog-layer{animation:none!important}

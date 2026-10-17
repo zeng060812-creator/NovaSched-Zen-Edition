@@ -44,10 +44,10 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     let state_dir = Path::new(STATE_DIR);
     util::create_dir(state_dir)?;
     let logger = Logger::new(state_dir);
-    let _lock = util::acquire_flock(&state_dir.join("daemon.lock"))?;
-    util::remove_if_exists(&state_dir.join("status"))?;
+    let _lock = util::acquire_flock(&crate::storage::path(&state_dir, "daemon.lock"))?;
+    util::remove_if_exists(&crate::storage::path(&state_dir, "status"))?;
     logger.clear();
-    let pid_path = state_dir.join("daemon.pid");
+    let pid_path = crate::storage::path(&state_dir, "daemon.pid");
     util::atomic_write(
         &pid_path,
         format!("{}\n", util::current_pid()).as_bytes(),
@@ -59,7 +59,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         Err(error) => return startup_fail(&logger, state_dir, "采集进程身份", error),
     };
     if let Err(error) = util::atomic_write(
-        &state_dir.join("daemon.identity"),
+        &crate::storage::path(&state_dir, "daemon.identity"),
         identity.encode().as_bytes(),
         0o600,
     ) {
@@ -70,7 +70,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         "NovaSched Zen Edition {} 守护进程启动",
         env!("CARGO_PKG_VERSION")
     ));
-    util::atomic_write(&state_dir.join("startup"), b"state=starting\n", 0o600)?;
+    util::atomic_write(&crate::storage::path(&state_dir, "startup"), b"state=starting\n", 0o600)?;
     let hardware = match scheduler::preflight() {
         Ok(value) => value,
         Err(error) => return startup_fail(&logger, state_dir, "环境校验", error),
@@ -102,7 +102,25 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     };
     let mut config = match Config::load(Path::new(CONFIG_PATH)) {
         Ok(value) => value,
-        Err(error) => return startup_fail(&logger, state_dir, "读取配置", error),
+        Err(first_error) => {
+            // 配置损坏自愈：隔离损坏文件，优先回滚到升级前备份，否则从
+            // 模板重建。不自愈的结果是守护永远起不来、调度完全失效。
+            match crate::profiles::recover_corrupt(&module_dir, &hardware, state_dir) {
+                Ok(true) => {
+                    logger.warn(format!(
+                        "配置损坏（{first_error}），已隔离损坏文件并恢复可用配置"
+                    ));
+                    match Config::load(Path::new(CONFIG_PATH)) {
+                        Ok(value) => value,
+                        Err(error) => return startup_fail(&logger, state_dir, "读取配置", error),
+                    }
+                }
+                Ok(false) => return startup_fail(&logger, state_dir, "读取配置", first_error),
+                Err(error) => {
+                    return startup_fail(&logger, state_dir, "配置损坏自愈", error)
+                }
+            }
+        }
     };
     // Thread settings must come from the same adapted configuration as the
     // dispatcher; otherwise a disabled FAS engine can still be spawned.
@@ -116,6 +134,9 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         Err(error) => return startup_fail(&logger, state_dir, "加载原厂快照", error),
     };
     let mut scene = scene::detect();
+    // 上次会话若死于 SIGKILL（且监督进程四次重启均失败），信息流锁帧的
+    // settings/sysfs 改动没有恢复路径；这里按持久化记录兜底恢复。
+    crate::feed_fps::recover_pending(&logger);
     if !scene.linked() {
         if let Err(error) = util::remove_if_exists(Path::new(SCENE_REQUEST_PATH)) {
             logger.warn(format!("清理上次失效的 Scene 请求失败: {error}"));
@@ -145,8 +166,6 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             .unwrap_or_else(|| app_modes.default_mode())
     } else if local_automatic_enabled(automatic.enabled(), &scene) {
         "powersave".to_string()
-    } else if app_modes::scene_pedestal_active(scene.linked()) {
-        "fast".to_string()
     } else {
         app_modes.default_mode()
     };
@@ -257,6 +276,13 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or_else(|| "0".into());
+        // 输入线程使用 dup 出的独立 fd：eventfd 本体归 EventLoop 所有，
+        // 裸共享 fd 号会在任一端关闭后变成悬垂引用，写入误伤复用的 fd。
+        let input_touch_fd = if touch_file.is_some() {
+            unsafe { ffi::fcntl(touch_fd, ffi::F_DUPFD_CLOEXEC, 0) }
+        } else {
+            -1
+        };
         let ctx = crate::input_boost::InputBoostContext {
             live: cpuctl_live.clone(),
             node,
@@ -264,7 +290,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             stop: web_stop.clone(),
             snapshot: snapshot.clone(),
             logger: logger.clone(),
-            touch_signal_fd: if touch_file.is_some() { touch_fd } else { -1 },
+            touch_signal_fd: input_touch_fd,
         };
         match crate::input_boost::spawn(ctx) {
             Some(handle) => Some(handle),
@@ -305,10 +331,10 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     } else {
         None
     };
-    if let Err(e) = util::remove_if_exists(&state_dir.join("last_error")) {
+    if let Err(e) = util::remove_if_exists(&crate::storage::path(&state_dir, "last_error")) {
         logger.error(e);
     }
-    if let Err(e) = util::atomic_write(&state_dir.join("startup"), b"state=running\n", 0o600) {
+    if let Err(e) = util::atomic_write(&crate::storage::path(&state_dir, "startup"), b"state=running\n", 0o600) {
         logger.error(e);
     }
 
@@ -326,7 +352,21 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     let mut node_audit = NodeAuditClock::new(Instant::now());
     let mut scene_probe_at = Instant::now() + scene::PRESENCE_INTERVAL;
     let mut feed_fps = crate::feed_fps::FeedFpsState::default();
-    while !STOP_REQUESTED.load(Ordering::Relaxed) && !state_dir.join("stop.requested").exists() {
+    // 运行期间感知管理器的停用/卸载标记：守护继续写节点会与卸载流程并发
+    // 冲突，且与"已停用"语义相悖。低频（15 秒）检查，命中即走正常停止
+    // 与恢复路径。
+    let mut module_flag_at = Instant::now() + Duration::from_secs(15);
+    while !STOP_REQUESTED.load(Ordering::Relaxed) && !crate::storage::path(&state_dir, "stop.requested").exists() {
+        if Instant::now() >= module_flag_at {
+            module_flag_at = Instant::now() + Duration::from_secs(15);
+            if module_dir.join("disable").exists()
+                || module_dir.join("remove").exists()
+                || module_dir.join(".uninstalling").exists()
+            {
+                logger.warn("模块已被标记停用或卸载，守护进程停止并恢复原厂节点");
+                break;
+            }
+        }
         let wake = if first_scan {
             first_scan = false;
             WakeReason::Event
@@ -410,16 +450,8 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             );
             runtime.set_scene_presence(scene.availability);
             if previous_scene.linked() && !scene.linked() {
-                // Pedestal is transient. It must not survive an uninstall,
-                // or a replacement provider in this boot.
-                let pedestal = app_modes::scene_pedestal_active(true);
                 if let Err(error) = util::remove_if_exists(Path::new(SCENE_REQUEST_PATH)) {
                     logger.warn(format!("清理失效 Scene 请求失败: {error}"));
-                }
-                if pedestal {
-                    if let Err(error) = app_modes.write_current_mode(&app_modes.default_mode()) {
-                        logger.error(format!("退出 Scene 底座档位失败: {error}"));
-                    }
                 }
             }
             if previous_scene != scene {
@@ -502,7 +534,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                 false,
             )
         } else if automatic_enabled {
-            // Neither mode.txt, pedestal nor a manual daily-app rule can keep
+            // Neither mode.txt nor a manual daily-app rule can keep
             // fast selected after the foreground game ends.
             (
                 classification.kind.mode().to_string(),
@@ -513,9 +545,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             let configured = app_modes.resolve(&package);
             let leaving_explicit =
                 !explicit && package != scheduler.current_package() && scheduler.last_explicit();
-            let pedestal = app_modes::scene_pedestal_active(scene.linked());
             let selected = app_modes::select_local_mode(
-                pedestal,
                 explicit,
                 configured,
                 leaving_explicit,
@@ -526,7 +556,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                     app_modes::read_mode_file()
                 },
             );
-            (selected, explicit && !pedestal)
+            (selected, explicit)
         };
         if let Ok(mut state) = cpuctl_live.inner.lock() {
             state.active = !package.is_empty() && !scene.controls_locked();
@@ -703,7 +733,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         let status = format!("{status}{}pending_controls={}\n", fas_status.report(), scheduler.pending_control_count());
         if status != last_status || status_written.elapsed() >= Duration::from_secs(10) {
             if let Err(error) =
-                util::atomic_write(&state_dir.join("status"), status.as_bytes(), 0o600)
+                util::atomic_write(&crate::storage::path(&state_dir, "status"), status.as_bytes(), 0o600)
             {
                 logger.error(format!("状态文件写入失败: {error}"));
             } else {
@@ -747,7 +777,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             logger.error(format!("保存正常停止记录失败: {error}"));
         }
         if let Err(error) =
-            util::atomic_write(&state_dir.join("startup"), b"state=stopped\n", 0o600)
+            util::atomic_write(&crate::storage::path(&state_dir, "startup"), b"state=stopped\n", 0o600)
         {
             logger.error(error);
         }
@@ -816,7 +846,7 @@ pub fn send_signal(module: &Path, signal: i32) -> Result<()> {
 }
 pub fn health(module: &Path) -> Result<String> {
     let process = process_identity::verify(Path::new(STATE_DIR), module)?;
-    let path = Path::new(STATE_DIR).join("status");
+    let path = crate::storage::path(Path::new(STATE_DIR), "status");
     let modified = fs::metadata(&path)
         .and_then(|m| m.modified())
         .map_err(|e| e.to_string())?;
@@ -852,7 +882,7 @@ pub fn print_status(module: &Path) -> Result<()> {
 pub fn restore_stock(module: &Path) -> Result<()> {
     lifecycle::stop(module)?;
     let state = Path::new(STATE_DIR);
-    let _lock = util::acquire_flock(&state.join("daemon.lock"))?;
+    let _lock = util::acquire_flock(&crate::storage::path(&state, "daemon.lock"))?;
     Snapshot::load(state, Logger::new(state))?
         .restore()
         .map(|_| ())
@@ -860,7 +890,7 @@ pub fn restore_stock(module: &Path) -> Result<()> {
 
 pub fn restore_after_supervisor_crash(_module: &Path) -> Result<()> {
     let state = Path::new(STATE_DIR);
-    let _lock = util::acquire_flock(&state.join("daemon.lock"))?;
+    let _lock = util::acquire_flock(&crate::storage::path(&state, "daemon.lock"))?;
     let logger = Logger::new(state);
     let nodes = Snapshot::load(state, logger).and_then(|snapshot| snapshot.restore().map(|_| ()));
     let scene_restore = scene::restore_provider().map(|outcome| {

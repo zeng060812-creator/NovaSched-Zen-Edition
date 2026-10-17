@@ -410,6 +410,34 @@ pub fn parse(root: &Value) -> Result<Config> {
         }
         None => FeedVideoConfig::default(),
     };
+    // devfreq GPU 档位包络是可选块：缺省 = 关闭，GPU 完全由内核管理。
+    let gpu_devfreq = match field(features, "gpu_devfreq") {
+        Some(block) => {
+            let enabled = flag(block, "enabled")?;
+            let mut modes = BTreeMap::new();
+            if let Some(Value::Object(entries)) = field(block, "modes") {
+                for (mode, value) in entries {
+                    if !crate::config::MODES.contains(&mode.as_str()) {
+                        return Err(format!("gpu_devfreq.modes 含未知档位: {mode}"));
+                    }
+                    let min = percent_number(value, "min")
+                        .map_err(|error| format!("features.gpu_devfreq.modes.{mode}.{error}"))?;
+                    let max = percent_number(value, "max")
+                        .map_err(|error| format!("features.gpu_devfreq.modes.{mode}.{error}"))?;
+                    modes.insert(mode.clone(), GpuDevfreqMode { min, max });
+                }
+            }
+            if enabled {
+                for mode in crate::config::MODES {
+                    if !modes.contains_key(mode) {
+                        return Err(format!("gpu_devfreq 已启用但缺少档位 {mode} 的包络"));
+                    }
+                }
+            }
+            GpuDevfreq { enabled, modes }
+        }
+        None => GpuDevfreq::default(),
+    };
     let mut modes = BTreeMap::new();
     for mode in MODES {
         let m = root.get("modes")?.get(mode)?;
@@ -475,6 +503,7 @@ pub fn parse(root: &Value) -> Result<Config> {
             },
             fas,
             feed_video,
+            gpu_devfreq,
         },
     })
 }
@@ -607,6 +636,27 @@ pub fn encode(config: &Config, soc: Soc) -> Value {
         ("fps", text(&f.feed_video.fps.to_string())),
         ("packages", list(&f.feed_video.packages)),
     ]);
+    let gpu_devfreq_out = object([
+        ("enabled", Value::Bool(f.gpu_devfreq.enabled)),
+        (
+            "modes",
+            Value::Object(
+                f.gpu_devfreq
+                    .modes
+                    .iter()
+                    .map(|(mode, value)| {
+                        (
+                            mode.clone(),
+                            object([
+                                ("min", text(&value.min.to_string())),
+                                ("max", text(&value.max.to_string())),
+                            ]),
+                        )
+                    })
+                    .collect(),
+            ),
+        ),
+    ]);
     let features = object([
         ("node_watchdog", Value::Bool(f.node_watchdog)),
         ("cpuset", cpuset),
@@ -651,6 +701,7 @@ pub fn encode(config: &Config, soc: Soc) -> Value {
         ),
         ("fas", fas_out),
         ("feed_video", feed_video_out),
+        ("gpu_devfreq", gpu_devfreq_out),
     ]);
     let modes = Value::Object(
         config
@@ -748,6 +799,11 @@ pub fn migrate(root: &Value, config: &Config, soc: Soc) -> Result<Value> {
                     if !features.contains_key("fas") {
                         if let Some(fas) = default_features.get("fas") {
                             features.insert("fas".into(), fas.clone());
+                        }
+                    }
+                    if !features.contains_key("gpu_devfreq") {
+                        if let Some(gpu) = default_features.get("gpu_devfreq") {
+                            features.insert("gpu_devfreq".into(), gpu.clone());
                         }
                     }
                     if let Some(Value::Object(cpuset_block)) = features.get_mut("cpuset") {

@@ -238,7 +238,10 @@ impl Controller {
     }
 }
 
-/// GPU 忙碌百分比：Adreno kgsl 优先，其次 MTK GED 与 Mali kbase。
+/// GPU 忙碌百分比：Adreno kgsl 百分比节点优先，其次 kgsl `gpubusy`
+/// （"<busy_us> <total_us>" 微秒对，OPlus/小米等 ColorOS 系内核只提供它）、
+/// MTK GED 与 Mali kbase。单个节点缺失或格式不识时继续尝试下一个来源，
+/// 绝不因一个节点缺席放弃全部启发式输入。
 pub fn read_gpu_busy() -> Option<f32> {
     for path in [
         "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
@@ -246,11 +249,34 @@ pub fn read_gpu_busy() -> Option<f32> {
         "/sys/kernel/gpu/gpu_load",
         "/sys/class/misc/mali0/device/gpu_utilisation",
     ] {
-        let raw = util::read_trimmed(std::path::Path::new(path)).ok()?;
-        let value = raw.split('%').next()?.trim();
-        let parsed = value.parse::<f32>().ok()?;
-        if (0.0..=100.0).contains(&parsed) {
-            return Some(parsed);
+        let Ok(raw) = util::read_trimmed(std::path::Path::new(path)) else {
+            continue;
+        };
+        // 兼容 "42"、"42 %"、"GPU loading: 42 %" 等写法：取第一个数字 token。
+        let parsed = raw
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter(|token| !token.is_empty())
+            .find_map(|token| token.parse::<f32>().ok());
+        if let Some(value) = parsed {
+            if (0.0..=100.0).contains(&value) {
+                return Some(value);
+            }
+        }
+    }
+    // ColorOS / 一加 / OPPO 的 kgsl 内核只暴露 gpubusy 微秒对。
+    if let Ok(raw) = util::read_trimmed(std::path::Path::new(
+        "/sys/class/kgsl/kgsl-3d0/gpubusy",
+    )) {
+        let mut fields = raw
+            .split_whitespace()
+            .filter_map(|token| token.parse::<f64>().ok());
+        if let (Some(busy), Some(total)) = (fields.next(), fields.next()) {
+            if total > 0.0 {
+                let value = (busy * 100.0 / total) as f32;
+                if (0.0..=100.0).contains(&value) {
+                    return Some(value);
+                }
+            }
         }
     }
     None
@@ -282,6 +308,9 @@ const NO_SIGNAL_RELEASE_TICKS: u32 = 25;
 /// 加压 > 0 而帧/负载信号停更超过此时长：按 2 倍速率受控泄压，加压值
 /// 绝不悬挂在高位。
 const STALE_BOOST_AFTER: Duration = Duration::from_secs(8);
+/// boost 不变时按去重跳过节点写入；每 25 拍（默认步长下约 5 秒）强制
+/// 校验一轮，恢复被调度器 force apply 覆盖的底频与 uclamp。
+const REASSERT_TICKS: u32 = 25;
 
 impl Timestats {
     fn new() -> Self {
@@ -457,6 +486,10 @@ fn run(ctx: EngineCtx) {
     let mut fail_streak: u32 = 0;
     let mut no_signal: u32 = 0;
     let mut signal_dead = false;
+    // 定期重断言计数：调度器 force apply（配置重载/审计修复/档位重发）会把
+    // 底频写回档位基线，而 boost 未变时本引擎按去重逻辑不重写。每
+    // REASSERT_TICKS 拍强制校验一轮节点，堵住这个被覆盖后不自愈的窗口。
+    let mut reassert: u32 = 0;
     loop {
         // 每拍递增：WebUI 看到它变化即证明引擎线程活着，即使帧率与
         // 加压值都稳定不动。
@@ -503,7 +536,9 @@ fn run(ctx: EngineCtx) {
             && crate::config::MODES.contains(&shared.mode.as_str())
             && mode_cfg.as_ref().is_some_and(|mode| mode.ceiling > 0);
         if !cfg.enabled || !want_active {
-            release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status);
+            // 外部调度器接管（!shared.allowed）时节点已不归本模块管理：
+            // 跳过恢复写，避免覆盖对方刚设置的值。
+            release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status, shared.allowed);
             publish(&ctx.status, &status);
             std::thread::sleep(Duration::from_millis(cfg.step_ms.max(300)));
             continue;
@@ -575,7 +610,7 @@ fn run(ctx: EngineCtx) {
         if no_signal >= NO_SIGNAL_RELEASE_TICKS {
             no_signal = 0;
             signal_dead = true;
-            release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status);
+            release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status, shared.allowed);
             publish(&ctx.status, &status);
             std::thread::sleep(Duration::from_millis(cfg.step_ms.max(300)));
             continue;
@@ -583,6 +618,11 @@ fn run(ctx: EngineCtx) {
         status.state = "active";
         status.boost = controller.boost;
         status.override_active = !scene.suspended.is_empty();
+        reassert = reassert.wrapping_add(1);
+        let force_reassert = reassert >= REASSERT_TICKS;
+        if force_reassert {
+            reassert = 0;
+        }
         apply_targets(
             &ctx,
             &shared,
@@ -590,11 +630,12 @@ fn run(ctx: EngineCtx) {
             controller.boost,
             &mut clusters,
             &mut last_boost,
+            force_reassert,
         );
         publish(&ctx.status, &status);
         std::thread::sleep(Duration::from_millis(cfg.step_ms));
     }
-    release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status);
+    release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status, true);
     stats.disable();
 }
 
@@ -604,11 +645,14 @@ fn release(
     clusters: &mut [ClusterState],
     scene: &mut SceneOverride,
     status: &mut EngineStatus,
+    restore_nodes: bool,
 ) {
     scene.refresh(false, &ctx.logger);
-    if status.state == "active" || controller.boost > 0 {
+    if restore_nodes && (status.state == "active" || controller.boost > 0) {
         restore_floors(ctx, clusters);
         restore_uclamp_baseline(ctx);
+    }
+    if status.state == "active" || controller.boost > 0 {
         controller.reset();
     }
     status.state = if ctx.fas.read().map(|cfg| cfg.enabled).unwrap_or(false) {
@@ -671,8 +715,9 @@ fn apply_targets(
     boost: u32,
     clusters: &mut [ClusterState],
     last_boost: &mut u32,
+    force_reassert: bool,
 ) {
-    if boost == *last_boost {
+    if boost == *last_boost && !force_reassert {
         return;
     }
     *last_boost = boost;

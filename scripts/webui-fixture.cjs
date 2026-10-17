@@ -3,7 +3,7 @@ function mockHost(options){
   window.fixture={mode:'balance',effective:'balance',pkg:'com.omarea.vtools',linked:!!options.linked,external:!!options.external,
     installed:options.presence==='available',presence:options.presence||'available',automatic:!!options.automatic,
     pendingControls:options.pendingControls||0,phase:options.phase||'ready',legacyMode:options.legacyMode||'balance',
-    version:options.version||'2.10.3',fasState:options.fasState||'ready',fasSync:options.fasSync||'synced',fasMode:options.fasMode||'balance',
+    version:options.version||'2.11.0',fasState:options.fasState||'ready',fasSync:options.fasSync||'synced',fasMode:options.fasMode||'balance',
     fasEngine:options.fasEngine!==undefined?options.fasEngine:'idle',fasEngineSrc:options.fasEngineSrc||'none',
     fasFps:options.fasFps||0,fasBoost:options.fasBoost||0,fasOverride:!!options.fasOverride,samsungSafe:!!options.samsung,
     fasGpu:options.fasGpu||0,fasTick:options.fasTick||0,freqs:options.freqs||'',
@@ -79,7 +79,7 @@ function mockHost(options){
       setTimeout(()=>{if(this.readyState===3)return;this.readyState=1;this.onopen?.({});this.push();},15);
     }
     push(){if(this.readyState!==1)return;const data=this.url.endsWith('/modes')?modes():this.url.endsWith('/app-modes')?apps():logs;setTimeout(()=>this.onmessage?.({data}),5);}
-    send(message){update(message);}
+    send(message){if(options.ackDelay)setTimeout(()=>update(message),options.ackDelay);else update(message);}
     close(){this.readyState=3;this.onclose?.({});}
   }
   window.WebSocket=MockSocket;

@@ -14,6 +14,7 @@ pub const O_NONBLOCK: c_int = 0o0004000;
 pub const O_CLOEXEC: c_int = 0o2000000;
 pub const F_GETFL: c_int = 3;
 pub const F_SETFL: c_int = 4;
+pub const F_DUPFD_CLOEXEC: c_int = 1030;
 pub const IN_NONBLOCK: c_int = O_NONBLOCK;
 pub const IN_CLOEXEC: c_int = O_CLOEXEC;
 pub const IN_MODIFY: c_uint = 0x0000_0002;

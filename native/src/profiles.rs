@@ -8,6 +8,7 @@ use crate::{
 };
 use std::fs;
 use std::path::Path;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -23,6 +24,11 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 // `scripts/stock-fingerprints.cjs` 生成；tests::shipped_templates_are_stock
 // 在编译期保证列表与模板一致。
 const STOCK_FINGERPRINTS: &[u64] = &[
+    // Current schema-2 defaults.
+    0x0a54bd0af41800f6,0xc75ef8e9e069bed6,0x6401b330f5ea6fa5,0x9b85f833053fee13,0xc2617dcfd60f3372,0xf1707125ea2a1933,0xe1d863d1e4e5cc37,0x19bba46aa364a9fd,0xe2d7accce3dd4fa8,0xda9e3b2b3c4a74cc,
+    // v2.11.0 新增：SM8845（骁龙 8 Gen 5）、MT6989（天玑 9300+ 极限性能策略）
+    0x2aeebe4e4883bcfb,
+    0xc45688b305d5d683,
     0x00df72641cb5315d,
     0x187662c4444d7f9f,
     0x2fd8e8592f6d7ab2,
@@ -212,7 +218,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("nova-config-{}-{n}", util::current_pid()))
+        let root=std::env::temp_dir().join(format!("nova-config-{}-{n}", util::current_pid()));
+        crate::storage::prepare(&root).unwrap();
+        root
     }
     #[test]
     fn shipped_templates_are_stock() {
@@ -237,14 +245,14 @@ mod tests {
             assert!(initialize(&module(), &hardware, &state)
                 .unwrap()
                 .contains("config=created"));
-            let text = fs::read_to_string(state.join("config.json"))
+            let text = fs::read_to_string(crate::storage::path(&state, "config.json"))
                 .unwrap()
                 .replace("\"INFO\"", "\"DEBUG\"");
-            fs::write(state.join("config.json"), &text).unwrap();
+            fs::write(crate::storage::path(&state, "config.json"), &text).unwrap();
             assert!(initialize(&module(), &hardware, &state)
                 .unwrap()
                 .contains("config=preserved"));
-            assert_eq!(fs::read_to_string(state.join("config.json")).unwrap(), text);
+            assert_eq!(fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap(), text);
             fs::remove_dir_all(state).unwrap();
         }
     }
@@ -265,16 +273,16 @@ mod tests {
                 .unwrap()
                 .replace("\"INFO\"", "\"DEBUG\"");
             let before = Config::from_text(&text).unwrap();
-            fs::write(state.join("config.json"), &text).unwrap();
-            fs::write(state.join("config.json.bak"), "existing backup").unwrap();
+            fs::write(crate::storage::path(&state, "config.json"), &text).unwrap();
+            fs::write(crate::storage::path(&state, "config.json.bak"), "existing backup").unwrap();
             fs::write(
-                state.join("options.txt"),
+                crate::storage::path(&state, "options.txt"),
                 "extreme_powersave=1\nsmooth_powersave=0\n",
             )
             .unwrap();
             let report = initialize(&module(), &test_hardware(soc), &state).unwrap();
             assert!(report.contains("config=upgraded_preserved"), "{report}");
-            let saved = fs::read_to_string(state.join("config.json")).unwrap();
+            let saved = fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap();
             let after = Config::from_text(&saved).unwrap();
             assert_eq!(format!("{:?}", after.modes), format!("{:?}", before.modes));
             assert_eq!(
@@ -305,18 +313,18 @@ mod tests {
                 .unwrap();
             assert_eq!(fs::read_to_string(backup).unwrap(), text);
             assert_eq!(
-                fs::read_to_string(state.join("config.json.bak")).unwrap(),
+                fs::read_to_string(crate::storage::path(&state, "config.json.bak")).unwrap(),
                 "existing backup"
             );
             assert_eq!(
-                fs::read_to_string(state.join("options.txt")).unwrap(),
+                fs::read_to_string(crate::storage::path(&state, "options.txt")).unwrap(),
                 "extreme_powersave=1\nsmooth_powersave=0\n"
             );
             assert!(initialize(&module(), &test_hardware(soc), &state)
                 .unwrap()
                 .contains("config=preserved"));
             assert_eq!(
-                fs::read_to_string(state.join("config.json")).unwrap(),
+                fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap(),
                 saved
             );
             fs::remove_dir_all(state).unwrap();
@@ -326,20 +334,20 @@ mod tests {
     fn chip_change_archives_config_and_conflicting_or_invalid_configs_are_untouched() {
         let state = state();
         initialize(&module(), &test_hardware(Soc::Gen3), &state).unwrap();
-        let original = fs::read(state.join("config.json")).unwrap();
+        let original = fs::read(crate::storage::path(&state, "config.json")).unwrap();
         let report = initialize(&module(), &test_hardware(Soc::Elite), &state).unwrap();
         let backup = report
             .lines()
             .find_map(|l| l.strip_prefix("backup="))
             .unwrap();
         assert_eq!(fs::read(backup).unwrap(), original);
-        fs::write(state.join("config.json"), original.clone()).unwrap();
+        fs::write(crate::storage::path(&state, "config.json"), original.clone()).unwrap();
         assert!(initialize(&module(), &test_hardware(Soc::Elite), &state).is_err());
-        assert_eq!(fs::read(state.join("config.json")).unwrap(), original);
-        fs::write(state.join("config.json"), "invalid").unwrap();
+        assert_eq!(fs::read(crate::storage::path(&state, "config.json")).unwrap(), original);
+        fs::write(crate::storage::path(&state, "config.json"), "invalid").unwrap();
         assert!(initialize(&module(), &test_hardware(Soc::Elite), &state).is_err());
         assert_eq!(
-            fs::read_to_string(state.join("config.json")).unwrap(),
+            fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap(),
             "invalid"
         );
         fs::remove_dir_all(state).unwrap();
@@ -350,10 +358,10 @@ mod tests {
         util::create_dir(&state).unwrap();
         let text = crate::config_v2::legacy_fixture(Soc::Gen1)
             .replace(Soc::Gen1.name(), "unknown user config");
-        fs::write(state.join("config.json"), &text).unwrap();
+        fs::write(crate::storage::path(&state, "config.json"), &text).unwrap();
         assert!(initialize(&module(), &test_hardware(Soc::Gen3), &state).is_err());
-        assert_eq!(fs::read_to_string(state.join("config.json")).unwrap(), text);
-        assert!(!state.join("config.profile").exists());
+        assert_eq!(fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap(), text);
+        assert!(!crate::storage::path(&state, "config.profile").exists());
         fs::remove_dir_all(state).unwrap();
     }
     #[test]
@@ -365,7 +373,7 @@ mod tests {
             let hardware = test_hardware(Soc::Gen3);
             initialize(&module(), &hardware, &state).unwrap();
             let mut old =
-                json::parse(&fs::read_to_string(state.join("config.json")).unwrap()).unwrap();
+                json::parse(&fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap()).unwrap();
             if let Value::Object(root) = &mut old {
                 if let Some(Value::Object(meta)) = root.get_mut("meta") {
                     meta.insert("version".into(), Value::Number(237));
@@ -376,15 +384,15 @@ mod tests {
                 }
             }
             let default = json::stringify(&old).unwrap();
-            fs::write(state.join("config.default.json"), &default).unwrap();
+            fs::write(crate::storage::path(&state, "config.default.json"), &default).unwrap();
             let text = if custom {
                 default.replace(stock_max, "51%")
             } else {
                 default
             };
-            fs::write(state.join("config.json"), &text).unwrap();
+            fs::write(crate::storage::path(&state, "config.json"), &text).unwrap();
             let report = initialize(&module(), &hardware, &state).unwrap();
-            let saved = fs::read_to_string(state.join("config.json")).unwrap();
+            let saved = fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap();
             let parsed = Config::from_text(&saved).unwrap();
             assert_eq!(parsed.meta.version, crate::config::PROFILE_VERSION);
             assert_eq!(
@@ -440,12 +448,12 @@ mod tests {
                 max[0] = Value::String("43%".into());
                 let text = json::stringify(&root).unwrap();
                 let before = Config::from_text(&text).unwrap();
-                fs::write(state.join("config.json"), &text).unwrap();
-                fs::write(state.join("mode.txt"), "balance\n").unwrap();
-                fs::write(state.join("options.txt"), "extreme_powersave=1\n").unwrap();
+                fs::write(crate::storage::path(&state, "config.json"), &text).unwrap();
+                fs::write(crate::storage::path(&state, "mode.txt"), "balance\n").unwrap();
+                fs::write(crate::storage::path(&state, "options.txt"), "extreme_powersave=1\n").unwrap();
                 let report = initialize(&module(), &test_hardware(soc), &state).unwrap();
                 assert!(report.contains("config=upgraded_preserved"), "{report}");
-                let saved = fs::read_to_string(state.join("config.json")).unwrap();
+                let saved = fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap();
                 let after = Config::from_text(&saved).unwrap();
                 assert_eq!(after.meta.version, crate::config::PROFILE_VERSION);
                 assert_eq!(after.meta.loglevel, "DEBUG");
@@ -454,10 +462,10 @@ mod tests {
                 assert_eq!(json::parse(&saved).unwrap().get("custom_note").unwrap().as_str().unwrap(), "保留我的配置");
                 let backup = report.lines().find_map(|line| line.strip_prefix("backup=")).unwrap();
                 assert_eq!(fs::read_to_string(backup).unwrap(), text);
-                assert_eq!(fs::read_to_string(state.join("mode.txt")).unwrap(), "balance\n");
-                assert_eq!(fs::read_to_string(state.join("options.txt")).unwrap(), "extreme_powersave=1\n");
+                assert_eq!(fs::read_to_string(crate::storage::path(&state, "mode.txt")).unwrap(), "balance\n");
+                assert_eq!(fs::read_to_string(crate::storage::path(&state, "options.txt")).unwrap(), "extreme_powersave=1\n");
                 assert!(initialize(&module(), &test_hardware(soc), &state).unwrap().contains("config=preserved"));
-                assert_eq!(fs::read_to_string(state.join("config.json")).unwrap(), saved);
+                assert_eq!(fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap(), saved);
                 fs::remove_dir_all(state).unwrap();
             }
         }
@@ -469,13 +477,13 @@ mod tests {
         util::create_dir(&state).unwrap();
         let text = fs::read_to_string(module().join("config/SM8750.json")).unwrap()
             .replace("\"step_ms\": \"200\"", "\"step_ms\": true");
-        fs::write(state.join("config.json"), &text).unwrap();
+        fs::write(crate::storage::path(&state, "config.json"), &text).unwrap();
         let error = initialize(&module(), &test_hardware(Soc::Elite), &state).unwrap_err();
-        assert!(error.contains(&state.join("config.json").display().to_string()), "{error}");
+        assert!(error.contains(&crate::storage::path(&state, "config.json").display().to_string()), "{error}");
         assert!(error.contains("features.fas.step_ms"), "{error}");
-        assert_eq!(fs::read_to_string(state.join("config.json")).unwrap(), text);
-        assert!(!state.join("config.profile").exists());
-        assert!(!state.join("config.default.json").exists());
+        assert_eq!(fs::read_to_string(crate::storage::path(&state, "config.json")).unwrap(), text);
+        assert!(!crate::storage::path(&state, "config.profile").exists());
+        assert!(!crate::storage::path(&state, "config.default.json").exists());
         fs::remove_dir_all(state).unwrap();
     }
 }
@@ -484,6 +492,38 @@ fn restore(path: &Path, previous: &Option<String>) -> Result<()> {
         Some(text) => util::atomic_write(path, text.as_bytes(), 0o600),
         None => util::remove_if_exists(path),
     }
+}
+/// 配置损坏自愈（守护启动路径）：config.json 解析失败时，把损坏文件隔离
+/// 为 config/config.corrupt-<时间戳>.json（不丢弃用户数据），优先恢复上次
+/// 升级前的备份 restore/config.previous.json，随后按正常初始化流程补齐
+/// （无有效备份时从出厂模板重建）。返回是否有损坏被处理。
+pub fn recover_corrupt(module: &Path, hardware: &Hardware, state: &Path) -> Result<bool> {
+    let path = crate::storage::path(state, "config.json");
+    let current = match read_optional(&path)? {
+        Some(text) => text,
+        None => return Ok(false),
+    };
+    if Config::from_text(&current).is_ok() {
+        return Ok(false);
+    }
+    let stamp = {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("config.corrupt-{now}.json")
+    };
+    let quarantine = crate::storage::path(state, &stamp);
+    fs::rename(&path, &quarantine)
+        .map_err(|e| format!("隔离损坏配置失败: {e}"))?;
+    if let Some(backup) = read_optional(&crate::storage::path(state, "config.previous.json"))? {
+        if Config::from_text(&backup).is_ok() {
+            util::atomic_write(&path, backup.as_bytes(), 0o600)?;
+        }
+    }
+    // 让标准初始化决定后续：有效备份触发迁移，无备份则从模板重建。
+    initialize(module, hardware, state)?;
+    Ok(true)
 }
 pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<String> {
     let source = module.join("config").join(hardware.soc.file());
@@ -498,9 +538,9 @@ pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<St
     }
     hardware.adapt_config(&mut candidate)?;
     util::create_dir(state)?;
-    let _lock = util::acquire_flock(&state.join("config.install.lock"))?;
-    let path = state.join("config.json");
-    let marker = state.join("config.profile");
+    let _lock = util::acquire_flock(&crate::storage::path(&state, "config.install.lock"))?;
+    let path = crate::storage::path(&state, "config.json");
+    let marker = crate::storage::path(&state, "config.profile");
     let current = read_optional(&path)?;
     let previous_marker = read_optional(&marker)?;
     let installed = previous_marker
@@ -544,8 +584,8 @@ pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<St
     let version_upgrade = parsed
         .as_ref()
         .is_some_and(|parsed| parsed.meta.version != candidate.meta.version);
-    let previous_default = read_optional(&state.join("config.default.json"))?
-        .as_deref()
+    let previous_default_text = read_optional(&crate::storage::path(&state, "config.default.json"))?;
+    let previous_default = previous_default_text.as_deref()
         .and_then(|text| json::parse(text).ok());
     let unedited_default = match (&current_root, &previous_default) {
         (Some(current), Some(default)) => {
@@ -577,26 +617,12 @@ pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<St
     let mut backup = None;
     if next.is_some() {
         if let Some(text) = current.as_ref() {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos();
-            let name = format!(
-                "config.{}.before-{}.{}.{}.json",
-                previous_soc.map(Soc::id).unwrap_or("unidentified"),
-                hardware.soc.id(),
-                unique,
-                util::current_pid()
-            );
-            let backup_path = state.join(name);
-            if backup_path.exists() {
-                return Err("配置备份文件名冲突，原配置已保留".into());
-            }
+            let backup_path = crate::storage::target(state,"config.previous.json");
             util::atomic_write(&backup_path, text.as_bytes(), 0o600)?;
             backup = Some(backup_path);
         }
     }
-    let default = state.join("config.default.json");
+    let default = crate::storage::path(&state, "config.default.json");
     if read_optional(&default)?.as_deref() != Some(template.as_str()) {
         util::atomic_write(&default, template.as_bytes(), 0o600)?;
     }
@@ -612,6 +638,7 @@ pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<St
     })();
     if let Err(error) = commit {
         let mut issues = Vec::new();
+        if let Err(e)=restore(&default,&previous_default_text){issues.push(e);}
         if next.is_some() {
             if let Err(e) = restore(&path, &current) {
                 issues.push(e);

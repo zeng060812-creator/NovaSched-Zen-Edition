@@ -112,7 +112,7 @@ impl BootGuard {
         if boot.is_empty() || !boot.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             return Err("无法确认启动身份，未写入调度节点".into());
         }
-        let path = state.join("boot-guard");
+        let path = crate::storage::path(&state, "boot-guard");
         let previous = match fs::read_to_string(&path) {
             Ok(text) => {
                 let (boot, phase) = parse_record(&text)?;
@@ -191,7 +191,7 @@ mod tests {
         assert!(!module.join("disable").exists());
         assert!(BootGuard::begin_for_boot(&module, &state, "boot-b").is_err());
         assert!(module.join("disable").exists());
-        assert_eq!(parse_record(&fs::read_to_string(state.join("boot-guard")).unwrap()).unwrap().1, "blocked");
+        assert_eq!(parse_record(&fs::read_to_string(crate::storage::path(&state, "boot-guard")).unwrap()).unwrap().1, "blocked");
         // The manager's explicit re-enable permits one fresh trial.
         fs::remove_file(module.join("disable")).unwrap();
         let mut guard = BootGuard::begin_for_boot(&module, &state, "boot-c").unwrap();

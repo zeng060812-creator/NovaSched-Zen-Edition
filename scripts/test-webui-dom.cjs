@@ -39,7 +39,8 @@ function fixture(options) {
   w.history={get state(){return states[cursor];},replaceState(state){states[cursor=Math.max(0,cursor)]=state;},pushState(state){states.splice(cursor+1);states[++cursor]=state;},back(){if(cursor<=0)return;cursor--;const event=new w.Event('popstate');event.state=states[cursor];later(()=>w.dispatchEvent(event));}};
   Object.defineProperty(d,'visibilityState',{value:'visible'});Object.defineProperty(d,'hidden',{value:false});d.activeElement=d.body;
   w.HTMLElement.prototype.focus=function(){d.activeElement=this;};
-  w.HTMLElement.prototype.animate=function(){return {cancel(){},onfinish:null,finished:Promise.resolve()};};
+  const animations=new Set();
+  w.HTMLElement.prototype.animate=function(){const a={cancel(){animations.delete(a);},onfinish:null,oncancel:null,finished:Promise.resolve()};animations.add(a);return a;};
   w.HTMLElement.prototype.getBoundingClientRect=function(){
     const page=this.closest('.page'),dialog=this.closest('.dialog-layer,.appearance-layer');
     const visible=(!page||page.classList.contains('active')||page.classList.contains('leaving'))&&(!dialog||dialog.classList.contains('open'))&&!this.closest('[hidden]');
@@ -55,7 +56,7 @@ function fixture(options) {
   const context=vm.createContext(w);
   vm.runInContext(`(${mockHost.toString()})(${JSON.stringify(options)})`,context);
   for(const file of ['version.js','host.js','haptics.js','liquid-glass.js','app.js'])vm.runInContext(fs.readFileSync(path.join(web,'assets',file),'utf8'),context,{filename:file});
-  return {w,d,cleanup:()=>timers.forEach(nativeClearTimeout)};
+  return {w,d,animations,cleanup:()=>timers.forEach(nativeClearTimeout)};
 }
 async function until(fn,timeout=4000){const end=Date.now()+timeout;while(!fn()){if(Date.now()>end)throw new Error('Timed out waiting for UI state');await new Promise(resolve=>nativeTimeout(resolve,10));}}
 const pause=()=>new Promise(resolve=>nativeTimeout(resolve,30));
@@ -182,7 +183,7 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
   const {w,d,cleanup}=fixture({version:'2.2.8',legacy:true,legacyMode:'balance'});
   try {
     await until(()=>d.querySelector('#about-engine-version').textContent==='v2.2.8');
-    assert.equal(d.querySelector('#about-version').textContent,'v2.10.3');
+    assert.equal(d.querySelector('#about-version').textContent,'v2.11.0');
     assert.equal(d.querySelector('#version-note').hidden,false);
     await until(()=>d.querySelector('#fas-legacy-desc').textContent.includes('旧版服务'));
     assert(d.querySelector('#fas-legacy-desc').textContent.includes('fas-rs'));
@@ -266,7 +267,7 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
     click(d,'#about-update');
     await until(()=>d.querySelector('#dialog-layer').classList.contains('open'));
     assert(d.querySelector('#dialog-title').textContent.includes('检查更新'),'update dialog opened');
-    assert(d.querySelector('#update-status').textContent.includes('当前版本 v2.10.3'),'update dialog shows current version');
+    assert(d.querySelector('#update-status').textContent.includes('当前版本 v2.11.0'),'update dialog shows current version');
     console.log('PASS cloud update entry and dialog');
   } finally {cleanup();}
 }
@@ -289,6 +290,38 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
     await until(()=>d.querySelector('[data-mode="fast"]').dataset.state==='active');
     console.log('PASS no success confirmation while CPU ceilings await readback');
   } finally {cleanup();}
+}
+{
+ const {w,d,animations,cleanup}=fixture({motion:true});
+ try{
+  await until(()=>d.querySelector('#nav-cta-text').textContent==='已连接');
+  for(const page of ['rules','logs','overview','about','overview','about'])click(d,`.dock [data-page="${page}"]`);
+  await until(()=>d.querySelectorAll('.page.leaving').length===0);
+  assert.equal(d.querySelectorAll('.page.active').length,1);
+  for(const page of d.querySelectorAll('.page'))assert.equal(page.inert,!page.classList.contains('active'));
+  assert.equal(animations.size,0);
+  click(d,'#appearance-settings');click(d,'#personalize-close');click(d,'#appearance-settings');
+  await new Promise(resolve=>nativeTimeout(resolve,600));
+  assert(d.querySelector('#appearance-layer').classList.contains('open'));assert(!d.querySelector('#appearance-layer').classList.contains('closing'));assert.equal(animations.size,0);
+  click(d,'#about-license');click(d,'#dialog-close');await until(()=>!d.querySelector('#dialog-layer').classList.contains('open'));
+  assert.equal(d.querySelector('main').inert,true);assert.equal(d.body.style.overflow,'hidden');
+  click(d,'#personalize-close');w.dispatchEvent(new w.Event('pagehide'));
+  assert.equal(d.querySelector('main').inert,false);assert.equal(d.body.style.overflow,'');
+  const dock=d.querySelector('.dock'),tab=d.querySelector('.dock [data-page="about"]');
+  pointer(w,tab,'pointerdown',60,20);await pause();assert(dock.classList.contains('dock-pressing'));pointer(w,tab,'pointermove',62,60);assert(!dock.classList.contains('dock-pressing'));pointer(w,tab,'pointerup',62,60);assert(!dock.classList.contains('dock-dragging'));
+  console.log('PASS motion fallback, rapid navigation, close/reopen, stacked modals and gesture cancellation');
+ }finally{cleanup();}
+}
+{
+ const {w,d,cleanup}=fixture({ackDelay:160});
+ try{
+  await until(()=>d.querySelector('#nav-cta-text').textContent==='已连接');
+  click(d,'.dock [data-page="rules"]');await until(()=>d.querySelectorAll('.rule-row').length===1);click(d,'#add-rule');
+  d.querySelector('#dialog-input').value='com.example.delayed';click(d,'#dialog-save');click(d,'#dialog-close');await pause();
+  click(d,'.dock [data-page="about"]');click(d,'#about-license');await until(()=>w.fixture.rules.length===2);await new Promise(resolve=>nativeTimeout(resolve,100));
+  assert(d.querySelector('#dialog-layer').classList.contains('open'));assert(d.querySelector('#dialog-title').textContent.includes('来源与许可'));
+  console.log('PASS delayed rule acknowledgement preserves the newer dialog');
+ }finally{cleanup();}
 }
 console.log('PASS: DOM and host scenarios. Geometry and Canvas are synthetic; this is not pixel verification.');
 }

@@ -235,7 +235,6 @@ const NATIVE_JSON: &str = "/data/powercfg.json";
 const NATIVE_SCRIPT: &str = "/data/powercfg.sh";
 const NATIVE_BASE: &str = "/data/powercfg-base.sh";
 const OWN_SCRIPT_MAGIC: &str = "NovaSched_Zen_Edition_Scene_Provider";
-const PROVIDER_STATE_DIR: &str = "/data/adb/novasched/scene-provider";
 const PROVIDER_STATE_HEADER: &str = "NOVASCHED_ZEN_SCENE_PROVIDER_V2";
 const LEGACY_PROVIDER_STATE_HEADER: &str = "NOVASCHED_ZEN_SCENE_PROVIDER_V1";
 fn vtools_xml(user: u32) -> [PathBuf; 2] {
@@ -573,7 +572,7 @@ pub fn sync_rules(rules: &Rules) -> Result<bool> {
     if merged == original {
         return Ok(true);
     }
-    let _lock = util::acquire_flock(&Path::new(PROVIDER_STATE_DIR).join("rules.lock"))?;
+    let _lock = util::acquire_flock(&crate::storage::path(Path::new(util::STATE_DIR), "scene-provider").as_path().join("rules.lock"))?;
     util::atomic_replace_preserving(&path, merged.as_bytes(), original.as_bytes())?;
     Ok(true)
 }
@@ -802,7 +801,7 @@ struct ProviderPaths {
 
 impl ProviderPaths {
     fn new() -> Self {
-        let dir = PathBuf::from(PROVIDER_STATE_DIR);
+        let dir = crate::storage::path(Path::new(util::STATE_DIR), "scene-provider");
         Self {
             lock: dir.join("lock"),
             marker: dir.join("managed"),

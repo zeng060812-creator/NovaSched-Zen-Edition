@@ -4,7 +4,7 @@ umask 077
 export PATH="/system/bin:/system/xbin:/data/adb/ksu/bin:/data/adb/ap/bin:/data/adb/magisk:$PATH"
 
 printf '\nNovaSched Zen Edition · 卸载收尾 · ZenJooo\n'
-printf '调度下班，系统归位，行李全部带走。\n'
+printf '停止服务，恢复系统设置并清理模块数据。\n'
 # Print directly: retaining an uninstall.log would itself leave a residue.
 # The native command verifies process identity and holds the control locks
 # while restoring and cleaning; failures must remain visible to the manager.

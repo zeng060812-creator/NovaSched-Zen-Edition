@@ -217,7 +217,7 @@ pub fn identify_soc(
         .map(|(soc, e)| (soc, e.join(", ")))
         .ok_or_else(|| {
             format!(
-                "未识别到支持的处理器（骁龙 8 系列、天玑 8350 / 8400 / 9400+、玄戒 O3）；检测值: {}",
+                "未识别到支持的处理器（骁龙 8 系列、天玑 8350 / 8400 / 9300+ / 9400+、玄戒 O3）；检测值: {}",
                 properties
                     .iter()
                     .filter(|(_, v)| !v.trim().is_empty())
@@ -347,29 +347,7 @@ pub fn inspect_policies(root: &Path) -> Result<Vec<CpuPolicy>> {
     policies.sort_by_key(|p| p.id);
     Ok(policies)
 }
-fn physical_frequency_range(base: &Path) -> Result<(u64, u64)> {
-    let read = |name: &str| {
-        util::read_trimmed(base.join(name))
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-    };
-    if let (Some(min), Some(max)) = (read("cpuinfo_min_freq"), read("cpuinfo_max_freq")) {
-        if min <= max {
-            // Qualcomm primes expose a boost OPP above cpuinfo_max_freq
-            // (SM8550: 3187 vs 3200 MHz). Without this, 100% resolves one
-            // OPP short and 极速 can never reach the true silicon maximum.
-            let boost = util::read_trimmed(base.join("scaling_boost_frequencies"))
-                .ok()
-                .and_then(|raw| {
-                    raw.split_whitespace()
-                        .filter_map(|v| v.parse::<u64>().ok())
-                        .filter(|v| *v > 0)
-                        .max()
-                });
-            return Ok((min, boost.map(|b| max.max(b)).unwrap_or(max)));
-        }
-    }
+fn frequency_table(base: &Path) -> Vec<u64> {
     let mut frequencies: Vec<u64> = util::read_trimmed(base.join("scaling_available_frequencies"))
         .unwrap_or_default()
         .split_whitespace()
@@ -385,8 +363,54 @@ fn physical_frequency_range(base: &Path) -> Result<(u64, u64)> {
             .collect();
     }
     frequencies.sort_unstable();
-    match (frequencies.first(), frequencies.last()) {
-        (Some(min), Some(max)) => Ok((*min, *max)),
+    frequencies.dedup();
+    frequencies
+}
+fn physical_frequency_range(base: &Path) -> Result<(u64, u64)> {
+    let read = |name: &str| {
+        util::read_trimmed(base.join(name))
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    };
+    let table = frequency_table(base);
+    let (table_min, table_max) = (
+        table.first().copied().unwrap_or(0),
+        table.last().copied().unwrap_or(0),
+    );
+    if let (Some(min), Some(max)) = (read("cpuinfo_min_freq"), read("cpuinfo_max_freq")) {
+        if min <= max {
+            // Qualcomm primes expose a boost OPP above cpuinfo_max_freq
+            // (SM8550: 3187 vs 3200 MHz). Without this, 100% resolves one
+            // OPP short and 极速 can never reach the true silicon maximum.
+            let boost = util::read_trimmed(base.join("scaling_boost_frequencies"))
+                .ok()
+                .and_then(|raw| {
+                    raw.split_whitespace()
+                        .filter_map(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v > 0)
+                        .max()
+                });
+            let mut min = min;
+            let mut max = boost.map(|b| max.max(b)).unwrap_or(max);
+            // 交叉校验：部分内核上报占位的伪范围（天玑 9300+ 真机实测
+            // cpuinfo_min/max = 1/10000000 kHz）。若 cpuinfo 端点落在可用
+            // 频表之外（上限允许超出频表一倍以内，覆盖骁龙未列表的 boost
+            // OPP），以频表端点为准，否则百分比会按伪上限换算出硬件根本
+            // 不存在的频率，写入即被内核拒绝或静默钳制。
+            if table_min > 0 && (min < table_min || min > table_max) {
+                min = table_min;
+            }
+            if table_max > 0 && (max < table_min || max > table_max.saturating_mul(2)) {
+                max = table_max;
+            }
+            if min <= max {
+                return Ok((min, max));
+            }
+        }
+    }
+    match (table_min, table_max) {
+        (min, max) if min > 0 && max >= min => Ok((min, max)),
         _ => Err(format!(
             "{} 缺少 CPU 物理频率范围，请保留检测输出",
             base.display()
@@ -516,6 +540,7 @@ impl Hardware {
             config.functions.scheduler.enable = false;
             config.functions.perf_service_lock.enable = false;
             config.functions.fas.enabled = false;
+            config.functions.gpu_devfreq.enabled = false;
             for profile in config.modes.values_mut() {
                 profile.online = [true; 8];
                 for cluster in &mut profile.clusters {
@@ -793,6 +818,7 @@ mod tests {
             (Soc::Gen3, 557),
             (Soc::Elite, 618),
             (Soc::Elite5, 660),
+            (Soc::Gen5, 685),
         ] {
             for value in [
                 soc.id().to_string(),
@@ -811,8 +837,7 @@ mod tests {
         }
         for name in [
             "Snapdragon 8s Gen 3",
-            "Snapdragon 8 Gen 5",
-            "SM8845",
+            "Snapdragon 8s Gen 5",
             "SM8650--AB",
             "SM86500",
             "8 Elite 2",
@@ -878,7 +903,9 @@ mod tests {
                     Soc::Dimensity8350 | Soc::Dimensity8400 => "1680000",
                     // SM8650 按 2W 功耗预算重调：省电小核 60%（无表夹取）。
                     Soc::Gen3 => "1800000",
-                    Soc::Elite | Soc::Elite5 | Soc::Dimensity9400Plus => "1560000",
+                    Soc::Elite | Soc::Elite5 | Soc::Dimensity9400Plus | Soc::Gen5 => "1560000",
+                    // MT6989 全大核：省电档首簇（A720）留 60% 保底日常流畅。
+                    Soc::Dimensity9300Plus => "1800000",
                 }
             );
         }
@@ -995,13 +1022,81 @@ mod tests {
         }
     }
     #[test]
+    fn gen5_and_dimensity9300plus_real_device_evidence_is_recognized() {
+        // 一加 PLR110（骁龙 8 Gen 5 / SM8845 / canoe）真机采集证据。
+        let oneplus = vec![
+            ("ro.product.manufacturer".into(), "OnePlus".into()),
+            ("ro.product.model".into(), "PLR110".into()),
+            ("ro.product.device".into(), "OP6117L1".into()),
+            ("ro.soc.manufacturer".into(), "QTI".into()),
+            ("ro.soc.model".into(), "SM8845".into()),
+            ("ro.board.platform".into(), "canoe".into()),
+            ("ro.hardware".into(), "qcom".into()),
+            ("ro.vendor.qti.soc_model".into(), "SM8845".into()),
+            ("ro.vendor.qti.soc_name".into(), "alor".into()),
+            ("ro.vendor.qti.soc_id".into(), "685".into()),
+        ];
+        assert_eq!(identify_soc(&oneplus, &[]).unwrap().0, Soc::Gen5);
+        assert_eq!(Soc::Gen5.anchors(), [0, 6, -1, -1]);
+        assert!(Soc::Gen5.qualcomm());
+        for value in ["SM8845", "Snapdragon 8 Gen 5", "sm8845-ac"] {
+            assert_eq!(identify_soc(&props(value), &[]).unwrap().0, Soc::Gen5, "{value}");
+        }
+        // vivo PD2417（天玑 9300+ / MT6989）真机采集证据。
+        let vivo = vec![
+            ("ro.product.manufacturer".into(), "vivo".into()),
+            ("ro.product.model".into(), "V2417A".into()),
+            ("ro.product.device".into(), "PD2417".into()),
+            ("ro.soc.manufacturer".into(), "Mediatek".into()),
+            ("ro.soc.model".into(), "MT6989".into()),
+            ("ro.board.platform".into(), "mt6989".into()),
+            ("ro.hardware".into(), "mt6989".into()),
+            ("ro.vendor.mediatek.platform".into(), "MT6989".into()),
+            ("ro.vendor.soc.model".into(), "MT6989".into()),
+        ];
+        assert_eq!(identify_soc(&vivo, &[]).unwrap().0, Soc::Dimensity9300Plus);
+        assert_eq!(Soc::Dimensity9300Plus.anchors(), [0, 4, 7, -1]);
+        assert!(!Soc::Dimensity9300Plus.qualcomm());
+        for value in ["MT6989", "MediaTek Dimensity 9300+", "天玑9300+", "dimensity9300plus"] {
+            assert_eq!(
+                identify_soc(&props(value), &[]).unwrap().0,
+                Soc::Dimensity9300Plus,
+                "{value}"
+            );
+        }
+        // 营销名精确匹配：天玑 9300（无 +）与 8s Gen 5 不属于本家族。
+        for value in ["Dimensity 9300", "天玑9300", "Snapdragon 8s Gen 5"] {
+            assert!(identify_soc(&props(value), &[]).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn bogus_cpuinfo_range_falls_back_to_the_frequency_table() {
+        // 天玑 9300+ 真机：cpuinfo_min/max_freq 上报占位伪值 1/10000000 kHz，
+        // 百分比换算必须回到可用频表边界，否则写出硬件不存在的频率。
+        let root = std::env::temp_dir().join(format!("nova-bogus-range-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("cpuinfo_min_freq"), "1").unwrap();
+        fs::write(root.join("cpuinfo_max_freq"), "10000000").unwrap();
+        fs::write(
+            root.join("scaling_available_frequencies"),
+            "300000 1200000 2000000",
+        )
+        .unwrap();
+        assert_eq!(physical_frequency_range(&root).unwrap(), (300000, 2000000));
+        // 骁龙超大核 boost：cpuinfo 上限允许超出频表（SM8550 3187 vs 2956）。
+        fs::write(root.join("cpuinfo_min_freq"), "595200").unwrap();
+        fs::write(root.join("cpuinfo_max_freq"), "3187200").unwrap();
+        assert_eq!(physical_frequency_range(&root).unwrap(), (595200, 3187200));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn excludes_similar_other_and_unknown_chips() {
         for value in [
             "SM8635",
             "Snapdragon 8s Gen 3",
             "SM85500",
             "SM86500",
-            "SM8845",
+            "SM88450",
             "Snapdragon 8s Gen 2",
             "houji",
             "",
@@ -1173,6 +1268,18 @@ mod tests {
                 vec![(10, "0-5"), (16, "6-7")],
                 [10, 16, -1, -1],
             ),
+            (
+                Soc::Gen5,
+                include_str!("../tests/fixtures/sm8845-cpuinfo.txt"),
+                vec![(0, "0-5"), (6, "6-7")],
+                [0, 6, -1, -1],
+            ),
+            (
+                Soc::Dimensity9300Plus,
+                include_str!("../tests/fixtures/mt6989-cpuinfo.txt"),
+                vec![(0, "0-3"), (4, "4-6"), (7, "7")],
+                [0, 4, 7, -1],
+            ),
         ];
         for (soc, dump, groups, expected) in samples {
             let normalized = dump.replace("\r\n", "\n");
@@ -1202,7 +1309,11 @@ mod tests {
                     parts,
                     ["0xd81", "0xd81", "0xd81", "0xd81", "0xd82", "0xd82", "0xd82", "0xd85"]
                 ),
-                Soc::Elite5 => assert!(parts.iter().all(|part| part == "0x002")),
+                Soc::Dimensity9300Plus => assert_eq!(
+                    parts,
+                    ["0xd81", "0xd81", "0xd81", "0xd81", "0xd82", "0xd82", "0xd82", "0xd82"]
+                ),
+                Soc::Elite5 | Soc::Gen5 => assert!(parts.iter().all(|part| part == "0x002")),
                 _ => unreachable!(),
             }
             let model = dump
@@ -1250,7 +1361,9 @@ mod tests {
                     );
                     assert!(data.max_freq.parse::<u64>().unwrap() <= policy.max_freq);
                     assert_eq!(data.governor, "schedutil");
-                    if !soc.elite() {
+                    // 天玑 9300+ 模板刻意携带 schedutil 速率参数（极限策略），
+                    // 其它非 Elite 模板仍保持空参数表。
+                    if !soc.elite() && soc != Soc::Dimensity9300Plus {
                         assert!(data.sched_params.is_empty());
                     }
                 }
@@ -1277,12 +1390,7 @@ mod tests {
         ] {
             assert!(identify_soc(&props(model), &[]).is_err());
         }
-        assert_eq!(
-            identify_soc(&[("ro.board.platform".into(), "MT6991".into())], &[])
-                .unwrap()
-                .0,
-            Soc::Dimensity9400Plus
-        );
+        assert!(identify_soc(&[("ro.board.platform".into(),"MT6991".into())],&[]).is_err());
         assert!(identify_soc(&props("Dimensity 8350"), &["xring,o3".into()]).is_err());
     }
     #[test]

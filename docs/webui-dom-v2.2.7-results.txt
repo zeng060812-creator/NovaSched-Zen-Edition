@@ -1,8 +1,0 @@
-PASS: DOM {"linked":true,"automatic":true,"presence":"available"}
-PASS: DOM {"presence":"absent"}
-PASS: DOM {"presence":"unknown"}
-PASS: DOM {"external":true,"presence":"available"}
-PASS: DOM {"root":true,"presence":"absent"}
-PASS: DOM {"labels":false,"presence":"absent"}
-PASS: navigation, Scene priority, full package fallback, mode changes, rule CRUD, diagnostics, themes, original glass script integration
-Geometry/canvas are synthetic; this is interaction verification, not a pixel rendering check.

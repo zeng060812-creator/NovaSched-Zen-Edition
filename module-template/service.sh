@@ -7,9 +7,17 @@ nova_module_available() {
 nova_module_available || exit 0
 umask 077
 export PATH="/system/bin:/system/xbin:/data/adb/ksu/bin:/data/adb/ap/bin:/data/adb/magisk:$PATH"
-# Keep pre-ELF evidence inside the module. A late boot shell must not recreate
-# the persistent runtime directory after the uninstaller has removed it.
-exec >>"$MODDIR/boot-entry.log" 2>&1 || exit 1
+# The installer prepares this directory. A late shell must not recreate it after uninstall.
+NOVA_STATE=/data/adb/novasched
+[ ! -L "$NOVA_STATE" ] && [ ! -L "$NOVA_STATE/logs" ] || exit 1
+nova_module_available || exit 0
+NOVA_BOOT_LOG="$NOVA_STATE/logs/boot-entry.log"
+[ ! -L "$NOVA_BOOT_LOG" ] || exit 1
+if [ -d "$NOVA_STATE/logs" ]; then
+  exec >"$NOVA_BOOT_LOG" 2>&1 || exit 1
+else
+  printf '%s\n' 'novasched: 启动日志目录缺失；完整安装模块可重建' >&2
+fi
 printf '%s service.sh entered; waiting for boot and first unlock\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
   nova_module_available || exit 0

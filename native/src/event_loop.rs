@@ -173,9 +173,11 @@ impl EventLoop {
                 .unwrap_or(0);
             if flags & (ffi::POLLIN | ffi::POLLERR) != 0 {
                 let mut value = [0u8; 8];
-                // 信号是电平触发的；读掉计数值即可。读失败按坏描述符处理。
+                // 信号是电平触发的；读掉计数值即可。读失败按坏描述符处理：
+                // 只置 None 让 File 的 Drop 关闭 fd。不能再显式 close——
+                // Drop 会二次关闭同一 fd 号，若其间其它线程打开新文件复用了
+                // 该号，会被误关。
                 if file.read_exact(&mut value).is_err() {
-                    unsafe { ffi::close(file.as_raw_fd()) };
                     self.touch_signal = None;
                     broken = true;
                 } else {

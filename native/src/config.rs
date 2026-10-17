@@ -188,6 +188,23 @@ impl Default for FeedVideoConfig {
     }
 }
 
+/// devfreq GPU 档位包络：按档位写 GPU min_freq/max_freq（可用频表归一化）。
+/// 0% = 不限制（写设备频表端点）。设备缺少可调频 GPU 节点时运行时降级：
+/// 记一条日志并保持 GPU 完全由内核管理，不影响其它功能。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuDevfreqMode {
+    /// 最低频率下限，占频表最高 OPP 的百分比；0 = 物理最低。
+    pub min: u32,
+    /// 最高频率上限，占频表最高 OPP 的百分比；0 = 物理最高。
+    pub max: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuDevfreq {
+    pub enabled: bool,
+    pub modes: BTreeMap<String, GpuDevfreqMode>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Functions {
     pub node_watchdog: bool,
@@ -201,6 +218,7 @@ pub struct Functions {
     pub perf_service_lock: PerfServiceLock,
     pub fas: FasConfig,
     pub feed_video: FeedVideoConfig,
+    pub gpu_devfreq: GpuDevfreq,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -424,6 +442,7 @@ impl Config {
                 perf_service_lock,
                 fas: FasConfig::default(),
             feed_video: FeedVideoConfig::default(),
+            gpu_devfreq: GpuDevfreq::default(),
             },
             modes,
         })

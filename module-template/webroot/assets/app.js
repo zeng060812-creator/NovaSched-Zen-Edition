@@ -15,7 +15,7 @@
     if (match) { MODULE = match[1]; MODULE_CANDIDATES.unshift(MODULE); }
   } catch (_) {}
   const STORAGE = "novasched.zen.ui.v2";
-  const UI_VERSION = window.NovaRelease?.version || "2.10.3";
+  const UI_VERSION = window.NovaRelease?.version || "2.11.0";
 
   const MODES = {
     powersave:   { name: "省电", copy: "限制 CPU 频率上限，适合消息、阅读和轻量日用。" },
@@ -338,7 +338,7 @@
       return reply;
     });
   }
-  function receiveRootSnapshot(reply) {
+  function receiveRootSnapshot(reply,withLogs=false){
     if (reply.modes) {
       const status = parseStatus(reply.modes);
       if (!goodStatus(status)) throw new Error("守护心跳或状态未就绪");
@@ -348,8 +348,8 @@
       modeNote("");
     }
     if (reply.apps) receiveApps(reply.apps);
-    if (logsActive()) {
-      if (reply.logsReset) { s.logTail = ""; if (!s.logCursor) s.logs = []; }
+    if(withLogs&&logsActive()){
+      if(reply.logsReset) { s.logTail = ""; if (!s.logCursor) s.logs = []; }
       s.logCursor = reply.cursor;
       s.logConnected = true; s.logConnecting = false;
       if (reply.logs) receiveLogs(reply.logs); else renderLogs();
@@ -357,17 +357,17 @@
   }
   function pollRootBridge(epoch) {
     if (epoch !== s.epoch || s.suspended || s.transport !== "root" || s.rootJob) return;
-    const job = {}, generation = s.rootGeneration; s.rootJob = job;
-    rootRequest({endpoint:"snapshot", logs:logsActive(), cursor:s.logCursor}).then(reply => {
+    const job={logs:logsActive()},generation=s.rootGeneration;s.rootJob=job;
+    rootRequest({endpoint:"snapshot",logs:job.logs,cursor:s.logCursor}).then(reply => {
       if (epoch !== s.epoch || s.suspended || generation !== s.rootGeneration) return;
-      receiveRootSnapshot(reply);
+      receiveRootSnapshot(reply,job.logs);
     }).catch(error => {
       if (epoch !== s.epoch || s.suspended || generation !== s.rootGeneration) return;
       offline("root"); s.connectionError = "宿主备用通道失败：" + publicError(error.message); render();
     }).finally(() => {
       if (s.rootJob === job) s.rootJob = null;
       if (epoch === s.epoch && !s.suspended && s.transport === "root")
-        s.rootTimer = setTimeout(() => pollRootBridge(epoch), 2000);
+        s.rootTimer=setTimeout(()=>pollRootBridge(epoch),logsActive()&&!job.logs?0:2000);
     });
   }
   function startRootBridge() {
@@ -590,7 +590,7 @@
     if (kind === "auto" && s.linked) { toast("Scene 正在控制档位，请在 Scene 中调整"); return false; }
     const endpoint = ["rule", "delete"].includes(kind) ? "apps" : "modes";
     const message = kind === "mode" ? value : kind === "auto" ? `auto\t${value}` : kind === "rule" ? `set\t${pkg}\t${value}` : `delete\t${pkg}`;
-    s.pending = { kind, value, pkg };
+    s.pending = { kind, value, pkg, dialogEpoch };
     if (!send(endpoint, message)) { s.pending = null; render(); return false; }
     if (kind === "mode") modeNote(`正在请求${MODES[value].name}档，等待守护进程反馈…`);
     if (kind === "auto") modeNote("正在切换自动调度，等待守护进程确认…");
@@ -621,8 +621,8 @@
     const p = s.pending; clearTimeout(pendingTimer); pendingTimer = 0; s.pending = null;
     if (success) NovaHaptics.success(); else NovaHaptics.failure();
     if (p?.kind === "mode" || p?.kind === "auto") modeNote(message, !success);
-    if (success && ["rule", "delete"].includes(p?.kind)) closeDialog();
-    if (!success && ["rule", "delete"].includes(p?.kind)) {
+    if(success&&["rule","delete"].includes(p?.kind)&&p.dialogEpoch===dialogEpoch)closeDialog();
+    if(!success&&["rule","delete"].includes(p?.kind)&&p.dialogEpoch===dialogEpoch){
       const err = $("#dialog-error");
       if (err && $("#dialog-layer").classList.contains("open")) { err.hidden = false; err.textContent = message; }
     }
@@ -868,7 +868,22 @@
   const PAGE_IDS = ["overview", "rules", "logs", "about"];
   let currentPage = "overview", routeDepth = 0;
   const pageScroll = new Map();
-  const reducedMotion = () => ui.reduceMotion || !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  const motionQuery=window.matchMedia?.("(prefers-reduced-motion: reduce)");
+  const reducedMotion=()=>ui.reduceMotion||!!motionQuery?.matches;
+  const motions=new Map();
+  let stopPageMotion=null,dialogEpoch=0,personalEpoch=0;
+  function ownedMotion(element,frames,options,complete){
+    motions.get(element)?.cancel();
+    let animation=null,timer=0,settled=false;
+    const controller={cancel:()=>settle(false),finish:()=>settle(true)};
+    function settle(finished){if(settled)return;settled=true;clearTimeout(timer);if(motions.get(element)===controller)motions.delete(element);if(animation){animation.onfinish=null;animation.oncancel=null;animation.cancel();}complete?.(finished);}
+    if(reducedMotion()||typeof element?.animate!=="function"){settle(true);return controller;}
+    motions.set(element,controller);
+    try{animation=element.animate(frames,options);animation.onfinish=controller.finish;animation.oncancel=controller.cancel;timer=setTimeout(controller.finish,(options.duration||0)+80);}catch(_){settle(true);}
+    return controller;
+  }
+  function finishMotion(){stopPageMotion?.();for(const motion of [...motions.values()])motion.finish();}
+  motionQuery?.addEventListener?.("change",()=>{if(reducedMotion())finishMotion();});
   /* 兼容别名：所有触感统一走 NovaHaptics 语义层 */
   function haptic() { NovaHaptics.select(); }
   function rememberRoute(overlay = null, replace = false) {
@@ -884,62 +899,46 @@
     for (const selector of ["main", "#dock-wrap", ".top-bar"]) { const node=$(selector); if(node)node.inert=modal; }
     $("#personal-panel").inert = $("#dialog-layer").classList.contains("open");
     document.body.classList.toggle("overlay-open", modal);
+    document.body.style.overflow=modal?"hidden":"";
   }
   /* 锚点 morph：打开与关闭共用同一组关键帧，关闭时反向播放，
      元素精确回到它的来源锚点（从哪来就从哪回去）。 */
-  function morph(element, anchor, opening = true) {
-    if (!element || !anchor || reducedMotion() || typeof element.animate !== "function") return;
-    const target = element.getBoundingClientRect(), from = anchor.getBoundingClientRect();
-    if (!target.width || !target.height || !from.width || !from.height) return;
-    const dx = from.left + from.width / 2 - target.left - target.width / 2;
-    const dy = from.top + from.height / 2 - target.top - target.height / 2;
-    const small = `translate(${dx}px,${dy}px) scale(${Math.max(.08, from.width / target.width)},${Math.max(.08, from.height / target.height)})`;
-    const frames = [
-      { transform: small, opacity: .25 },
-      { transform: "none", opacity: 1 },
-    ];
-    element.animate(opening ? frames : [...frames].reverse(), {
-      duration: 420, easing: "cubic-bezier(.32,.72,0,1)", fill: "none",
-    });
-    window.NovaGlass?.invalidate(560);
+  function morph(element,anchor,opening=true,complete){
+    const target=element?.getBoundingClientRect(),from=anchor?.getBoundingClientRect();
+    let small="translateY(12px) scale(.96)";
+    if(target?.width&&target.height&&from?.width&&from.height){const dx=from.left+from.width/2-target.left-target.width/2,dy=from.top+from.height/2-target.top-target.height/2;small=`translate(${dx}px,${dy}px) scale(${Math.max(.08,from.width/target.width)},${Math.max(.08,from.height/target.height)})`;}
+    const frames=[{transform:small,opacity:0},{transform:"none",opacity:1}];
+    const motion=ownedMotion(element,opening?frames:[...frames].reverse(),{duration:opening?420:320,easing:"cubic-bezier(.22,.8,.25,1)",fill:"both"},complete);
+    window.NovaGlass?.invalidate(500);return motion;
   }
-  function animatePageSwitch(previous, next, forward) {
-    const incoming = $("#page-" + next), outgoing = $("#page-" + previous);
-    if (!incoming || !outgoing || reducedMotion() || typeof incoming.animate !== "function") return;
-    const duration = 400, easing = "cubic-bezier(.32,.72,0,1)";
-    const enter = [
-      { transform: `translateX(${forward ? "26%" : "-26%"})`, opacity: 0 },
-      { transform: "translateX(0)", opacity: 1 },
-    ];
-    const leave = [
-      { transform: "translateX(0)", opacity: 1 },
-      { transform: `translateX(${forward ? "-18%" : "18%"})`, opacity: 0 },
-    ];
-    outgoing.classList.add("leaving");
-    const out = outgoing.animate(leave, { duration, easing, fill: "forwards" });
-    const inn = incoming.animate(enter, { duration, easing, fill: "both" });
-    let done = 0;
-    const finish = () => {
-      if (++done < 2) return;
-      out.cancel(); inn.cancel();
-      outgoing.classList.remove("leaving");
-      window.NovaGlass?.invalidate(360);
-    };
-    out.onfinish = finish; inn.onfinish = finish;
-    setTimeout(finish, duration + 80); /* 兜底：标签页切换或 WebView 暂停时 onfinish 可能延迟 */
+  function animatePageSwitch(previous,next,forward){
+    stopPageMotion?.();
+    const incoming=$("#page-"+next),outgoing=$("#page-"+previous);
+    if(!incoming||!outgoing||reducedMotion()||typeof incoming.animate!=="function")return;
+    if(mainScroll.scrollTop>0||(pageScroll.get(previous)||0)>0){
+      let motion;const finish=()=>{motion?.cancel();if(stopPageMotion===finish)stopPageMotion=null;};stopPageMotion=finish;
+      motion=ownedMotion(incoming,[{opacity:.45},{opacity:1}],{duration:220,easing:"ease-out",fill:"both"},()=>{if(stopPageMotion===finish)stopPageMotion=null;});window.NovaGlass?.invalidate(320);return;
+    }
+    const duration=360,easing="cubic-bezier(.22,.8,.25,1)";let out,inn,timer=0,done=0,settled=false;
+    const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);for(const a of [out,inn])if(a){a.onfinish=null;a.oncancel=null;a.cancel();}outgoing.classList.remove("leaving");if(stopPageMotion===finish)stopPageMotion=null;window.NovaGlass?.invalidate(240);};
+    stopPageMotion=finish;outgoing.classList.add("leaving");
+    try{out=outgoing.animate([{transform:"none",opacity:1},{transform:`translateX(${forward?"-12%":"12%"})`,opacity:0}],{duration,easing,fill:"both"});inn=incoming.animate([{transform:`translateX(${forward?"18%":"-18%"})`,opacity:0},{transform:"none",opacity:1}],{duration,easing,fill:"both"});const ended=()=>{if(++done===2)finish();};out.onfinish=ended;inn.onfinish=ended;out.oncancel=finish;inn.oncancel=finish;timer=setTimeout(finish,duration+100);}catch(_){finish();}
+    window.NovaGlass?.invalidate(460);
   }
   function setPage(page, fromHistory = false) {
     if (!PAGE_IDS.includes(page)) page = "overview";
     const previous = currentPage, changed = previous !== page;
     if (changed) {
+      stopPageMotion?.();
       pageScroll.set(previous, mainScroll.scrollTop || 0);
-      if ($("#appearance-layer").classList.contains("open")) closePersonalize(true);
-      if ($("#dialog-layer").classList.contains("open")) closeDialog(true);
+      if ($("#appearance-layer").classList.contains("open")) closePersonalize(true,true);
+      if ($("#dialog-layer").classList.contains("open")) closeDialog(true,true);
     }
     currentPage = page; s.page = page;
     $$(".page").forEach(node => {
       node.classList.toggle("active", node.id === "page-" + page);
       node.setAttribute("aria-hidden", String(node.id !== "page-" + page));
+      node.inert=node.id!=="page-"+page;
     });
     const index = PAGE_IDS.indexOf(page);
     $$(".dock button").forEach((button, buttonIndex) => {
@@ -972,7 +971,7 @@
   });
   const dock = $(".dock"); let dockDrag = null, ignoreDockClick = 0;
   dock.addEventListener("pointerdown", event => {
-    if (event.button > 0) return;
+    if(event.button>0||event.isPrimary===false||dockDrag)return;
     const rect = dock.getBoundingClientRect(), cell = (rect.width - 10) / 4;
     dockDrag = { pointer: event.pointerId, start: event.clientX, startY: event.clientY, rect, cell, moved: false, index: PAGE_IDS.indexOf(currentPage) };
     /* 按下后下一帧给轻微压缩反馈；不缩放单个按钮，点击区域保持稳定 */
@@ -982,7 +981,7 @@
     if (!dockDrag || event.pointerId !== dockDrag.pointer) return;
     if (!dockDrag.moved) {
       const dx = Math.abs(event.clientX - dockDrag.start), dy = Math.abs(event.clientY - dockDrag.startY);
-      if (dy > 8 && dy > dx) { dockDrag = null; return; }
+      if(dy>8&&dy>dx){endDock(event,true);return;}
       if (dx <= 8) return;
       dockDrag.moved = true;
       dock.setPointerCapture?.(event.pointerId);
@@ -1003,8 +1002,9 @@
       switchPageWithHaptic(PAGE_IDS[index]);
       ignoreDockClick = performance.now() + 180;
     }
-    if (dock.hasPointerCapture?.(event.pointerId)) dock.releasePointerCapture?.(event.pointerId);
-    dock.classList.remove("dock-dragging"); dockDrag = null; window.NovaGlass?.invalidate(360);
+    dockDrag=null;
+    if(dock.hasPointerCapture?.(event.pointerId))dock.releasePointerCapture?.(event.pointerId);
+    dock.classList.remove("dock-dragging");dock.style.removeProperty("--dock-drag-x"); window.NovaGlass?.invalidate(360);
   }
   /* 统一的切页入口：有效切换一次触感；点击当前页只给轻反馈并保留状态 */
   function switchPageWithHaptic(page) {
@@ -1015,6 +1015,8 @@
   }
   dock.addEventListener("pointerup", event => endDock(event));
   dock.addEventListener("pointercancel", event => endDock(event, true));
+  dock.addEventListener("lostpointercapture",event=>endDock(event,true));
+  window.addEventListener("blur",()=>{if(dockDrag)endDock({pointerId:dockDrag.pointer},true);});
   /* 原地点按已在 pointerup 处理；吞掉随后的 click，避免一次操作触发两次 */
   dock.addEventListener("click", event => { if (performance.now() < ignoreDockClick) { event.preventDefault(); event.stopImmediatePropagation(); } }, true);
   dock.addEventListener("keydown", event => {
@@ -1044,7 +1046,7 @@
     if(wallpaperCache.has(key)){window.NovaGlass?.setWallpaper(wallpaperCache.get(key));return;}
     const img=new Image();
     img.onload=()=>{if(epoch!==wallpaperEpoch)return;wallpaperCache.clear();wallpaperCache.set(key,img);window.NovaGlass?.setWallpaper(img);};
-    img.onerror=()=>toast("壁纸无法读取，请重新选择");img.src=key;
+    img.onerror=()=>{if(epoch===wallpaperEpoch){wallpaperKey="";toast("壁纸无法读取，请重新选择");}};img.src=key;
   }
   function applyTheme() {
     const dark=ui.theme==="dark" || ui.theme==="system"&&!!darkQuery?.matches;
@@ -1067,6 +1069,7 @@
     window.NovaGlass?.setWallOptions({blur:ui.wallBlur,brightness:ui.wallBright/100,...currentCrop()});
     window.NovaGlass?.configure({level:ui.glassLevel,cardAlpha:ui.cardAlpha,cardBlur:ui.cardBlur,cardRadius:ui.cardRadius,chromeBlur:ui.chromeBlur,dispersion:ui.dispersion,material:ui.material,colorMode:ui.colorMode,cardColor:ui.cardColor,palette:ui.palette});
     loadWallpaperFromStorage();
+    if(reducedMotion())finishMotion();
   }
   $$(".theme-picker button").forEach(button=>button.onclick=()=>{ui.theme=button.dataset.themeChoice;saveUI();applyTheme();});
   $$(".swatch-row button").forEach(button=>button.onclick=()=>{ui.accent=button.dataset.accentChoice;saveUI();applyTheme();});
@@ -1098,38 +1101,35 @@
   darkQuery?.addEventListener?.("change",applyTheme);window.addEventListener("orientationchange",()=>{setTimeout(applyTheme,80);});window.addEventListener("resize",()=>{window.NovaGlass?.setWallOptions(currentCrop());});
   let personalAnchor=null,personalFocus=null,personalCloseTimer=0;
   function openPersonalize(anchor=$("#personalize-open"),push=true,glassOnly=false) {
-    personalAnchor=anchor||personalAnchor;personalFocus=document.activeElement;
+
     const layer=$("#appearance-layer");if(layer.classList.contains("open")&&!layer.classList.contains("closing"))return;
-    clearTimeout(personalCloseTimer);layer.classList.remove("closing");
+    if(anchor&&personalAnchor&&anchor!==personalAnchor)personalAnchor.style.visibility="";
+    personalAnchor=anchor||personalAnchor;
+    const epoch=++personalEpoch;if(!layer.classList.contains("open"))personalFocus=document.activeElement;
+    motions.get($("#personal-panel"))?.cancel();clearTimeout(personalCloseTimer);layer.classList.remove("closing");
     layer.classList.add("open");layer.setAttribute("aria-hidden","false");syncInert();
-    if(push)rememberRoute("appearance");
+    if(push&&history.state?.overlay!=="appearance")rememberRoute("appearance");
     const panel=$("#personal-panel");window.NovaGlass?.scan(panel);morph(panel,personalAnchor);
     if(personalAnchor=== $("#personalize-open"))personalAnchor.style.visibility="hidden";
-    requestAnimationFrame(()=>{if(glassOnly)$("#glass-controls").scrollIntoView?.({block:"start"});else $(".personal-scroll").scrollTop=0;$("#personalize-close").focus();});
+    requestAnimationFrame(()=>{if(epoch!==personalEpoch||!layer.classList.contains("open"))return;if(glassOnly)$("#glass-controls").scrollIntoView?.({block:"start"});else $(".personal-scroll").scrollTop=0;$("#personalize-close").focus();});
     window.dispatchEvent(new Event("nova:overlay"));
   }
-  function closePersonalize(fromHistory=false) {
-    const layer=$("#appearance-layer");
-    if(!layer.classList.contains("open") || (!fromHistory && layer.classList.contains("closing")))return;
-    stopSliderPreview();
-    const finish=()=>{
-      layer.classList.remove("open","closing");layer.setAttribute("aria-hidden","true");
-      if(personalAnchor)personalAnchor.style.visibility="";
-      syncInert();if(personalFocus?.isConnected)personalFocus.focus();window.dispatchEvent(new Event("nova:overlay"));
-    };
-    clearTimeout(personalCloseTimer);
-    if(fromHistory || reducedMotion())finish();
-    else{layer.classList.add("closing");morph($("#personal-panel"),personalAnchor,false);personalCloseTimer=setTimeout(finish,420);}
-    if(!fromHistory && history.state?.overlay==="appearance")history.back();
+  function closePersonalize(fromHistory=false,immediate=false){
+    const layer=$("#appearance-layer");if(!layer.classList.contains("open")||layer.classList.contains("closing")&&!immediate)return;
+    stopSliderPreview();const epoch=++personalEpoch;motions.get($("#personal-panel"))?.cancel();clearTimeout(personalCloseTimer);
+    const finish=finished=>{if(!finished||epoch!==personalEpoch)return;layer.classList.remove("open","closing");layer.setAttribute("aria-hidden","true");if(personalAnchor)personalAnchor.style.visibility="";syncInert();if(!$("#dialog-layer").classList.contains("open")&&personalFocus?.isConnected)personalFocus.focus();window.dispatchEvent(new Event("nova:overlay"));if(!fromHistory&&history.state?.overlay==="appearance")history.back();};
+    layer.classList.add("closing");if(immediate||reducedMotion())finish(true);else morph($("#personal-panel"),personalAnchor,false,finish);
   }
   $("#personalize-open").onclick=event=>openPersonalize(event.currentTarget);
   $("#appearance-settings").onclick=event=>openPersonalize(event.currentTarget);
   $("#glass-settings").onclick=event=>openPersonalize(event.currentTarget,true,true);
   $("#personalize-close").onclick=()=>closePersonalize();
   $("#appearance-layer").addEventListener("click",event=>{if(event.target===$("#appearance-layer"))closePersonalize();});
-  let panelDrag=null;
-  $(".personal-title").addEventListener("pointerdown",event=>{if(event.target.closest("button"))return;panelDrag={x:event.clientX,y:event.clientY};});
-  $(".personal-title").addEventListener("pointerup",event=>{if(panelDrag&&event.clientY-panelDrag.y>65)closePersonalize();panelDrag=null;});
+  let panelDrag=null;const panelHandle=$(".personal-title");
+  panelHandle.addEventListener("pointerdown",event=>{if(event.button>0||event.isPrimary===false||event.target.closest("button")||panelDrag)return;panelDrag={id:event.pointerId,y:event.clientY,dy:0};panelHandle.setPointerCapture?.(event.pointerId);});
+  panelHandle.addEventListener("pointermove",event=>{if(!panelDrag||event.pointerId!==panelDrag.id)return;panelDrag.dy=Math.max(0,event.clientY-panelDrag.y);if(panelDrag.dy>8){event.preventDefault();$("#personal-panel").style.transform=`translateY(${Math.min(140,panelDrag.dy)}px)`;window.NovaGlass?.invalidate();}});
+  function endPanelDrag(event,cancelled=false){if(!panelDrag||event.pointerId!==panelDrag.id)return;const drag=panelDrag;panelDrag=null;if(panelHandle.hasPointerCapture?.(event.pointerId))panelHandle.releasePointerCapture?.(event.pointerId);const panel=$("#personal-panel"),transform=panel.style.transform||"none";panel.style.transform="";if(!cancelled&&drag.dy>65)closePersonalize();else if(drag.dy>8)ownedMotion(panel,[{transform},{transform:"none"}],{duration:260,easing:"cubic-bezier(.22,.8,.25,1)",fill:"both"});window.NovaGlass?.invalidate(360);}
+  panelHandle.addEventListener("pointerup",e=>endPanelDrag(e));panelHandle.addEventListener("pointercancel",e=>endPanelDrag(e,true));panelHandle.addEventListener("lostpointercapture",e=>endPanelDrag(e,true));
   $("#wall-pick").onclick=()=>$("#wall-input").click();
   $("#wall-clear").onclick=()=>{ui.wallData="";ui.portrait={centerX:.5,centerY:.5,scale:1};ui.landscape={centerX:.5,centerY:.5,scale:1};saveUI();applyTheme();toast("已恢复默认壁纸");};
   $("#wall-frame").onclick=()=>{const img=window.NovaGlass?.getWallpaper();if(img)showWallpaperEditor(img,false);else toast("请等待壁纸加载完成");};
@@ -1146,6 +1146,7 @@
     openDialog(`<h3 id="dialog-title">调整壁纸</h3><div class="segmented" role="group" aria-label="壁纸方向"><button data-crop="portrait" type="button">竖屏</button><button data-crop="landscape" type="button">横屏</button></div><div class="crop-preview" id="crop-preview"><canvas id="crop-canvas"></canvas><span class="crop-guide" aria-hidden="true"></span></div><p class="crop-help">拖动调整位置，双指或滑条缩放。横竖屏分别保存。</p><input class="liquid-range" type="range" min="100" max="400" value="100" id="crop-scale" aria-label="壁纸缩放"><div class="dialog-actions"><button class="btn-capsule ghost" id="crop-cancel" type="button">取消</button><button class="btn-capsule accent" id="crop-save" type="button">完成</button></div>`);
     $(".dialog").classList.add("crop-dialog");
     const canvas=$("#crop-canvas"),context=canvas.getContext("2d"),preview=$("#crop-preview"),zoom=$("#crop-scale");const pointers=new Map();let lastPinch=0;
+    if(!context||!img.naturalWidth||!img.naturalHeight){closeDialog(true,true);toast("当前宿主无法编辑这张图片");return;}
     function draw(){
       const w=Math.max(1,Math.round(preview.clientWidth||258)),h=orientation==="portrait"?Math.round(w*1.2):Math.round(w*.65);preview.style.height=h+"px";canvas.width=w*2;canvas.height=h*2;
       const crop=crops[orientation],cover=Math.max(canvas.width/img.naturalWidth,canvas.height/img.naturalHeight)*crop.scale,dw=img.naturalWidth*cover,dh=img.naturalHeight*cover;
@@ -1176,34 +1177,28 @@
   /* ---------------- 弹窗 ---------------- */
   let dialogFocus = null, dialogCloseTimer = 0;
   function openDialog(bodyHtml) {
-    clearTimeout(dialogCloseTimer);$("#dialog-layer").classList.remove("closing");
+    const epoch=++dialogEpoch,reopening=$("#dialog-layer").classList.contains("closing");
+    motions.get($(".dialog"))?.cancel();clearTimeout(dialogCloseTimer);$("#dialog-layer").classList.remove("closing");
     const firstOpen=!$("#dialog-layer").classList.contains("open");
-    if(firstOpen)rememberRoute("dialog");
+    if(firstOpen&&history.state?.overlay!=="dialog")rememberRoute("dialog");
     $(".dialog").classList.remove("crop-dialog");
     const layer = $("#dialog-layer");
     if (!layer.classList.contains("open")) dialogFocus = document.activeElement;
     $("#dialog-body").innerHTML = `<button class="dialog-close" id="dialog-close" type="button" aria-label="关闭弹窗">×</button>` + bodyHtml;
     layer.classList.add("open"); layer.setAttribute("aria-hidden", "false");
     syncInert();
-    document.body.style.overflow = "hidden";
     $("#dialog-close").onclick = () => closeDialog();
     window.NovaGlass?.scan(layer);
-    if(firstOpen)morph($(".dialog"),dialogFocus);
+    if(firstOpen||reopening)morph($(".dialog"),dialogFocus);else ownedMotion($("#dialog-body"),[{opacity:.45,transform:"translateY(5px)"},{opacity:1,transform:"none"}],{duration:180,easing:"ease-out",fill:"both"});
     window.dispatchEvent(new Event("nova:dialog"));
-    requestAnimationFrame(() => { if (layer.classList.contains("open")) ($("#dialog-input") || $("#dialog-close")).focus(); });
+    requestAnimationFrame(() => { if(epoch===dialogEpoch&&layer.classList.contains("open")) ($("#dialog-input") || $("#dialog-close")).focus(); });
+    return epoch;
   }
-  function closeDialog(fromHistory = false) {
-    const layer=$("#dialog-layer");
-    if(!layer.classList.contains("open") || (!fromHistory && layer.classList.contains("closing")))return;
-    const finish=()=>{
-      layer.classList.remove("open","closing");layer.setAttribute("aria-hidden","true");
-      syncInert();document.body.style.overflow = "";
-      if(dialogFocus?.isConnected)dialogFocus.focus();window.dispatchEvent(new Event("nova:dialog"));
-    };
-    clearTimeout(dialogCloseTimer);
-    if(fromHistory || reducedMotion())finish();
-    else{layer.classList.add("closing");morph($(".dialog"),dialogFocus,false);dialogCloseTimer=setTimeout(finish,420);}
-    if(!fromHistory && history.state?.overlay==="dialog")history.back();
+  function closeDialog(fromHistory=false,immediate=false){
+    const layer=$("#dialog-layer");if(!layer.classList.contains("open")||layer.classList.contains("closing")&&!immediate)return;
+    const epoch=++dialogEpoch;motions.get($(".dialog"))?.cancel();clearTimeout(dialogCloseTimer);
+    const finish=finished=>{if(!finished||epoch!==dialogEpoch)return;layer.classList.remove("open","closing");layer.setAttribute("aria-hidden","true");syncInert();if(dialogFocus?.isConnected&&!dialogFocus.closest?.("[inert],[aria-hidden=true]"))dialogFocus.focus();window.dispatchEvent(new Event("nova:dialog"));if(!fromHistory&&history.state?.overlay==="dialog")history.back();};
+    layer.classList.add("closing");if(immediate||reducedMotion())finish(true);else morph($(".dialog"),dialogFocus,false,finish);
   }
   $("#dialog-layer").addEventListener("click", event => {
     if (event.target === $("#dialog-layer")) closeDialog();
@@ -1216,10 +1211,7 @@
     }
     if (event.key === "Escape") { closeDialog(); return; }
     if (event.key !== "Tab") return;
-    const fields = $$("button:not(:disabled),input:not(:disabled),a[href]", $("#dialog-body")).filter(node => node.getClientRects().length);
-    const first = fields[0], last = fields[fields.length-1];
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    trapFocus(event,$("#dialog-body"));
   });
 
   function showRuleEditor(pkg = "") {
@@ -1303,14 +1295,14 @@
   function maybeShowWelcome() {
     let seen = false;
     try { seen = localStorage.getItem(WELCOME_KEY) === "1"; } catch (_) { return; }
-    if (seen || !s.online) return;
+    if(seen||!s.online||document.hidden||currentPage!=="overview"||$(".appearance-layer.open,.dialog-layer.open"))return;
     try { localStorage.setItem(WELCOME_KEY, "1"); } catch (_) { return; }
     openDialog(`
       <p class="eyebrow">WELCOME</p>
       <h3 id="dialog-title">NovaSched v${UI_VERSION}</h3>
       <p class="dialog-sub">四档策略已按你的处理器逐频点适配；Scene 联动时，省电 / 均衡 / 性能 / 极速四个档位都由本模块执行下发。</p>
-      <p class="dialog-sub">NovaFAS 接管 Scene FAS / FEAS / FAS Lite 的职责：掉帧快速加压、稳定缓慢回落。使用本模块时建议在 Scene 里关闭它的 FAS 与调度，避免两个帧调度器争抢节点。</p>
-      <p class="dialog-sub">下拉通知栏与超级岛动画会按需临时抬频——省电、均衡档也不卡。概览页顶部可看各簇实时频率。</p>
+      <p class="dialog-sub">NovaFAS 接管 Scene FAS / FEAS / FAS Lite 的职责：掉帧快速加压、稳定缓慢回落。请关闭其它独立的帧调度器，避免两个帧调度器争抢节点。</p>
+      <p class="dialog-sub">概览页可查看当前档位、前台应用与各簇频率；连接异常时，可从设置读取诊断。</p>
       <div class="dialog-actions">
         <button class="btn-capsule ghost" type="button" id="welcome-donate">支持开发</button>
         <button class="btn-capsule accent" type="button" id="welcome-close">开始使用</button>
@@ -1335,7 +1327,7 @@
     return keys;
   }
   function showUpdate() {
-    openDialog(`
+    const epoch=openDialog(`
       <p class="eyebrow">UPDATE</p>
       <h3 id="dialog-title">检查更新</h3>
       <p class="dialog-sub" id="update-status">当前版本 v${UI_VERSION}。检查需要联网，下载走直连与镜像自动回退，SHA256 校验通过后才安装。</p>
@@ -1352,22 +1344,24 @@
       $("#update-check").disabled = true;
       status.textContent = "正在连接 GitHub 获取最新版本…";
       const restore = (message, error = true) => {
+        if(epoch!==dialogEpoch||!status.isConnected)return;
         status.textContent = message;
         const check = $("#update-check");
         if (check) { check.disabled = false; check.textContent = "重新检查"; }
         if (error) NovaHaptics.failure();
       };
       rootExec(updateScriptCommand("check"), 90000).then(result => {
+        if(epoch!==dialogEpoch||!status.isConnected)return;
         const keys = parseUpdateKeys(result.stdout);
         if (keys.UPDATE_FAIL) return restore("检查失败：" + keys.UPDATE_FAIL);
-        if (!keys.LATEST) return restore("返回数据不完整，请稍后再试");
+        if(!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(keys.LATEST||""))return restore("返回数据不完整，请稍后再试");
         if (keys.UPDATE_OK === "latest" || !keys.UPDATE_AVAILABLE) {
           NovaHaptics.success();
           status.textContent = `已是最新版本（当前 v${UI_VERSION}，最新 ${keys.LATEST}）。`;
           return;
         }
         NovaHaptics.success();
-        status.textContent = `发现新版本 ${keys.LATEST}（当前 v${UI_VERSION}）。下载约 1.7MB，校验通过后自动安装，完成后需要重启。`;
+        status.textContent = `发现新版本 ${keys.LATEST}（当前 v${UI_VERSION}）。校验通过后自动安装，完成后需要重启。`;
         actions.innerHTML = `
           <button class="btn-capsule ghost" type="button" id="update-open">打开 Release 页</button>
           <button class="btn-capsule accent" type="button" id="update-install">下载并安装 ${keys.LATEST}</button>`;
@@ -1377,10 +1371,11 @@
           actions.innerHTML = `<button class="btn-capsule ghost" type="button" id="dialog-cancel2">关闭</button>`;
           $("#dialog-cancel2").onclick = () => closeDialog();
           status.textContent = "正在下载、校验并安装，请保持网络畅通与屏幕亮起…";
-          rootExec(updateScriptCommand(`install ${keys.LATEST}`), 420000).then(installResult => {
+          rootExec(updateScriptCommand(`install ${shellQuote(keys.LATEST)}`), 420000).then(installResult => {
+            if(epoch!==dialogEpoch||!status.isConnected)return;
             const done = parseUpdateKeys(installResult.stdout);
             const report = $("#update-report");
-            if (report.isConnected) { report.hidden = false; report.textContent = (installResult.stdout || "").trim(); }
+            if(report?.isConnected){report.hidden=false;report.textContent=(installResult.stdout || "").trim(); }
             if (done.UPDATE_OK && done.UPDATE_OK !== "latest") {
               NovaHaptics.success();
               status.textContent = `安装完成（${done.MANAGER || "已写入 modules_update"}）。请重启手机生效。`;
@@ -1496,9 +1491,9 @@
 
   function trapFocus(event,root){
     if(event.key!=="Tab")return;
-    const fields=$$("button:not(:disabled),input:not(:disabled),a[href]",root).filter(node=>node.getClientRects().length&&!node.hidden);
+    const fields=$$("button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex]",root).filter(node=>node.getClientRects().length&&!node.hidden&&node.getAttribute("tabindex")!=="-1"&&!node.closest("[inert]"));
     const first=fields[0],last=fields.at(-1);if(!first)return;
-    if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
+    if(!fields.includes(document.activeElement)){event.preventDefault();first.focus();}else if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
   }
   $("#foreground-time").onclick=()=>{if(!editable()||!s.pkg){toast("连接后可以为前台应用设置规则");return;}showRuleEditor(basePackage(s.pkg));};
   $("#foreground-card").onclick=event=>{if (!event.target.closest("button")) $("#foreground-time").click();};
@@ -1506,24 +1501,28 @@
   $("#rule-search").oninput=event=>{ruleQuery=event.target.value.trim().toLowerCase();renderRules();};
   let ruleDrag=null,suppressRuleClick=0;
   $("#rule-list").addEventListener("pointerdown",event=>{
-    const row=event.target.closest(".rule-row");if(!row)return;ruleDrag={row,id:event.pointerId,x:event.clientX,y:event.clientY,delta:0,active:false};
+    const row=event.target.closest(".rule-row");if(!row||event.button>0||event.isPrimary===false||ruleDrag)return;ruleDrag={row,id:event.pointerId,x:event.clientX,y:event.clientY,delta:0,active:false};
   },{passive:true});
   $("#rule-list").addEventListener("pointermove",event=>{
     if(!ruleDrag||event.pointerId!==ruleDrag.id)return;
     const dx=event.clientX-ruleDrag.x,dy=event.clientY-ruleDrag.y;
+    if(!ruleDrag.active&&Math.abs(dy)>10&&Math.abs(dy)>Math.abs(dx)){ruleDrag=null;return;}
     if(!ruleDrag.active&&Math.abs(dx)>12&&Math.abs(dx)>Math.abs(dy)*1.5){ruleDrag.active=true;ruleDrag.row.setPointerCapture?.(event.pointerId);}
     if(!ruleDrag.active)return;event.preventDefault();ruleDrag.delta=dx;ruleDrag.row.style.transform=`translateX(${Math.max(-72,Math.min(0,dx))}px)`;window.NovaGlass?.invalidate();
   });
   function stopRuleSwipe(event,cancelled=false){
     if(!ruleDrag||event.pointerId!==ruleDrag.id)return;const {row,delta,active}=ruleDrag;
-    if(active){const open=!cancelled&&delta<-36;row.style.transform=open?"translateX(-72px)":"";row.parentElement.classList.toggle("swiped",open);const action=$(".swipe-delete",row.parentElement);action.tabIndex=open?0:-1;action.setAttribute("aria-hidden",String(!open));suppressRuleClick=performance.now()+180;window.NovaGlass?.invalidate(300);}ruleDrag=null;
+    ruleDrag=null;if(row.hasPointerCapture?.(event.pointerId))row.releasePointerCapture?.(event.pointerId);
+    if(active){const open=!cancelled&&delta<-36;row.style.transform=open?"translateX(-72px)":"";row.parentElement.classList.toggle("swiped",open);const action=$(".swipe-delete",row.parentElement);action.tabIndex=open?0:-1;action.setAttribute("aria-hidden",String(!open));suppressRuleClick=performance.now()+180;window.NovaGlass?.invalidate(300);}
   }
+  $("#rule-list").addEventListener("lostpointercapture",event=>stopRuleSwipe(event,true));
   $("#rule-list").addEventListener("pointerup",event=>stopRuleSwipe(event));$("#rule-list").addEventListener("pointercancel",event=>stopRuleSwipe(event,true));
   $("#rule-list").addEventListener("click",event=>{if(performance.now()<suppressRuleClick){event.preventDefault();event.stopImmediatePropagation();}},true);
   $("#rule-list").addEventListener("click",event=>{const button=event.target.closest("[data-rule-delete]");if(button)showDeleteConfirm(button.dataset.ruleDelete);});
 
   /* ---------------- 页面可见性 ---------------- */
   function suspend() {
+    finishMotion();stopSliderPreview();if(dockDrag)endDock({pointerId:dockDrag.pointer},true);if(panelDrag)endPanelDrag({pointerId:panelDrag.id},true);if(ruleDrag)stopRuleSwipe({pointerId:ruleDrag.id},true);
     cancelRootBridge();
     if (s.suspended) return;
     s.suspended = true; s.epoch++; clearTimeout(s.retry); cancelProbes(); cancelAuthentication();
@@ -1545,6 +1544,7 @@
     const channel = NovaHaptics.channel();
     hapticsNote.textContent = !on ? "已关闭"
       : channel === "native" ? "宿主原生触感"
+      : channel === "system" ? "Android 系统触感（遵循系统开关）"
       : channel === "vibrate" ? "设备振动（系统触感关闭时自动静默）"
       : "当前宿主未提供触感能力";
   }
@@ -1554,7 +1554,10 @@
     renderHapticsSetting();
     if (next) NovaHaptics.toggle();
   };
-  renderHapticsSetting();
+  renderHapticsSetting();window.addEventListener("nova:haptics",renderHapticsSetting);
+  let hapticsProbed=false;
+  function probeHaptics(){if(hapticsProbed||typeof bridge()?.exec!=="function")return;hapticsProbed=true;rootExec(moduleCommand("haptic probe"),5000).then(result=>{if(result.errno===0&&/(?:^|\n)haptic=system(?:\n|$)/.test(result.stdout))NovaHaptics.setSystemBridge(async semantic=>{const r=await rootExec(moduleCommand(`haptic ${shellQuote(semantic)}`),5000,false);if(r.errno!==0)throw new Error("系统触感不可用");});}).catch(()=>{});}
+  for(const id of ["personalize-open","appearance-settings","glass-settings"])$("#"+id).addEventListener("click",probeHaptics);
 
   applyTheme();
   loadWallpaperFromStorage();

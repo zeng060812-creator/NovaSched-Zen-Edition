@@ -5,6 +5,7 @@
 #
 SKIPUNZIP=0
 NOVA_STATE="/data/adb/novasched"
+NOVA_INSTALL="$NOVA_STATE/run/install"
 
 # ---------- 动画工具箱 ----------
 # 安装器输出是逐行追加的，动画 = 按节拍吐行。帧间隔短、总时长可控。
@@ -63,12 +64,8 @@ stage_header() {
 install_fail() {
   ui_print " "
   ui_print "  ✗ $1"
-  if [ -r "$MODPATH/install-check.log" ] && mkdir -p "$NOVA_STATE"; then
-    if cp -f "$MODPATH/install-check.log" "$NOVA_STATE/install-last.log"; then
-      set_perm "$NOVA_STATE/install-last.log" 0 0 0600
-      ui_print "  ✗ 失败记录已保留：$NOVA_STATE/install-last.log"
-    fi
-  fi
+  [ ! -r "$NOVA_STATE/logs/install.log" ] || ui_print "  ✗ 失败记录已保留：$NOVA_STATE/logs/install.log"
+  [ ! -d "$NOVA_INSTALL" ] || rm -rf "$NOVA_INSTALL"
   abort "$1"
 }
 
@@ -112,14 +109,16 @@ if [ ! -x "$MODPATH/bin/novasched" ]; then
   install_fail "bin/novasched 无法赋予执行权限，请反馈机型与管理器版本"
 fi
 
-CHECK_LOG="$MODPATH/install-check.log"
+CHECK_LOG="$NOVA_STATE/logs/install.log"
+umask 077
+mkdir -p "$NOVA_STATE/logs" "$NOVA_INSTALL" || install_fail "无法创建安装目录"
 : > "$CHECK_LOG" || install_fail "无法创建安装日志"
 
 # run_check：调度器自查统一入口。原生进程把退出码写进 .exit 票据，
 # ui_print 管道无法跨管理器可靠传递首命令状态。
 run_check() {
   NOVA_PHASE=$1
-  NOVA_RECEIPT="$MODPATH/install-$NOVA_PHASE.exit"
+  NOVA_RECEIPT="$NOVA_INSTALL/$NOVA_PHASE.exit"
   rm -f "$NOVA_RECEIPT" || return 1
   "$MODPATH/bin/novasched" install-check "$NOVA_PHASE" --module-dir "$MODPATH" 2>&1 |
     while IFS= read -r line; do
@@ -141,7 +140,7 @@ run_check() {
 ui_print " "
 stage_header "二" "核心自检"
 spin_line 3 "检查二进制与运行权限"
-run_check self-test || install_fail "二进制自检失败，请保留 install-last.log"
+run_check self-test || install_fail "二进制自检失败，请保留 logs/install.log"
 ui_print "  ✓ 核心自检通过"
 bar_line 4 " 33%" "核心就绪"
 
@@ -149,14 +148,14 @@ bar_line 4 " 33%" "核心就绪"
 ui_print " "
 stage_header "三" "识别处理器"
 spin_line 3 "读取 SoC 证据与 CPU 策略"
-run_check probe || install_fail "硬件检测未通过，原因见上方输出与 install-last.log"
-DETECTED_SOC=$(sed -n 's/^soc=//p' "$MODPATH/install-probe.log")
-DETECTED_PROFILE=$(sed -n 's/^profile=//p' "$MODPATH/install-probe.log")
-DETECTED_ID=$(sed -n 's/^soc_id=//p' "$MODPATH/install-probe.log")
+run_check probe || install_fail "硬件检测未通过，原因见上方输出与 logs/install.log"
+DETECTED_SOC=$(sed -n 's/^soc=//p' "$NOVA_INSTALL/probe.log")
+DETECTED_PROFILE=$(sed -n 's/^profile=//p' "$NOVA_INSTALL/probe.log")
+DETECTED_ID=$(sed -n 's/^soc_id=//p' "$NOVA_INSTALL/probe.log")
 ui_print "  ✦ 识别结果：${DETECTED_SOC:-未知}（${DETECTED_ID:-?}）"
 ui_print "  ✦ 配套配置：${DETECTED_PROFILE:-未知}"
 bar_line 7 " 58%" "已匹配调度档案"
-if [ "$(sed -n 's/^compatibility=//p' "$MODPATH/install-probe.log")" = "samsung" ]; then
+if [ "$(sed -n 's/^compatibility=//p' "$NOVA_INSTALL/probe.log")" = "samsung" ]; then
   ui_print "  ✦ 三星保守策略：保留原厂调速器，暂停 NovaFAS 与额外调度"
 fi
 
@@ -164,29 +163,38 @@ fi
 ui_print " "
 stage_header "四" "准备配置"
 spin_line 3 "保留已有配置与自动调度偏好"
+run_check prepare-storage || install_fail "数据目录迁移失败；原数据已保留"
+NOVA_DEFERRED=$(sed -n 's/^storage_deferred=//p' "$NOVA_INSTALL/prepare-storage.log")
+if [ "$NOVA_DEFERRED" != true ]; then
 mkdir -p "$NOVA_STATE" || install_fail "无法创建运行时目录"
 run_check prepare-config || install_fail "配置初始化失败；原配置已保留"
 run_check prepare-auto || install_fail "自动调度偏好初始化失败"
-if [ ! -f "$NOVA_STATE/mode.txt" ]; then
-  printf 'powersave\n' > "$NOVA_STATE/mode.txt" || install_fail "无法初始化默认档位"
+if [ ! -f "$NOVA_STATE/run/mode.txt" ]; then
+  printf 'powersave\n' > "$NOVA_STATE/run/mode.txt" || install_fail "无法初始化默认档位"
 fi
-set_perm "$NOVA_STATE/mode.txt" 0 0 0600
-if [ "$(sed -n 's/^automatic_enabled=//p' "$MODPATH/install-prepare-auto.log")" = "true" ]; then
+set_perm "$NOVA_STATE/run/mode.txt" 0 0 0600
+if [ "$(sed -n 's/^automatic_enabled=//p' "$NOVA_INSTALL/prepare-auto.log")" = "true" ]; then
   ui_print "  ✓ 自动调度已开启：游戏极速，其余省电"
 else
   ui_print "  ✓ 已保留手动调度偏好"
+fi
+else
+  ui_print "  ✓ 旧版服务仍在运行，配置迁移将在重启后完成"
 fi
 bar_line 9 " 75%" "配置就绪"
 
 # ---------- 第五幕：检测 Scene ----------
 ui_print " "
 stage_header "五" "检测 Scene"
-if run_check scene-status; then
-  SCENE_STATUS=$(sed -n 's/^scene_presence=//p' "$MODPATH/install-scene-status.log") || SCENE_STATUS=unknown
+if [ "$NOVA_DEFERRED" = true ]; then
+  SCENE_STATUS=deferred
+elif run_check scene-status; then
+  SCENE_STATUS=$(sed -n 's/^scene_presence=//p' "$NOVA_INSTALL/scene-status.log") || SCENE_STATUS=unknown
 else
   SCENE_STATUS=unknown
 fi
 case "$SCENE_STATUS" in
+  deferred) ui_print "  ✓ Scene 入口将在重启后更新" ;;
   available)
     ui_print "  ✦ 已确认安装 Scene，正在备份原调度并注册 NovaSched"
     if run_check scene-install; then
@@ -209,8 +217,9 @@ ui_print "  ✓ 原厂节点在首次写入前保存，卸载时恢复"
 ui_print "  ✓ 首次解锁后等待 30 秒启动；异常重启自动停用保护"
 ui_print "  ✓ 云端更新：WebUI → 设置 → 检查更新"
 ui_print "  ✓ 安装记录：$CHECK_LOG"
-ui_print "  ✓ 运行记录：$NOVA_STATE/novasched.log"
-cp -f "$CHECK_LOG" "$NOVA_STATE/install-last.log" && set_perm "$NOVA_STATE/install-last.log" 0 0 0600
+ui_print "  ✓ 运行记录：$NOVA_STATE/logs/novasched.log"
+set_perm "$CHECK_LOG" 0 0 0600
+rm -rf "$NOVA_INSTALL"
 ui_print " "
 ui_print "  ✦ NovaSched $NOVA_VERSION · ZenJooo · 感谢刷入 ✦"
 ui_print " "

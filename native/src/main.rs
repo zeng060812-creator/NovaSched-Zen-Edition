@@ -23,6 +23,8 @@ mod root_bridge;
 mod scene;
 mod scheduler;
 mod snapshot;
+mod storage;
+mod haptics;
 mod soc;
 mod telemetry;
 mod uninstall;
@@ -46,7 +48,7 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(|| usage().to_string())?;
-    let requested_mode = if matches!(command.as_str(), "scene-mode" | "install-check") {
+    let requested_mode = if matches!(command.as_str(), "scene-mode" | "install-check" | "haptic") {
         args.next()
     } else {
         None
@@ -102,7 +104,11 @@ fn run() -> Result<()> {
     {
         return Err("模块正在卸载，已停止启动、回调与配置写入".into());
     }
+    if matches!(command.as_str(), "start" | "restart" | "supervise" | "daemon" | "scene-mode" | "prepare-config" | "prepare-auto" | "scene-install") { storage::ensure_ready(std::path::Path::new(util::STATE_DIR))?; }
+    if matches!(command.as_str(), "start" | "restart") { if let Err(e)=storage::cleanup_legacy(&module_dir,std::path::Path::new(util::STATE_DIR)){eprintln!("novasched: 部分旧文件未清理，继续启动: {e}");} }
     match command.as_str() {
+        "prepare-storage" => { println!("storage_deferred={}",!storage::prepare(std::path::Path::new(util::STATE_DIR))?); Ok(()) },
+        "haptic" => haptics::run(requested_mode.as_deref().unwrap_or("")),
         "boot-ready" => boot_guard::ensure_ready(),
         "version" | "--version" => {
             println!("NovaSched Zen Edition {}", env!("CARGO_PKG_VERSION"));
@@ -205,5 +211,5 @@ fn run() -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "用法: novasched <start|restart|daemon|boot-ready|reload|stop|status|diagnose|game-diagnose|fas-diagnose|webui-session|webui-rpc|restore|uninstall|scene-install|scene-restore|scene-status|scene-diagnose|probe|check-config|prepare-config|prepare-auto|version|self-test|install-check PHASE> [--module-dir PATH] [--origin ORIGIN] [--request JSON]"
+    "用法: novasched <start|restart|daemon|boot-ready|reload|stop|status|diagnose|game-diagnose|fas-diagnose|webui-session|webui-rpc|restore|uninstall|scene-install|scene-restore|scene-status|scene-diagnose|probe|check-config|prepare-storage|prepare-config|prepare-auto|haptic ACTION|version|self-test|install-check PHASE> [--module-dir PATH] [--origin ORIGIN] [--request JSON]"
 }
