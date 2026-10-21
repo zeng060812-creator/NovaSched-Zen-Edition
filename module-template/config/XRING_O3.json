@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 390,
+    "version": 391,
     "soc": "XRING_O3",
     "loglevel": "INFO"
   },
@@ -18,8 +18,8 @@
     "node_watchdog": true,
     "cpuset": {
       "enabled": false,
-      "top_app": "0-7",
-      "foreground": "0-7",
+      "top_app": "0-9",
+      "foreground": "0-9",
       "restricted": "4-7",
       "system_background": "4-7",
       "background": "4-5"
@@ -109,16 +109,6 @@
           "freq_scale": "80"
         }
       }
-    },
-    "feed_video": {
-      "enabled": true,
-      "fps": 30,
-      "packages": [
-        "com.ss.android.ugc.aweme",
-        "com.smile.gifmaker",
-        "com.xingin.xhs",
-        "tv.danmaku.bili"
-      ]
     }
   },
   "modes": {
@@ -148,6 +138,8 @@
         {}
       ],
       "online": [
+        true,
+        true,
         true,
         true,
         true,
@@ -191,6 +183,8 @@
         true,
         true,
         true,
+        true,
+        true,
         true
       ]
     },
@@ -227,6 +221,8 @@
         true,
         true,
         true,
+        true,
+        true,
         true
       ]
     },
@@ -256,6 +252,8 @@
         {}
       ],
       "online": [
+        true,
+        true,
         true,
         true,
         true,

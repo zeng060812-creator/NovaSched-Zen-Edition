@@ -15,7 +15,7 @@
     if (match) { MODULE = match[1]; MODULE_CANDIDATES.unshift(MODULE); }
   } catch (_) {}
   const STORAGE = "novasched.zen.ui.v2";
-  const UI_VERSION = window.NovaRelease?.version || "2.11.0";
+  const UI_VERSION = window.NovaRelease?.version || "2.11.2";
 
   const MODES = {
     powersave:   { name: "省电", copy: "限制 CPU 频率上限，适合消息、阅读和轻量日用。" },
@@ -24,7 +24,7 @@
     fast:        { name: "极速", copy: "开放更高频率上限，NovaFAS 按可用帧信号动态调节。" },
   };
   const ENGINE_TITLES = {
-    off: "NovaFAS 未启用", idle: "NovaFAS 待命", active: "NovaFAS 已接管", paused: "NovaFAS 已暂停",
+    off: "NovaFAS 未启用", idle: "NovaFAS 待命", active: "NovaFAS 已接管", degraded: "NovaFAS 信号不可用", paused: "NovaFAS 已暂停",
   };
   const THEME_NAMES = { system: "跟随系统", light: "浅色", dark: "深色" };
   const SYSTEM_NAMES = {
@@ -37,7 +37,8 @@
     page: "overview", pendingControls: 0, online: false, connecting: true, phase: "", error: "", connectionError: "", version: "",
     mode: "", effective: "", pkg: "", controller: "", external: false, linked: false,
     heartbeat: null, soc: "", socId: "", configProfile: "", fasAvailable: false, fasState: "unknown", fasMode: "", fasSync: "", fasLegacy: false, sceneInstalled: false, scenePresence: "unknown",
-    fasEngineState: "", fasEngineSource: "", fasFps: 0, fasBoost: 0, fasOverride: false, fasGpu: 0, fasTick: 0, samsungSafe: false, feedFps: false,
+    fasEngineState: "", fasEngineSource: "", fasEngineReason: "", fasFps: 0, fasBoost: 0, fasOverride: false, fasGpu: 0, fasTick: 0, samsungSafe: false,
+    extremePower: false, extremeStatus: "off", extremeError: "", extremePending: null,
     freqs: [],
     automatic: false, automaticActive: false, appKind: "", classificationSource: "",
     rules: [], rulesLoaded: false, overrides: {},
@@ -517,9 +518,10 @@
     }
     s.sceneInstalled = data.sceneInstalled === "true";
     s.scenePresence = ["available", "absent", "unknown"].includes(data.scenePresence) ? data.scenePresence : s.sceneInstalled ? "available" : "unknown";
-    if (["off", "idle", "active", "paused"].includes(data.fasEngine)) {
+    if (["off", "idle", "active", "degraded", "paused"].includes(data.fasEngine)) {
       s.fasEngineState = data.fasEngine;
       s.fasEngineSource = ["timestats", "heuristic", "none"].includes(data.fasEngineSrc) ? data.fasEngineSrc : "none";
+      s.fasEngineReason = data.fasReason || "";
       s.fasFps = Number(data.fasFps) || 0;
       s.fasGpu = Number(data.fasGpu) || 0;
       s.fasBoost = /^\d+$/.test(data.fasBoost || "") ? Number(data.fasBoost) : 0;
@@ -527,7 +529,10 @@
       s.fasTick = /^\d+$/.test(data.fasTick || "") ? Number(data.fasTick) : 0;
     }
     s.freqs = String(data.freqs || "").split(";").map(Number).filter(value => Number.isFinite(value) && value > 0);
-    s.feedFps = data.feedFps === "1";
+    s.extremePower = data.extremePower === "true";
+    s.extremeStatus = ["off", "applying", "active", "partial", "unsupported", "failed"].includes(data.extremeStatus) ? data.extremeStatus : "off";
+    s.extremeError = data.extremeError || "";
+    if ((s.extremePending === s.extremePower && s.extremeStatus !== "applying") || s.extremeStatus === "failed") s.extremePending = null;
     s.automatic = data.automaticEnabled === "true";
     s.automaticActive = data.automaticActive === "true";
     s.appKind = ["game", "daily", "unknown"].includes(data.appKind) ? data.appKind : "";
@@ -574,7 +579,14 @@
       rootRequest({endpoint:kind === "apps" ? "apps" : "modes", message}).then(reply => {
         if (epoch === s.epoch && generation === s.rootGeneration && !s.suspended) receiveRootSnapshot(reply);
       }).catch(error => {
-        if (epoch === s.epoch && generation === s.rootGeneration) finishPending(false, "操作未确认：" + publicError(error.message));
+        if (epoch === s.epoch && generation === s.rootGeneration) {
+          if (message.startsWith("extreme\t")) {
+            s.extremePending = null;
+            s.extremeStatus = "failed";
+            s.extremeError = "设置未保存：" + publicError(error.message);
+            render();
+          } else finishPending(false, "操作未确认：" + publicError(error.message));
+        }
       }).finally(() => {
         if (epoch === s.epoch && !s.suspended) { clearTimeout(s.rootTimer); s.rootTimer = setTimeout(() => pollRootBridge(epoch), 100); }
       });
@@ -690,11 +702,28 @@
     autoSwitch.setAttribute("aria-checked", String(!s.linked && !!s.automatic));
     present("#auto-note", s.linked ? "Scene 决定档位；本地自动偏好保留，退出联动后恢复。" : "游戏用极速，日用和桌面用省电。");
     autoSwitch.setAttribute("aria-busy", String(s.pending?.kind === "auto"));
+    const extremeSwitch = $("#extreme-switch");
+    extremeSwitch.disabled = !editable() || s.extremePending !== null;
+    extremeSwitch.setAttribute("aria-checked", String(s.extremePower));
+    extremeSwitch.setAttribute("aria-busy", String(s.extremeStatus === "applying" || s.extremePending !== null));
+    const extremeLabels = {
+      off: "已关闭",
+      applying: "正在应用",
+      active: "已生效",
+      partial: "部分策略簇支持，未支持的策略簇保持原策略",
+      unsupported: s.external ? "外部调度器接管中，当前不可用" : "设备未提供可确认的 CPU 频率表，当前不支持",
+      failed: s.extremeError || "策略下发失败，请查看日志",
+    };
+    present("#extreme-status", s.extremeError || extremeLabels[s.extremeStatus] || "等待本地服务");
+    const extremeNote = $("#extreme-note");
+    if (extremeNote) extremeNote.textContent = s.external
+      ? "降低性能上限，延长续航。当前由 Scene 外部控制，极限省电暂不下发。"
+      : "降低性能上限，延长续航。作为四档与应用规则之上的限制层；NovaFAS 不能突破此上限。";
 
     /* NovaFAS 引擎卡：引擎状态与 fas-rs 接口状态分开呈现 */
     $("#samsung-compat").hidden = !s.online || !s.samsungSafe;
-    const engineRunning = s.online && s.fasEngineState === "active";
-    present("#fas-engine-badge", !s.online ? "待连接" : engineRunning ? (s.fasOverride ? "已接管 fas-rs" : "运行中") : s.fasEngineState === "idle" ? "待命" : "未启用");
+    const engineRunning = s.online && ["active", "degraded"].includes(s.fasEngineState);
+    present("#fas-engine-badge", !s.online ? "待连接" : engineRunning ? (s.fasEngineState === "degraded" ? "信号不可用，已回退" : s.fasOverride ? "已接管 fas-rs" : "运行中") : s.fasEngineState === "idle" ? "待命" : "未启用");
     let engineTitle, engineDesc, engineSource;
     if (!s.online) {
       engineTitle = "等待连接"; engineDesc = "连接后读取 NovaFAS 引擎状态。"; engineSource = "待连接";
@@ -711,6 +740,10 @@
       engineDesc = s.fasOverride
         ? "读取前台应用渲染帧信号，在档位包络内动态调频；Scene 的 fas-rs 已被暂停，由本引擎接管。"
         : "读取前台应用渲染帧信号，在档位包络内动态调频：掉帧快速加压，稳定后缓慢回落省电。";
+    } else if (s.fasEngineState === "degraded") {
+      engineTitle = ENGINE_TITLES.degraded;
+      engineSource = s.fasEngineSource === "heuristic" ? `帧信号缺失 · GPU ${s.fasGpu.toFixed(0)}% 启发式` : "帧与负载信号不可用";
+      engineDesc = s.fasEngineReason || "采样信号缺失或已过期，NovaFAS 正在回退到当前档位策略。";
     } else if (s.fasEngineState === "idle") {
       engineTitle = ENGINE_TITLES.idle;
       engineSource = "待命";
@@ -726,7 +759,7 @@
     }
     present("#fas-engine-title", engineTitle);
     present("#fas-engine-source", engineSource);
-    present("#fas-engine-desc", engineDesc + (s.online && s.feedFps ? " 信息流 30Hz 锁帧生效中。" : ""));
+    present("#fas-engine-desc", engineDesc);
     const meter = $("#fas-engine-meter");
     if (meter) meter.hidden = !engineRunning;
     const frameSource = s.fasEngineSource === "timestats";
@@ -1449,6 +1482,22 @@
     const on = event.currentTarget.getAttribute("aria-checked") !== "true";
     NovaHaptics.toggle();
     beginPending("auto", on ? "on" : "off");
+    render();
+  };
+  $("#extreme-switch").onclick = event => {
+    if (s.extremePending !== null) return;
+    const enabled = event.currentTarget.getAttribute("aria-checked") !== "true";
+    NovaHaptics.toggle();
+    const previousStatus = s.extremeStatus;
+    s.extremePending = enabled;
+    s.extremeStatus = "applying";
+    s.extremeError = "";
+    if (!send("modes", `extreme\t${enabled ? "1" : "0"}`)) {
+      s.extremePending = null;
+      s.extremeStatus = previousStatus;
+      render();
+      return;
+    }
     render();
   };
   $("#scene-diagnose").onclick = () => showDiagnostics(true);

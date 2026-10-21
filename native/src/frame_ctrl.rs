@@ -35,10 +35,11 @@ pub struct FrameSample {
 /// 引擎运行状态，供 WebUI 与诊断展示。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EngineStatus {
-    /// off（配置关闭）/ idle（待命）/ active（已接管）/ paused（外部调度接管）
+    /// off（配置关闭）/ idle（待命）/ active（有有效信号）/ degraded（无有效信号）/ paused（外部调度接管）
     pub state: &'static str,
     /// timestats / heuristic / none
     pub source: &'static str,
+    pub reason: &'static str,
     pub fps: f32,
     /// 帧信号不可用时的 GPU 忙碌百分比（0..100），供启发式展示。
     pub gpu: f32,
@@ -179,6 +180,14 @@ impl Controller {
     /// 帧信号可用时每次采样调用。
     pub fn on_frame(&mut self, ceiling: u32, sample: FrameSample) -> u32 {
         let ceiling = ceiling.min(100);
+        if !sample.fps.is_finite()
+            || !sample.dropped.is_finite()
+            || !(0.0..=1.0).contains(&sample.dropped)
+        {
+            self.bad_streak = 0;
+            self.calm = 0;
+            return self.boost;
+        }
         if sample.fps < 1.0 {
             // 应用停止渲染（暂停/静态画面）时按稳定路径缓慢回落。
             self.calm += 1;
@@ -553,11 +562,25 @@ fn run(ctx: EngineCtx) {
             last_sample = Instant::now();
             match stats.sample(&shared.package) {
                 Some(sample) => {
-                    frame_ok = true;
-                    fail_streak = 0;
-                    last_progress = Instant::now();
-                    controller.on_frame(mode_cfg.ceiling, sample);
-                    status.fps = sample.fps;
+                    if sample.fps.is_finite()
+                        && (0.5..=240.0).contains(&sample.fps)
+                        && sample.dropped.is_finite()
+                        && (0.0..=1.0).contains(&sample.dropped)
+                    {
+                        frame_ok = true;
+                        fail_streak = 0;
+                        last_progress = Instant::now();
+                        controller.on_frame(mode_cfg.ceiling, sample);
+                        status.fps = sample.fps;
+                    } else {
+                        fail_streak += 1;
+                        if fail_streak >= SAMPLE_FAIL_STREAK {
+                            frame_ok = false;
+                            fail_streak = 0;
+                            status.fps = 0.0;
+                            stats.force_retry();
+                        }
+                    }
                 }
                 None => {
                     if frame_ok {
@@ -601,6 +624,11 @@ fn run(ctx: EngineCtx) {
         } else {
             "none"
         };
+        status.reason = match status.source {
+            "timestats" => "",
+            "heuristic" => "帧时间信号不可用或已过期，当前使用 GPU 负载启发式",
+            _ => "帧时间与 GPU 负载信号均不可用，调度已回退到当前档位",
+        };
         if status.source == "none" {
             no_signal += 1;
         } else {
@@ -611,11 +639,17 @@ fn run(ctx: EngineCtx) {
             no_signal = 0;
             signal_dead = true;
             release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status, shared.allowed);
+            status.state = "degraded";
+            status.reason = "连续采样无有效帧或负载信号，已释放 NovaFAS 加压并回退到当前档位";
             publish(&ctx.status, &status);
             std::thread::sleep(Duration::from_millis(cfg.step_ms.max(300)));
             continue;
         }
-        status.state = "active";
+        status.state = if status.source == "none" {
+            "degraded"
+        } else {
+            "active"
+        };
         status.boost = controller.boost;
         status.override_active = !scene.suspended.is_empty();
         reassert = reassert.wrapping_add(1);
@@ -661,6 +695,7 @@ fn release(
         "off"
     };
     status.source = "none";
+    status.reason = "NovaFAS 当前未执行调度";
     status.fps = 0.0;
     status.gpu = 0.0;
     status.boost = 0;
@@ -867,6 +902,7 @@ mod tests {
         let mut status = EngineStatus {
             state: "active",
             source: "timestats",
+            reason: "",
             fps: 59.5,
             gpu: 12.0,
             boost: 12,
@@ -885,6 +921,14 @@ mod tests {
         publish(&sink, &status);
         assert_eq!(sink.lock().unwrap().fps, 60.4);
         assert_eq!(sink.lock().unwrap().ticks, 2);
+    }
+
+    #[test]
+    fn invalid_frame_samples_do_not_raise_performance_boost() {
+        let mut controller = Controller::default();
+        assert_eq!(controller.on_frame(80, sample(f32::NAN, 0.0)), 0);
+        assert_eq!(controller.on_frame(80, sample(60.0, f32::NAN)), 0);
+        assert_eq!(controller.on_frame(80, sample(60.0, 1.5)), 0);
     }
 
     #[test]

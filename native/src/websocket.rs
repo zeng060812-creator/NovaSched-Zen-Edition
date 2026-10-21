@@ -53,13 +53,16 @@ struct RuntimeData {
     fas_sync: String,
     fas_engine_state: String,
     fas_engine_source: String,
+    fas_engine_reason: String,
     fas_engine_fps: f32,
     fas_engine_gpu: f32,
     fas_engine_boost: u32,
     fas_engine_override: bool,
     fas_engine_ticks: u64,
     frequencies: [u32; 4],
-    feed_fps: bool,
+    extreme_power: bool,
+    extreme_power_status: String,
+    extreme_power_error: String,
     scene_installed: bool,
     scene_presence: String,
     samsung: bool,
@@ -190,6 +193,7 @@ impl RuntimeState {
         if let Ok(mut data) = self.inner.lock() {
             data.fas_engine_state = status.state.into();
             data.fas_engine_source = status.source.into();
+            data.fas_engine_reason = status.reason.into();
             data.fas_engine_fps = status.fps;
             data.fas_engine_gpu = status.gpu;
             data.fas_engine_boost = status.boost;
@@ -205,10 +209,20 @@ impl RuntimeState {
         }
     }
 
-    /// 信息流 30Hz 锁帧是否生效中。
-    pub fn set_feed_fps(&self, engaged: bool) {
+    pub fn set_extreme_power(&self, enabled: bool, status: &str, error: &str) {
         if let Ok(mut data) = self.inner.lock() {
-            data.feed_fps = engaged;
+            data.extreme_power = enabled;
+            data.extreme_power_status = status.into();
+            data.extreme_power_error = error.replace(',', "，").replace(['\n', '\r', ':'], " ");
+        }
+    }
+
+    pub fn set_extreme_power_error(&self, error: &str) {
+        if let Ok(mut data) = self.inner.lock() {
+            data.extreme_power_error = error.replace(',', "，").replace(['\n', '\r', ':'], " ");
+            if !error.is_empty() {
+                data.extreme_power_status = "failed".into();
+            }
         }
     }
 
@@ -227,6 +241,7 @@ pub struct WebState {
     pub automatic: Automatic,
     pub runtime: RuntimeState,
     pub revision: Arc<AtomicU64>,
+    pub extreme_power: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WebState {
@@ -569,6 +584,20 @@ fn handle_state(
                 if state.runtime.webui_allows_message(&message) {
                     if !app_endpoint && matches!(message.as_str(), "auto\ton" | "auto\toff") {
                         state.automatic.set_enabled(message == "auto\ton")?;
+                    } else if !app_endpoint && matches!(message.as_str(), "extreme\t1" | "extreme\t0") {
+                        let enabled = message == "extreme\t1";
+                        let path = crate::storage::path(
+                            std::path::Path::new(crate::util::STATE_DIR),
+                            "extreme-power",
+                        );
+                        match crate::util::atomic_write(&path, if enabled { b"1\n" } else { b"0\n" }, 0o600) {
+                            Ok(()) => {
+                                state.extreme_power.store(enabled, Ordering::Relaxed);
+                                state.runtime.set_extreme_power_error("");
+                                state.runtime.set_extreme_power(enabled, "applying", "");
+                            }
+                            Err(error) => state.runtime.set_extreme_power_error(&format!("保存极限省电设置失败: {error}")),
+                        }
                     } else if app_endpoint {
                         if let Some(rest) = message.strip_prefix("set\t") {
                             if let Some((package, mode)) = rest.split_once('\t') {
@@ -617,7 +646,7 @@ fn payload(state: &WebState, app_endpoint: bool) -> String {
     };
     if !app_endpoint {
         return format!(
-            "mode:{},effective:{},package:{},controller:{},sceneActive:{},sceneLinked:{},phase:{},heartbeatMs:{},port:{},powerSaveProfile:{},socName:{},socId:{},configProfile:{},automaticEnabled:{},appKind:{},classificationSource:{},automaticActive:{},fasAvailable:{},sceneInstalled:{},scenePresence:{},fasState:{},fasMode:{},fasSync:{},fasEngine:{},fasEngineSrc:{},fasFps:{},fasGpu:{},fasBoost:{},fasOverride:{},fasTick:{},freqs:{},feedFps:{},version:{},pendingControls:{},samsungSafe:{}",
+            "mode:{},effective:{},package:{},controller:{},sceneActive:{},sceneLinked:{},phase:{},heartbeatMs:{},port:{},powerSaveProfile:{},socName:{},socId:{},configProfile:{},automaticEnabled:{},appKind:{},classificationSource:{},automaticActive:{},fasAvailable:{},sceneInstalled:{},scenePresence:{},fasState:{},fasMode:{},fasSync:{},fasEngine:{},fasEngineSrc:{},fasReason:{},fasFps:{},fasGpu:{},fasBoost:{},fasOverride:{},fasTick:{},freqs:{},extremePower:{},extremeStatus:{},extremeError:{},version:{},pendingControls:{},samsungSafe:{}",
             default,
             runtime.effective_mode,
             runtime.package,
@@ -632,13 +661,14 @@ fn payload(state: &WebState, app_endpoint: bool) -> String {
             runtime.fas_available, runtime.scene_installed, runtime.scene_presence,
             runtime.fas_state, runtime.fas_mode, runtime.fas_sync,
             runtime.fas_engine_state, runtime.fas_engine_source,
+            runtime.fas_engine_reason,
             format!("{:.1}", runtime.fas_engine_fps),
             format!("{:.0}", runtime.fas_engine_gpu),
             runtime.fas_engine_boost,
             runtime.fas_engine_override,
             runtime.fas_engine_ticks,
             runtime.frequencies.iter().map(u32::to_string).collect::<Vec<_>>().join(";"),
-            if runtime.feed_fps { "1" } else { "0" },
+            runtime.extreme_power, runtime.extreme_power_status, runtime.extreme_power_error,
             env!("CARGO_PKG_VERSION"), runtime.pending_controls, runtime.samsung,
         );
     }

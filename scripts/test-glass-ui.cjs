@@ -39,6 +39,16 @@ check('Scene priority and unknown detection reflected in UI',()=>{
   assert(ui.includes('s.scenePresence === "unknown"'));
   assert(ws.includes('scenePresence:{}'));
 });
+check('extreme power is persisted, bounded by CPU OPPs and reports readback state',()=>{
+  const scheduler=read('native/src/scheduler.rs');
+  assert(html.includes('id="extreme-switch"'));
+  assert(html.includes('降低性能上限，延长续航'));
+  assert(ui.includes('extreme\\t${enabled ? "1" : "0"}'));
+  assert(ui.includes('s.extremeStatus'));
+  assert(ws.includes('"extreme\\t1" | "extreme\\t0"'));
+  assert(scheduler.includes('conservative_frequency_ceiling'));
+  assert(scheduler.includes('scaling_available_frequencies'));
+});
 check('dialog accessibility, motion preference and safe areas',()=>{
   assert(ui.includes('dialogFocus'));
   assert(ui.includes('event.key !== "Tab"'));
@@ -89,6 +99,7 @@ for(const file of fs.readdirSync(path.join(root,'module-template/config'))){
     assert.equal(cfg.meta.author,'ZenJooo');
     assert.deepEqual(Object.keys(cfg.modes).sort(),['balance','fast','performance','powersave']);
     assert.ok(cfg.features.fas,'NovaFAS block missing');
+    assert.equal(cfg.features.feed_video,undefined,'feed lockframe config must be removed');
     assert.ok(cfg.features.fas.enabled,'NovaFAS disabled');
     for(const mode of ['powersave','balance','performance','fast'])
       assert.ok(cfg.features.fas.modes[mode],`NovaFAS ${mode} limits missing`);

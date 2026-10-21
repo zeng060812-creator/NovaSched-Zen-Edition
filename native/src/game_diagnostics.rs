@@ -189,11 +189,18 @@ fn kernel_report(root: &Path) -> String {
         &rooted(root, "sys/devices/system/cpu"),
         &["online", "offline"],
     );
-    for index in 0..8 {
+    let cpu_root = rooted(root, "sys/devices/system/cpu");
+    let indices: std::collections::BTreeSet<u32> = fs::read_dir(&cpu_root)
+        .into_iter().flatten().filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            let index = name.to_str()?.strip_prefix("cpu")?.parse::<u32>().ok()?;
+            (index < crate::config::MAX_CPU_COUNT as u32).then_some(index)
+        }).collect();
+    for index in indices {
         append_values(
             &mut report,
             &rooted(root, &format!("sys/devices/system/cpu/cpu{index}")),
-            &["thermal_pressure"],
+            &["thermal_pressure", "cpu_capacity"],
         );
     }
     for group in ["top-app", "foreground"] {

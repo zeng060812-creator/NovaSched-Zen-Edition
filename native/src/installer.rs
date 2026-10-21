@@ -73,6 +73,7 @@ pub fn run(module: &Path, phase: &str) -> Result<()> {
         // Keep the console readable; the full hardware report stays in logs.
         for line in output.lines().filter(|line| {
             line.starts_with("storage_deferred=")
+                || line.starts_with("cpu_count=")
                 || line.starts_with("soc=")
                 || line.starts_with("profile=")
                 || line.starts_with("config=")

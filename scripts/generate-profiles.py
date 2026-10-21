@@ -54,11 +54,6 @@ FAS_MODES = {
     'performance': {'ceiling': '80', 'freq_scale': '60'},
     'fast':        {'ceiling': '95', 'freq_scale': '80'},
 }
-# 信息流视频应用锁帧：前台命中 packages 时把屏幕刷新率限制到 fps Hz。
-FEED_VIDEO_PACKAGES = [
-    'com.ss.android.ugc.aweme', 'com.smile.gifmaker',
-    'com.xingin.xhs', 'tv.danmaku.bili',
-]
 # 每颗处理器显式写入最优调速器（不再是 auto）：
 # 骁龙 = walt（WALT 窗口负载跟踪，小米 14 真机确认 OEM 默认即 walt）；
 # 天玑 / 玄戒 = schedutil（MTK 系唯一现代全簇调速器）。
@@ -123,7 +118,7 @@ def profile(soc, policies):
         modes[name] = {
             'min': min_slots, 'max': slots('100%'),
             'governors': [GOVERNORS[soc] if p >= 0 else '' for p in policies],
-            'params': params, 'online': [True] * 8,
+            'params': params, 'online': [True] * (10 if soc == 'XRING_O3' else 8),
         }
     for name, values in zip(('powersave', 'balance', 'performance', 'fast'), CEILINGS[soc]):
         modes[name]['max'] = [f'{value}%' if p >= 0 else '0' for value, p in zip(values, policies)]
@@ -158,7 +153,6 @@ def profile(soc, policies):
             'step_ms': '200', 'sample_ms': '1000',
             'modes': fas_modes,
         },
-        'feed_video': {'enabled': True, 'fps': 30, 'packages': FEED_VIDEO_PACKAGES},
     }
     if soc in GPU_DEVFREQ:
         features['gpu_devfreq'] = {
@@ -166,10 +160,11 @@ def profile(soc, policies):
             'modes': {name: dict(values) for name, values in GPU_DEVFREQ[soc].items()},
         }
     if soc == 'XRING_O3':
-        features['cpuset'].update(restricted='4-7', system_background='4-7', background='4-5')
+        features['cpuset'].update(top_app='0-9', foreground='0-9',
+                                 restricted='4-7', system_background='4-7', background='4-5')
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 390,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 391,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': features,

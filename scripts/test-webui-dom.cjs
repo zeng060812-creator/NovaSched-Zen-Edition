@@ -183,7 +183,7 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
   const {w,d,cleanup}=fixture({version:'2.2.8',legacy:true,legacyMode:'balance'});
   try {
     await until(()=>d.querySelector('#about-engine-version').textContent==='v2.2.8');
-    assert.equal(d.querySelector('#about-version').textContent,'v2.11.0');
+    assert.equal(d.querySelector('#about-version').textContent,'v2.11.2');
     assert.equal(d.querySelector('#version-note').hidden,false);
     await until(()=>d.querySelector('#fas-legacy-desc').textContent.includes('旧版服务'));
     assert(d.querySelector('#fas-legacy-desc').textContent.includes('fas-rs'));
@@ -267,7 +267,7 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
     click(d,'#about-update');
     await until(()=>d.querySelector('#dialog-layer').classList.contains('open'));
     assert(d.querySelector('#dialog-title').textContent.includes('检查更新'),'update dialog opened');
-    assert(d.querySelector('#update-status').textContent.includes('当前版本 v2.11.0'),'update dialog shows current version');
+    assert(d.querySelector('#update-status').textContent.includes('当前版本 v2.11.2'),'update dialog shows current version');
     console.log('PASS cloud update entry and dialog');
   } finally {cleanup();}
 }

@@ -91,7 +91,7 @@ impl Soc {
             // 1×X4 超大核 cpu7（真机采集：vivo V2417A）。
             Self::Dimensity9300Plus => [0, 4, 7, -1],
             Self::Dimensity9400Plus => [0, 4, 7, -1],
-            // The supplied O3 dump numbers A715 first, X3 next, A510 last.
+            // Legacy eight-core reference; ten-core O3 policies are mapped from the kernel.
             Self::XringO3 => [4, 0, 1, -1],
         }
     }

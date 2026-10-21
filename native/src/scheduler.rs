@@ -54,6 +54,7 @@ pub struct Scheduler {
     /// 可调频 GPU 的 devfreq 目录（运行时能力检测；None = 本设备不可用，
     /// gpu_devfreq 特性降级为停用，不影响其它功能）。
     gpu_devfreq_base: Option<PathBuf>,
+    extreme_power: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -138,7 +139,47 @@ impl Scheduler {
             open_drift: None,
             fas_mode: None,
             gpu_devfreq_base,
+            extreme_power: false,
         })
+    }
+
+    pub fn set_extreme_power(&mut self, enabled: bool) {
+        self.extreme_power = enabled;
+    }
+
+    pub fn extreme_power_status(&self) -> &'static str {
+        if !self.extreme_power {
+            return "off";
+        }
+        let Ok(profile) = self.config.profile(&self.current_mode) else {
+            return "unsupported";
+        };
+        let mut supported = 0usize;
+        let mut applied = 0usize;
+        for cluster in 0..4 {
+            let policy = self.config.policy[cluster];
+            if policy < 0 {
+                continue;
+            }
+            let base = self.node(format!("/sys/devices/system/cpu/cpufreq/policy{policy}"));
+            let Some(cap) = conservative_frequency_ceiling(&base, &profile.clusters[cluster].max_freq) else {
+                continue;
+            };
+            supported += 1;
+            if util::read_trimmed(base.join("scaling_max_freq"))
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value <= cap)
+            {
+                applied += 1;
+            }
+        }
+        match (supported, applied) {
+            (0, _) => "unsupported",
+            (count, applied) if count == applied => "active",
+            (_count, applied) if applied > 0 => "partial",
+            _ => "applying",
+        }
     }
 
     pub fn replace_config(&mut self, mut config: Config) -> Result<()> {
@@ -147,9 +188,9 @@ impl Scheduler {
         }
         let old = &self.config.functions;
         let new = &config.functions;
-        let hotplug_changed = (0..8).any(|cpu| {
-            self.config.modes.values().any(|m| !m.online[cpu])
-                != config.modes.values().any(|m| !m.online[cpu])
+        let hotplug_changed = self.hardware.cpus().into_iter().any(|cpu| {
+            self.config.modes.values().any(|m| !m.cpu_online(cpu))
+                != config.modes.values().any(|m| !m.cpu_online(cpu))
         });
         if old.cpuset != new.cpuset
             || old.cpuctl != new.cpuctl
@@ -257,6 +298,23 @@ impl Scheduler {
             .config
             .profile(if burst { "performance" } else { mode })?
             .clone();
+        if self.extreme_power {
+            for cluster in 0..4 {
+                let policy = self.config.policy[cluster];
+                if policy < 0 {
+                    continue;
+                }
+                let base = self.node(format!("/sys/devices/system/cpu/cpufreq/policy{policy}"));
+                let data = &mut profile.clusters[cluster];
+                if let Some(cap) = conservative_frequency_ceiling(&base, &data.max_freq) {
+                    data.max_freq = cap.to_string();
+                    let min = normalize_frequency(&base, &data.min_freq, true)
+                        .parse::<u64>()
+                        .unwrap_or(0);
+                    data.min_freq = min.min(cap).to_string();
+                }
+            }
+        }
         let package_changed = package != self.current_package;
         let mode_changed = mode != self.current_mode;
         let boost = launch_boost
@@ -716,12 +774,12 @@ impl Scheduler {
                 }
             }
         }
-        for cpu in 0..8 {
+        for cpu in self.hardware.cpus() {
             if self
                 .config
                 .modes
                 .values()
-                .any(|profile| !profile.online[cpu])
+                .any(|profile| !profile.cpu_online(cpu))
             {
                 paths.insert(self.node(format!("/sys/devices/system/cpu/cpu{cpu}/online")));
             }
@@ -1084,13 +1142,13 @@ impl Scheduler {
     }
 
     fn apply_online(&self, profile: &ModeProfile) -> Result<()> {
-        for cpu in 0..8 {
-            if self.config.modes.values().all(|mode| mode.online[cpu]) {
+        for cpu in self.hardware.cpus() {
+            if self.config.modes.values().all(|mode| mode.cpu_online(cpu)) {
                 continue;
             }
             let path = self.node(format!("/sys/devices/system/cpu/cpu{cpu}/online"));
             if path.exists() {
-                let value = if profile.online[cpu] { "1" } else { "0" };
+                let value = if profile.cpu_online(cpu) { "1" } else { "0" };
                 if util::read_trimmed(&path)? != value {
                     // Some SM8650 kernels do not permit userspace hotplug.
                     // Log that optional capability; frequency/cpuset still apply.
@@ -1334,8 +1392,43 @@ fn frequency_range(base: &Path, min: &str, max: &str) -> Result<(String, String)
     if maximum == 0 {
         return Err("有效频率上限必须大于 0".into());
     }
+
     // A narrow requested range can round up and down to opposite OPPs.
     Ok((minimum.min(maximum).to_string(), maximum.to_string()))
+}
+
+fn conservative_frequency_ceiling(base: &Path, requested: &str) -> Option<u64> {
+    let raw = util::read_trimmed(base.join("scaling_available_frequencies"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            util::read_trimmed(base.join("stats/time_in_state"))
+                .ok()
+                .map(|value| {
+                    value
+                        .lines()
+                        .filter_map(|line| line.split_whitespace().next())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+        })?;
+    let mut frequencies: Vec<u64> = raw
+        .split_whitespace()
+        .filter_map(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .collect();
+    frequencies.sort_unstable();
+    frequencies.dedup();
+    if frequencies.len() < 2 {
+        return None;
+    }
+    let ceiling = normalize_frequency(base, requested, false)
+        .parse::<u64>()
+        .ok()?;
+    let index = frequencies
+        .iter()
+        .rposition(|frequency| *frequency <= ceiling)?;
+    (index > 0).then(|| frequencies[index - 1])
 }
 
 #[derive(Clone, Copy)]
@@ -1706,6 +1799,31 @@ mod tests {
     }
 
     #[test]
+    fn extreme_power_ceiling_uses_each_policy_frequency_table() {
+        let directory = std::env::temp_dir().join(format!("nova-extreme-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("scaling_available_frequencies"),
+            "300 400 500 600 700\n",
+        )
+        .unwrap();
+        assert_eq!(conservative_frequency_ceiling(&directory, "700"), Some(600));
+        fs::write(
+            directory.join("scaling_available_frequencies"),
+            "1000 1500 2000 2500\n",
+        )
+        .unwrap();
+        assert_eq!(conservative_frequency_ceiling(&directory, "2500"), Some(2000));
+        fs::write(
+            directory.join("scaling_available_frequencies"),
+            "100 200\n",
+        )
+        .unwrap();
+        assert_eq!(conservative_frequency_ceiling(&directory, "100"), None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn recognizes_kgsl_optional_not_supported_error() {
         assert!(optional_node_not_supported(
             "写入节点 /sys/class/kgsl/kgsl-3d0/force_bus_on=0 失败: Operation not supported on transport endpoint (os error 95)"
@@ -1905,6 +2023,7 @@ mod daemon_policy_tests {
                     current_governor: "walt".into(),
                     min_freq: 300000,
                     max_freq: 3000000,
+                    capacity: None,
                 });
             }
             for group in [
@@ -2036,6 +2155,7 @@ mod daemon_policy_tests {
                     current_governor: "walt".into(),
                     min_freq: 300000,
                     max_freq: 3000000,
+                    capacity: None,
                 });
             }
             for group in ["top-app", "foreground"] {
@@ -2355,6 +2475,55 @@ mod daemon_policy_tests {
             frequency_range(&base, "1500000", "1600000").unwrap(),
             ("1000000".into(), "1000000".into())
         );
+    }
+
+    #[test]
+    fn ten_core_xring_applies_all_policies_and_tracks_cpu9_hotplug() {
+        let f = Fixture::new();
+        let mut hardware = hardware::xring_ten_core_fixture();
+        for policy in &mut hardware.policies { policy.min_freq = 1000000; }
+        let mut config = Config::from_text(include_str!("../../module-template/config/XRING_O3.json")).unwrap();
+        config.functions.cpuctl.enable = false;
+        config.functions.input_boost.enabled = false;
+        config.functions.fas.enabled = false;
+        config.modes.get_mut("powersave").unwrap().online[9] = false;
+        for policy in &hardware.policies {
+            let base = f.root.join(format!("sys/devices/system/cpu/cpufreq/policy{}", policy.id));
+            fs::create_dir_all(&base).unwrap();
+            // Equal-width values avoid regular-file tail bytes; sysfs replaces values itself.
+            let frequencies = [1000000, 1500000, 1800000, 2000000, 2300000, 2800000, 3100000]
+                .into_iter().filter(|frequency| *frequency <= policy.max_freq)
+                .map(|frequency| frequency.to_string()).collect::<Vec<_>>().join(" ");
+            for (name, value) in [
+                ("scaling_min_freq", "1000000".into()),
+                ("scaling_max_freq", policy.max_freq.to_string()),
+                ("cpuinfo_min_freq", "1000000".into()),
+                ("cpuinfo_max_freq", policy.max_freq.to_string()),
+                ("scaling_governor", "schedutil".into()),
+                ("scaling_available_frequencies", frequencies),
+            ] { fs::write(base.join(name), value).unwrap(); }
+        }
+        let cpu9 = f.root.join("sys/devices/system/cpu/cpu9/online");
+        fs::create_dir_all(cpu9.parent().unwrap()).unwrap();
+        fs::write(&cpu9, "1").unwrap();
+        let logger = Logger::new(&f.root.join("xring-state"));
+        let snapshot = Snapshot::load(&f.root.join("xring-state"), logger.clone()).unwrap();
+        let mut scheduler = Scheduler::new(config, snapshot, logger, hardware, Arc::new(CpuctlLive::default())).unwrap();
+        scheduler.kernel_root = f.root.clone();
+        scheduler.initialize("balance").unwrap();
+        assert_eq!(scheduler.snapshot.original_value(&cpu9).unwrap().as_deref(), Some("1"));
+        for mode in ["powersave", "balance", "performance", "fast"] {
+            scheduler.apply("org.example.o3", mode, false, true, false).unwrap();
+            assert_eq!(util::read_trimmed(&cpu9).unwrap(), if mode == "powersave" { "0" } else { "1" });
+            for policy in &scheduler.hardware.policies {
+                let path = f.root.join(format!("sys/devices/system/cpu/cpufreq/policy{}/scaling_max_freq", policy.id));
+                assert!(scheduler.snapshot.written_nodes().iter().any(|(written, _)| written == &path));
+                assert!(util::read_trimmed(path).unwrap().parse::<u64>().unwrap() <= policy.max_freq);
+            }
+        }
+        let mut replacement = scheduler.config.clone();
+        replacement.modes.get_mut("powersave").unwrap().online[9] = true;
+        assert!(scheduler.replace_config(replacement).unwrap_err().contains("热插拔控制范围"));
     }
 
     #[test]

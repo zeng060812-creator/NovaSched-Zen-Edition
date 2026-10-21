@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 390,
+    "version": 391,
     "soc": "DIMENSITY9400PLUS",
     "loglevel": "INFO"
   },
@@ -109,16 +109,6 @@
           "freq_scale": "80"
         }
       }
-    },
-    "feed_video": {
-      "enabled": true,
-      "fps": 30,
-      "packages": [
-        "com.ss.android.ugc.aweme",
-        "com.smile.gifmaker",
-        "com.xingin.xhs",
-        "tv.danmaku.bili"
-      ]
     }
   },
   "modes": {

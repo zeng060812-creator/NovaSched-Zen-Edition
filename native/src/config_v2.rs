@@ -380,36 +380,6 @@ pub fn parse(root: &Value) -> Result<Config> {
         }
         None => FasConfig::default(),
     };
-    // 信息流视频锁帧同样是可选块：缺省 = 开启（默认应用清单，30Hz）。
-    let feed_video = match field(features, "feed_video") {
-        Some(block) => {
-            let enabled = flag(block, "enabled")?;
-            let fps = number(block, "fps")
-                .map_err(|error| format!("features.feed_video.{error}"))?
-                .parse::<u64>().map_err(|e| e.to_string())?;
-            if !(24..=120).contains(&fps) {
-                return Err("features.feed_video.fps 必须在 24..120 Hz".into());
-            }
-            let packages_node = field(block, "packages")
-                .ok_or("features.feed_video.packages 缺失")?;
-            let Value::Array(items) = packages_node else {
-                return Err("features.feed_video.packages 必须为字符串数组".into());
-            };
-            let mut packages = Vec::new();
-            for value in items {
-                let package = value.as_str()?;
-                if !crate::util::valid_package(package) {
-                    return Err(format!("features.feed_video.packages 包名非法: {package}"));
-                }
-                packages.push(package.to_string());
-            }
-            if packages.len() > 32 {
-                return Err("features.feed_video.packages 最多 32 项".into());
-            }
-            FeedVideoConfig { enabled, fps: fps as u32, packages }
-        }
-        None => FeedVideoConfig::default(),
-    };
     // devfreq GPU 档位包络是可选块：缺省 = 关闭，GPU 完全由内核管理。
     let gpu_devfreq = match field(features, "gpu_devfreq") {
         Some(block) => {
@@ -478,10 +448,13 @@ pub fn parse(root: &Value) -> Result<Config> {
                 sched_params,
             };
         }
-        let mut online = [true; 8];
-        for (index, value) in array(m.get("online")?, 8)?.iter().enumerate() {
-            online[index] = value.as_bool()?;
+        let Value::Array(values) = m.get("online")? else {
+            return Err(format!("{mode}.online 必须为布尔数组"));
+        };
+        if values.is_empty() || values.len() > MAX_CPU_COUNT {
+            return Err(format!("{mode}.online 必须包含 1..{MAX_CPU_COUNT} 项"));
         }
+        let online = values.iter().map(Value::as_bool).collect::<Result<Vec<_>>>()?;
         modes.insert(mode.into(), ModeProfile { clusters, online });
     }
     Ok(Config {
@@ -502,7 +475,6 @@ pub fn parse(root: &Value) -> Result<Config> {
                 services,
             },
             fas,
-            feed_video,
             gpu_devfreq,
         },
     })
@@ -631,11 +603,6 @@ pub fn encode(config: &Config, soc: Soc) -> Value {
         ("sample_ms", text(&f.fas.sample_ms.to_string())),
         ("modes", fas_modes),
     ]);
-    let feed_video_out = object([
-        ("enabled", Value::Bool(f.feed_video.enabled)),
-        ("fps", text(&f.feed_video.fps.to_string())),
-        ("packages", list(&f.feed_video.packages)),
-    ]);
     let gpu_devfreq_out = object([
         ("enabled", Value::Bool(f.gpu_devfreq.enabled)),
         (
@@ -700,7 +667,6 @@ pub fn encode(config: &Config, soc: Soc) -> Value {
             ]),
         ),
         ("fas", fas_out),
-        ("feed_video", feed_video_out),
         ("gpu_devfreq", gpu_devfreq_out),
     ]);
     let modes = Value::Object(
@@ -801,13 +767,13 @@ pub fn migrate(root: &Value, config: &Config, soc: Soc) -> Result<Value> {
                             features.insert("fas".into(), fas.clone());
                         }
                     }
-                    if !features.contains_key("gpu_devfreq") {
+                    if !features.contains_key("gpu_devfreq") && config.functions.gpu_devfreq.enabled {
                         if let Some(gpu) = default_features.get("gpu_devfreq") {
                             features.insert("gpu_devfreq".into(), gpu.clone());
                         }
                     }
                     if let Some(Value::Object(cpuset_block)) = features.get_mut("cpuset") {
-                        if !cpuset_block.contains_key("modes") {
+                        if !cpuset_block.contains_key("modes") && !config.functions.cpuset.modes.is_empty() {
                             if let Some(Value::Object(default_cpuset)) =
                                 default_features.get("cpuset")
                             {
@@ -1061,6 +1027,35 @@ mod tests {
                 assert!(values.get("freq_scale").unwrap().as_str().is_ok());
             }
         }
+    }
+
+    #[test]
+    fn online_arrays_accept_ten_cores_and_reject_invalid_lengths_and_types() {
+        let original = crate::json::parse(include_str!("../../module-template/config/XRING_O3.json")).unwrap();
+        assert_eq!(parse(&original).unwrap().modes["fast"].online.len(), 10);
+        for length in [8, 10, MAX_CPU_COUNT] {
+            let mut root = original.clone();
+            *at_mut(&mut root, &["modes", "fast", "online"]) = Value::Array(vec![Value::Bool(true); length]);
+            assert_eq!(parse(&root).unwrap().modes["fast"].online.len(), length);
+        }
+        for bad in [Value::Array(vec![]), Value::Array(vec![Value::Bool(true); MAX_CPU_COUNT + 1]),
+                    Value::Array(vec![Value::Number(1); 10]), Value::Null] {
+            let mut root = original.clone();
+            *at_mut(&mut root, &["modes", "fast", "online"]) = bad;
+            assert!(parse(&root).is_err());
+        }
+        let mut legacy = crate::json::parse(&legacy_fixture(Soc::XringO3)).unwrap();
+        assert_eq!(parse_legacy_online_count(&legacy), 8);
+        for mode in MODES {
+            let Value::Object(fields) = at_mut(&mut legacy, &["Switch", mode, "CoreOnline"]) else { unreachable!() };
+            fields.insert("Core8".into(), Value::Number(1));
+            fields.insert("Core9".into(), Value::Number(1));
+        }
+        assert_eq!(parse_legacy_online_count(&legacy), 10);
+    }
+
+    fn parse_legacy_online_count(root: &Value) -> usize {
+        Config::from_text(&crate::json::stringify(root).unwrap()).unwrap().modes["fast"].online.len()
     }
 
     #[test]

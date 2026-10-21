@@ -32,6 +32,90 @@ extern "C" fn handle_signal(signal: i32) {
     }
 }
 
+fn recover_legacy_feed_fps(state_dir: &Path, logger: &Logger) {
+    let record = crate::storage::path(state_dir, "feed-fps.saved");
+    let Ok(text) = util::read_text(&record) else {
+        return;
+    };
+    let mut restored = 0usize;
+    let mut failed = false;
+    for line in text.lines() {
+        let mut fields = line.splitn(3, '\t');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("node"), Some(node), Some(value))
+                if [
+                    "/sys/class/mi_display/disp-DSI-0/max_fps_clone",
+                    "/sys/class/mi_display/dsi-0-mi_display/max_fps_clone",
+                    "/sys/class/mi_display/disp-DSI-0/dynamic_fps",
+                    "/sys/class/mi_display/dsi-0-mi_display/dynamic_fps",
+                ]
+                .contains(&node) =>
+            {
+                match fs::write(node, value.as_bytes()) {
+                    Ok(()) => restored += 1,
+                    Err(error) => {
+                        failed = true;
+                        logger.warn(format!("恢复旧信息流刷新率限制失败: {error}"));
+                    }
+                }
+            }
+            (Some("setting"), Some(key), Some(value))
+                if matches!(key, "min_refresh_rate" | "peak_refresh_rate") =>
+            {
+                let result = if value == "null" || value.is_empty() {
+                    util::run_command("settings", &["delete", "system", key])
+                } else {
+                    util::run_command("settings", &["put", "system", key, value])
+                };
+                match result {
+                    Ok(_) => restored += 1,
+                    Err(error) => {
+                        failed = true;
+                        logger.warn(format!("恢复旧信息流刷新率设置 {key} 失败: {error}"));
+                    }
+                }
+            }
+            _ => {
+                failed = true;
+                logger.warn("旧信息流刷新率恢复记录格式无效，保留记录以便后续检查");
+            }
+        }
+    }
+    if !failed {
+        if let Err(error) = util::remove_if_exists(&record) {
+            logger.warn(format!("清理旧信息流刷新率恢复记录失败: {error}"));
+        }
+        if restored > 0 {
+            logger.warn(format!("已恢复 {restored} 项旧信息流锁帧设置"));
+        }
+    }
+}
+
+fn strip_legacy_feed_config(logger: &Logger) {
+    let path = Path::new(CONFIG_PATH);
+    let result = (|| -> Result<bool> {
+        let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let mut config = crate::json::parse(&text)?;
+        let crate::json::Value::Object(root) = &mut config else {
+            return Err("配置根节点不是对象".into());
+        };
+        let Some(crate::json::Value::Object(features)) = root.get_mut("features") else {
+            return Ok(false);
+        };
+        if features.remove("feed_video").is_none() {
+            return Ok(false);
+        }
+        let encoded = crate::json::stringify(&config)?;
+        util::atomic_write(path, encoded.as_bytes(), 0o600)?;
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => logger.info("已移除旧配置中的信息流锁帧选项，其他配置保持不变"),
+        Ok(false) => {}
+        Err(error) => logger.warn(format!("清理旧信息流锁帧配置失败（该配置已停用）: {error}")),
+    }
+}
+
 pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     crate::boot_guard::ensure_ready()?;
     STOP_REQUESTED.store(false, Ordering::Relaxed);
@@ -54,6 +138,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         0o600,
     )?;
     let cleanup = PidCleanup(pid_path.clone());
+    recover_legacy_feed_fps(state_dir, &logger);
     let identity = match process_identity::Identity::capture(util::current_pid()) {
         Ok(value) => value,
         Err(error) => return startup_fail(&logger, state_dir, "采集进程身份", error),
@@ -122,6 +207,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             }
         }
     };
+    strip_legacy_feed_config(&logger);
     // Thread settings must come from the same adapted configuration as the
     // dispatcher; otherwise a disabled FAS engine can still be spawned.
     match hardware.adapt_config(&mut config) {
@@ -134,9 +220,6 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         Err(error) => return startup_fail(&logger, state_dir, "加载原厂快照", error),
     };
     let mut scene = scene::detect();
-    // 上次会话若死于 SIGKILL（且监督进程四次重启均失败），信息流锁帧的
-    // settings/sysfs 改动没有恢复路径；这里按持久化记录兜底恢复。
-    crate::feed_fps::recover_pending(&logger);
     if !scene.linked() {
         if let Err(error) = util::remove_if_exists(Path::new(SCENE_REQUEST_PATH)) {
             logger.warn(format!("清理上次失效的 Scene 请求失败: {error}"));
@@ -174,7 +257,6 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     let input_boost_cfg = config.functions.input_boost.clone();
     let fas_cfg = config.functions.fas.clone();
     let fas_policies = config.policy;
-    let feed_video_cfg = config.functions.feed_video.clone();
     let cpuctl_live = Arc::new(CpuctlLive::default());
     let mut scheduler = match Scheduler::new(
         config,
@@ -186,6 +268,11 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         Ok(value) => value,
         Err(error) => return startup_fail(&logger, state_dir, "内核能力适配", error),
     };
+    let extreme_power = Arc::new(AtomicBool::new(
+        fs::read_to_string(crate::storage::path(&state_dir, "extreme-power"))
+            .is_ok_and(|value| value.trim() == "1"),
+    ));
+    scheduler.set_extreme_power(extreme_power.load(Ordering::Relaxed));
     let mut boot_guard = match crate::boot_guard::BootGuard::begin(&module_dir, state_dir) {
         Ok(guard) => guard,
         Err(error) => return startup_fail(&logger, state_dir, "启动保护", error),
@@ -225,6 +312,22 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         local_automatic_enabled(automatic.enabled(), &scene) && last_apply_error.is_empty(),
     );
     runtime.set_power_profile(scheduler.current_power_profile());
+    let mut reported_extreme_power = extreme_power.load(Ordering::Relaxed);
+    let mut reported_extreme_status = if !reported_extreme_power {
+        "off"
+    } else if !last_apply_error.is_empty() {
+        "failed"
+    } else if scene.controls_locked() {
+        "unsupported"
+    } else {
+        scheduler.extreme_power_status()
+    };
+    let mut reported_extreme_error = last_apply_error.clone();
+    runtime.set_extreme_power(
+        reported_extreme_power,
+        reported_extreme_status,
+        &reported_extreme_error,
+    );
     runtime.set_classification(&Classification {
         kind: crate::automatic::AppKind::Daily,
         source: "idle",
@@ -243,6 +346,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         automatic: automatic.clone(),
         runtime: runtime.clone(),
         revision: revision.clone(),
+        extreme_power: extreme_power.clone(),
     };
     let web_thread = match websocket::start(web_state, logger.clone(), web_stop.clone()) {
         Ok((handle, port)) => {
@@ -351,7 +455,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     let mut first_scan = true;
     let mut node_audit = NodeAuditClock::new(Instant::now());
     let mut scene_probe_at = Instant::now() + scene::PRESENCE_INTERVAL;
-    let mut feed_fps = crate::feed_fps::FeedFpsState::default();
+    let mut current_extreme_power = extreme_power.load(Ordering::Relaxed);
     // 运行期间感知管理器的停用/卸载标记：守护继续写节点会与卸载流程并发
     // 冲突，且与"已停用"语义相悖。低频（15 秒）检查，命中即走正常停止
     // 与恢复路径。
@@ -382,6 +486,12 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         let rules_changed = stamps.changed(Path::new(APP_MODES_PATH));
         let automatic_changed = stamps.changed(Path::new(util::AUTO_POLICY_PATH));
         let mode_changed = stamps.changed(Path::new(MODE_PATH));
+        let requested_extreme_power = extreme_power.load(Ordering::Relaxed);
+        let extreme_power_changed = requested_extreme_power != current_extreme_power;
+        if extreme_power_changed {
+            current_extreme_power = requested_extreme_power;
+            scheduler.set_extreme_power(current_extreme_power);
+        }
         let scene_request_changed = stamps.changed(Path::new(SCENE_REQUEST_PATH));
         let scene_files_changed = scene::watched_paths().iter().fold(false, |changed, path| {
             stamps.changed(Path::new(path)) || changed
@@ -561,29 +671,12 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         if let Ok(mut state) = cpuctl_live.inner.lock() {
             state.active = !package.is_empty() && !scene.controls_locked();
         }
-        // 信息流视频 30Hz 锁帧：前台命中清单（抖音/快手/小红书/B 站等，
-        // features.feed_video.packages 可配）时限制屏幕刷新率，切走恢复。
-        let feed_match = feed_video_cfg.enabled
-            && !scene.controls_locked()
-            && feed_video_cfg
-                .packages
-                .iter()
-                .any(|p| package == *p || package.starts_with(&format!("{p}:")));
-        if feed_match && !feed_fps.engaged {
-            feed_fps = crate::feed_fps::engage(feed_video_cfg.fps, &logger);
-            if feed_fps.engaged {
-                revision.fetch_add(1, Ordering::Relaxed);
-            }
-        } else if !feed_match && feed_fps.engaged {
-            crate::feed_fps::release(&mut feed_fps, &logger);
-            revision.fetch_add(1, Ordering::Relaxed);
-        }
-        runtime.set_feed_fps(feed_fps.engaged);
         let force_apply = forced
             || config_changed
             || rules_changed
             || automatic_changed
             || mode_changed
+            || extreme_power_changed
             || scene_request_changed
             || scene_changed;
         if force_apply { apply_failures = 0; }
@@ -717,6 +810,25 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         } else {
             scheduler.current_power_profile()
         });
+        let extreme_status = if !current_extreme_power {
+            "off"
+        } else if !last_apply_error.is_empty() {
+            "failed"
+        } else if scene.controls_locked() {
+            "unsupported"
+        } else {
+            scheduler.extreme_power_status()
+        };
+        let extreme_error = last_apply_error.as_str();
+        if reported_extreme_power != current_extreme_power
+            || reported_extreme_status != extreme_status
+            || reported_extreme_error != extreme_error
+        {
+            runtime.set_extreme_power(current_extreme_power, extreme_status, extreme_error);
+            reported_extreme_power = current_extreme_power;
+            reported_extreme_status = extreme_status;
+            reported_extreme_error = extreme_error.to_string();
+        }
         let status = format!(
             "pid={}\nmode={}\npackage={}\ncontroller={}\nscene_linked={}\nscene_locked={}\nscene_mode={}\nsnapshot_items={}\npower_profile={}\nfasAvailable={}\n",
             util::current_pid(), scheduler.current_mode(), scheduler.current_package(), scene.controller(), scene.linked(), scene.controls_locked(),
@@ -745,7 +857,6 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
 
     logger.info("收到停止请求，正在恢复原厂快照");
     web_stop.store(true, Ordering::Relaxed);
-    crate::feed_fps::release(&mut feed_fps, &logger);
     if let Some(handle) = input_thread {
         if handle.join().is_err() {
             logger.error("输入加速线程异常退出");
@@ -911,6 +1022,13 @@ pub fn probe(module_dir: &Path) -> Result<()> {
     let mut config = Config::load(&module_dir.join("config").join(hardware.soc.file()))?;
     let changes = hardware.adapt_config(&mut config)?;
     println!("compatibility={}", if hardware.samsung { "samsung" } else { "standard" });
+    println!("cpu_count={}", hardware.cpus().len());
+    for policy in &hardware.policies {
+        println!("policy{}.cpus={}\npolicy{}.physical_khz={}..{}\npolicy{}.capacity={}",
+            policy.id, policy.cpus.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+            policy.id, policy.min_freq, policy.max_freq, policy.id,
+            policy.capacity.map(|value| value.to_string()).unwrap_or_else(|| "unavailable".into()));
+    }
     println!("soc={}\nsoc_id={}\nprofile={}\nprofile_id=novasched.{}\nconfig_name={}\nconfig_author={}\nconfig_version={}\ndevice={}\nevidence={}\nroot=true\nmanager_gate=none\npolicies={},{},{},{}\ntop_app=true\npolicy_writes=0",
         hardware.soc.name(), hardware.soc.id(), hardware.soc.file(), hardware.soc.id().to_ascii_lowercase(),config.meta.name,config.meta.author,config.meta.version,hardware.device, hardware.evidence, config.policy[0],config.policy[1],config.policy[2],config.policy[3]);
     for change in changes {

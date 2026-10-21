@@ -1,5 +1,5 @@
 //! Read-only SoC admission and physical CPU policy mapping.
-use crate::config::Config;
+use crate::config::{Config, MAX_CPU_COUNT};
 use crate::soc::{self, Soc};
 use crate::util::{self, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +14,7 @@ pub struct CpuPolicy {
     pub current_governor: String,
     pub min_freq: u64,
     pub max_freq: u64,
+    pub capacity: Option<u32>,
 }
 #[derive(Clone, Debug)]
 pub struct Hardware {
@@ -286,7 +287,7 @@ pub(crate) fn parse_cpu_list(raw: &str) -> Result<BTreeSet<u32>> {
             start.map_err(|_| format!("CPU 列表非法: {raw}"))?,
             end.map_err(|_| format!("CPU 列表非法: {raw}"))?,
         );
-        if start > end || end > 7 {
+        if start > end || end >= MAX_CPU_COUNT as u32 {
             return Err(format!("CPU 列表超出支持的核心范围: {raw}"));
         }
         cpus.extend(start..=end);
@@ -332,6 +333,15 @@ pub fn inspect_policies(root: &Path) -> Result<Vec<CpuPolicy>> {
             return Err(format!("policy{id} 未提供可用调速器"));
         }
         let (min_freq, max_freq) = physical_frequency_range(&base)?;
+        let capacity = root.parent().and_then(|cpu_root| {
+            cpus.iter()
+                .map(|cpu| {
+                    util::read_trimmed(cpu_root.join(format!("cpu{cpu}/cpu_capacity")))
+                        .ok()?.parse::<u32>().ok().filter(|value| *value > 0)
+                })
+                .collect::<Option<Vec<_>>>()?
+                .into_iter().max()
+        });
         policies.push(CpuPolicy {
             id,
             cpus,
@@ -339,10 +349,11 @@ pub fn inspect_policies(root: &Path) -> Result<Vec<CpuPolicy>> {
             current_governor,
             min_freq,
             max_freq,
+            capacity,
         });
     }
-    if all_cpus != (0..7).collect() && all_cpus != (0..8).collect() {
-        return Err(format!("CPU policy 未覆盖连续七核或八核: {all_cpus:?}"));
+    if all_cpus.is_empty() || !all_cpus.iter().copied().eq(0..all_cpus.len() as u32) {
+        return Err(format!("CPU policy 未覆盖从 CPU0 开始的连续核心: {all_cpus:?}"));
     }
     policies.sort_by_key(|p| p.id);
     Ok(policies)
@@ -515,11 +526,63 @@ impl Hardware {
     }
     pub fn validate_topology(&self) -> Result<()> {
         let cpus = self.cpus();
-        if cpus == (0..8).collect() || (self.soc.elite() && cpus == (0..7).collect()) {
+        if cpus == (0..8).collect()
+            || (self.soc.elite() && cpus == (0..7).collect())
+            || (self.soc == Soc::XringO3 && cpus == (0..10).collect())
+        {
             Ok(())
         } else {
             Err(format!("{} 不支持此 CPU 拓扑: {cpus:?}", self.soc.id()))
         }
+    }
+    fn adapt_xring_reference(&self, config: &mut Config, changes: &mut Vec<String>) -> Result<()> {
+        if self.soc != Soc::XringO3 || self.cpus().len() != 10
+            || config.policy != self.soc.anchors()
+        {
+            return Ok(());
+        }
+        let sources: &[usize] = match self.policies.len() {
+            1 => &[0],
+            2 => &[0, 2],
+            3 => &[0, 1, 2],
+            4 => &[0, 1, 1, 2],
+            _ => return Err("玄戒 O3 的 CPU policy 数量超出 1..4，未下发调度策略".into()),
+        };
+        let use_capacity = self.policies.iter().all(|policy| policy.capacity.is_some());
+        let mut policies: Vec<_> = self.policies.iter().collect();
+        policies.sort_by_key(|policy| (
+            if use_capacity { policy.capacity.unwrap_or(0) } else { 0 },
+            policy.max_freq,
+            policy.id,
+        ));
+        let original = config.clone();
+        config.policy = [-1; 4];
+        for (slot, (policy, source)) in policies.iter().zip(sources).enumerate() {
+            config.policy[slot] = policy.id;
+            for (mode, profile) in &mut config.modes {
+                profile.clusters[slot] = original.modes[mode].clusters[*source].clone();
+            }
+            config.functions.launch_boost.frequencies[slot] =
+                original.functions.launch_boost.frequencies[*source].clone();
+        }
+        // Migrate only the shipped placement defaults. User app/mode masks stay explicit.
+        let full = "0-9";
+        let little = policies[0].cpus.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let background = policies[0].cpus.iter().take(2).map(u32::to_string).collect::<Vec<_>>().join(",");
+        let cpuset = &mut config.functions.cpuset;
+        for raw in [&mut cpuset.top_app, &mut cpuset.foreground] {
+            if matches!(raw.as_str(), "0-7" | "0-9") { *raw = full.into(); }
+        }
+        for raw in [&mut cpuset.restricted, &mut cpuset.system_background] {
+            if raw == "4-7" { *raw = little.clone(); }
+        }
+        if cpuset.background == "4-5" { cpuset.background = background; }
+        changes.push(format!(
+            "玄戒 O3 十核：按{}映射全部 {} 个实际 policy {:?}",
+            if use_capacity { "内核 CPU capacity" } else { "物理最高频率回退排序（缺少 CPU capacity）" },
+            policies.len(), config.policy,
+        ));
+        Ok(())
     }
     pub fn adapt_config(&self, config: &mut Config) -> Result<Vec<String>> {
         self.validate_topology()?;
@@ -530,6 +593,8 @@ impl Hardware {
                 self.soc.id()
             ));
         }
+        let mut changes = Vec::new();
+        self.adapt_xring_reference(config, &mut changes)?;
         if self.samsung {
             config.functions.node_watchdog = false;
             config.functions.cpuset.enable = false;
@@ -542,7 +607,7 @@ impl Hardware {
             config.functions.fas.enabled = false;
             config.functions.gpu_devfreq.enabled = false;
             for profile in config.modes.values_mut() {
-                profile.online = [true; 8];
+                profile.online = vec![true; self.cpus().len()];
                 for cluster in &mut profile.clusters {
                     cluster.governor = "auto".into();
                     cluster.sched_params.clear();
@@ -557,7 +622,6 @@ impl Hardware {
         if seven && self.soc.elite() {
             anchors[1] = 5;
         }
-        let mut changes = Vec::new();
         for (cluster, cpu) in anchors.iter().enumerate() {
             let configured = config.policy[cluster];
             if configured < 0 {
@@ -645,7 +709,7 @@ impl Hardware {
                         .copied()
                         .filter(|v| *v > start)
                         .min()
-                        .unwrap_or(if seven { 7 } else { 8 });
+                        .unwrap_or(self.cpus().len() as i32);
                     start >= 0
                         && policy
                             .cpus
@@ -719,14 +783,41 @@ impl Hardware {
                 }
             }
             for profile in config.modes.values_mut() {
-                let o = profile.online;
-                profile.online = if reference {
-                    [o[0], o[1], o[2], o[3], o[4] && o[5], o[6], o[7], true]
-                } else {
-                    [o[0], o[1], o[2], o[3], o[4], o[5], o[6], true]
-                };
+                if reference && profile.online.len() == 8 {
+                    let o = &profile.online;
+                    profile.online = vec![o[0], o[1], o[2], o[3], o[4] && o[5], o[6], o[7]];
+                }
             }
             changes.push("七核 Elite：按实际核心范围映射 CpuSet 与 online".into());
+        }
+        let actual = self.cpus();
+        let cpuset = &mut config.functions.cpuset;
+        let clip = |raw: &mut String| -> Result<()> {
+            let selected = parse_cpu_list(raw)?;
+            let available: BTreeSet<_> = selected.intersection(&actual).copied().collect();
+            if available.is_empty() {
+                return Err(format!("CpuSet 不包含设备上的可用核心: {raw}"));
+            }
+            if available != selected {
+                *raw = available.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+            }
+            Ok(())
+        };
+        for raw in [&mut cpuset.top_app, &mut cpuset.foreground, &mut cpuset.restricted,
+                    &mut cpuset.system_background, &mut cpuset.background] {
+            clip(raw)?;
+        }
+        for placement in cpuset.modes.values_mut().chain(cpuset.app_rule.iter_mut()) {
+            for raw in [&mut placement.top_app, &mut placement.foreground].into_iter().flatten() {
+                clip(raw)?;
+            }
+        }
+        for (mode, profile) in &mut config.modes {
+            if profile.online.iter().skip(actual.len()).any(|online| !online) {
+                return Err(format!("{mode}.online 指定了设备上不存在的离线核心"));
+            }
+            profile.online.resize(actual.len(), true);
+            profile.online.truncate(actual.len());
         }
         if self.samsung {
             for profile in config.modes.values_mut() {
@@ -743,10 +834,125 @@ impl Hardware {
 }
 
 #[cfg(test)]
+pub(crate) fn xring_ten_core_fixture() -> Hardware {
+    Hardware {
+        soc: Soc::XringO3,
+        samsung: false,
+        device: "synthetic-ten-core".into(),
+        evidence: "synthetic policies; not a captured device frequency table".into(),
+        policies: [
+            (11, "0-1", 350, 2300000),
+            (23, "2-5", 650, 3100000),
+            (37, "6-7", 650, 2000000),
+            (49, "8 9", 1024, 2800000),
+        ].into_iter().map(|(id, cpus, capacity, max_freq)| CpuPolicy {
+            id,
+            cpus: parse_cpu_list(cpus).unwrap(),
+            governors: vec!["schedutil".into()],
+            current_governor: "schedutil".into(),
+            min_freq: 300000,
+            max_freq,
+            capacity: Some(capacity),
+        }).collect(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn props(value: &str) -> Vec<(String, String)> {
         vec![("ro.soc.model".into(), value.into())]
+    }
+    fn xring_config() -> Config {
+        Config::from_text(include_str!("../../module-template/config/XRING_O3.json")).unwrap()
+    }
+    #[test]
+    fn ten_core_probe_is_read_only_and_covers_every_physical_policy() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("nova-o3-ten-{}-{stamp}", std::process::id()));
+        let policy_root = root.join("cpufreq");
+        let mut hardware = xring_ten_core_fixture();
+        let mut original_nodes = BTreeMap::new();
+        for policy in &hardware.policies {
+            let base = policy_root.join(format!("policy{}", policy.id));
+            fs::create_dir_all(&base).unwrap();
+            for (name, value) in [
+                ("related_cpus", policy.cpus.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")),
+                ("scaling_min_freq", "300000".into()),
+                ("scaling_max_freq", policy.max_freq.to_string()),
+                ("cpuinfo_min_freq", "300000".into()),
+                ("cpuinfo_max_freq", policy.max_freq.to_string()),
+                ("scaling_governor", "schedutil".into()),
+                ("scaling_available_governors", "schedutil".into()),
+            ] {
+                let path = base.join(name);
+                fs::write(&path, &value).unwrap();
+                original_nodes.insert(path, value);
+            }
+            for cpu in &policy.cpus {
+                let base = root.join(format!("cpu{cpu}"));
+                fs::create_dir_all(&base).unwrap();
+                let path = base.join("cpu_capacity");
+                let value = policy.capacity.unwrap().to_string();
+                fs::write(&path, &value).unwrap();
+                original_nodes.insert(path, value);
+            }
+        }
+        hardware.policies = inspect_policies(&policy_root).unwrap();
+        hardware.validate_topology().unwrap();
+        let mut config = xring_config();
+        let changes = hardware.adapt_config(&mut config).unwrap();
+        assert_eq!(config.policy, [11, 37, 23, 49]);
+        assert!(changes.iter().any(|line| line.contains("内核 CPU capacity")));
+        assert_eq!(parse_cpu_list(&config.functions.cpuset.top_app).unwrap(), (0..10).collect());
+        assert_eq!(parse_cpu_list(&config.functions.cpuset.background).unwrap(), (0..2).collect());
+        for profile in config.modes.values() {
+            assert_eq!(profile.online, vec![true; 10]);
+            for (slot, id) in config.policy.iter().enumerate() {
+                let policy = hardware.policies.iter().find(|policy| policy.id == *id).unwrap();
+                let max = profile.clusters[slot].max_freq.parse::<u64>().unwrap();
+                assert!((policy.min_freq..=policy.max_freq).contains(&max));
+            }
+        }
+        let before = format!("{config:?}");
+        hardware.adapt_config(&mut config).unwrap();
+        assert_eq!(format!("{config:?}"), before);
+        for (path, value) in original_nodes {
+            assert_eq!(fs::read_to_string(path).unwrap(), value);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn ten_core_upgrade_expands_legacy_online_and_preserves_custom_policy_selection() {
+        let hardware = xring_ten_core_fixture();
+        let mut config = xring_config();
+        for profile in config.modes.values_mut() { profile.online.truncate(8); }
+        config.functions.cpuset.top_app = "0-7".into();
+        config.functions.cpuset.foreground = "0-7".into();
+        hardware.adapt_config(&mut config).unwrap();
+        assert!(config.modes.values().all(|profile| profile.online == vec![true; 10]));
+        assert_eq!(parse_cpu_list(&config.functions.cpuset.foreground).unwrap(), (0..10).collect());
+
+        let mut custom = xring_config();
+        custom.policy = [49, 11, 23, 37];
+        hardware.adapt_config(&mut custom).unwrap();
+        assert_eq!(custom.policy, [49, 11, 23, 37]);
+        let text = crate::json::stringify(&crate::config_v2::encode(&custom, Soc::XringO3)).unwrap();
+        assert_eq!(Config::from_text(&text).unwrap().modes["fast"].online.len(), 10);
+    }
+    #[test]
+    fn ten_core_fallback_is_explicit_and_other_soc_admission_stays_strict() {
+        let mut hardware = xring_ten_core_fixture();
+        for policy in &mut hardware.policies { policy.capacity = None; }
+        let mut config = xring_config();
+        let changes = hardware.adapt_config(&mut config).unwrap();
+        assert_eq!(config.policy, [37, 11, 49, 23]);
+        assert!(changes.iter().any(|line| line.contains("缺少 CPU capacity")));
+        hardware.soc = Soc::Gen3;
+        assert!(hardware.validate_topology().is_err());
+        hardware.soc = Soc::XringO3;
+        hardware.policies.last_mut().unwrap().cpus.remove(&9);
+        assert!(hardware.validate_topology().is_err());
     }
     #[test]
     fn combined_marketing_names_revision_and_family_labels_do_not_reject_gen3() {
@@ -778,6 +984,7 @@ mod tests {
             current_governor: "schedutil".into(),
             min_freq: 400000,
             max_freq: 2000000,
+            capacity: None,
         });
         let mut config = Config::load(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-template/config/SM8550.json"),
@@ -878,6 +1085,7 @@ mod tests {
                     current_governor: "schedutil".into(),
                     min_freq: 300000,
                     max_freq: 3000000,
+                    capacity: None,
                 })
                 .collect();
             let hw = Hardware {
@@ -933,6 +1141,7 @@ mod tests {
                     current_governor: "schedutil".into(),
                     min_freq: 300000,
                     max_freq: 3000000,
+                    capacity: None,
                 })
                 .collect(),
         };
@@ -966,6 +1175,7 @@ mod tests {
                         current_governor: "schedutil".into(),
                         min_freq: 300000,
                         max_freq: 3000000,
+                        capacity: None,
                     })
                     .collect(),
             };
@@ -1147,6 +1357,7 @@ mod tests {
                     current_governor: "schedutil".into(),
                     min_freq: 300000,
                     max_freq: 3000000,
+                    capacity: None,
                 })
                 .collect(),
         }
@@ -1337,6 +1548,7 @@ mod tests {
                         current_governor: "schedutil".into(),
                         min_freq: 300000,
                         max_freq: 3000000,
+                        capacity: None,
                     })
                     .collect(),
             };
@@ -1532,7 +1744,7 @@ mod tests {
             config.functions.perf_service_lock.enable = true;
             config.functions.disable_gpu_boost = true;
             for profile in config.modes.values_mut() {
-                profile.online = [false; 8];
+                profile.online = vec![false; 8];
                 for data in &mut profile.clusters { data.governor = "schedutil".into(); }
             }
             hardware.adapt_config(&mut config).unwrap();

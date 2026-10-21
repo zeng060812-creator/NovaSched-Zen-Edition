@@ -38,13 +38,6 @@ const FAS_MODES = {
   performance: { ceiling: "80", freq_scale: "60" },
   fast: { ceiling: "95", freq_scale: "80" },
 };
-/* 信息流视频应用锁帧：前台命中 packages 时把屏幕刷新率限制到 fps Hz。 */
-const FEED_VIDEO_PACKAGES = [
-  "com.ss.android.ugc.aweme",
-  "com.smile.gifmaker",
-  "com.xingin.xhs",
-  "tv.danmaku.bili",
-];
 /* 每颗处理器显式写入最优调速器（不再是 auto）：
  * 骁龙 = walt（WALT 窗口负载跟踪，小米 14 真机确认 OEM 默认即 walt）；
  * 天玑 / 玄戒 = schedutil（MTK 系唯一现代全簇调速器）。
@@ -102,7 +95,7 @@ function profile(soc, policies) {
     modes[name] = {
       min: minSlots, max: slots(policies, "100%"),
       governors: policies.map((p) => (p >= 0 ? GOVERNORS[soc] : "")),
-      params, online: Array(8).fill(true),
+      params, online: Array(soc === "XRING_O3" ? 10 : 8).fill(true),
     };
   }
   for (const [name, values] of Object.entries({ powersave: 0, balance: 1, performance: 2, fast: 3 })) {
@@ -136,13 +129,12 @@ function profile(soc, policies) {
     foreground_ignore: [],
     perf_lock: { enabled: false, services: [] },
     fas: { enabled: true, override_scene: true, step_ms: "200", sample_ms: "1000", modes: fasModes },
-    feed_video: { enabled: true, fps: 30, packages: FEED_VIDEO_PACKAGES },
   };
   if (GPU_DEVFREQ[soc]) features.gpu_devfreq = { enabled: true, modes: clone(GPU_DEVFREQ[soc]) };
-  if (soc === "XRING_O3") Object.assign(features.cpuset, { restricted: "4-7", system_background: "4-7", background: "4-5" });
+  if (soc === "XRING_O3") Object.assign(features.cpuset, { top_app: "0-9", foreground: "0-9", restricted: "4-7", system_background: "4-7", background: "4-5" });
   return {
     schema: "novasched/2", module: "NovaSched_Zen_Edition",
-    meta: { name: "NovaSched Zen Edition", author: "ZenJooo", version: 390, soc, loglevel: "INFO" },
+    meta: { name: "NovaSched Zen Edition", author: "ZenJooo", version: 391, soc, loglevel: "INFO" },
     policies,
     features,
     modes,

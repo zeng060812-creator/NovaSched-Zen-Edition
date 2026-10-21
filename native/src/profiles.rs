@@ -24,6 +24,20 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 // `scripts/stock-fingerprints.cjs` 生成；tests::shipped_templates_are_stock
 // 在编译期保证列表与模板一致。
 const STOCK_FINGERPRINTS: &[u64] = &[
+    // v2.11.1 shipped defaults and v2.11.2 ten-core O3 defaults.
+    0x15affb80bf8dad19, // DIMENSITY8350.json
+    0x5ae43ee831dd3cb9, // DIMENSITY8400.json
+    0x57323fd617d50c92, // DIMENSITY9400PLUS.json
+    0x8c0e1e3797e2556c, // MT6989.json
+    0xd3de93288e9bcb84, // SM8450.json
+    0x7fcfa826a938a6c5, // SM8475.json
+    0x83677585e49a2724, // SM8550.json
+    0xfa7b44c30bb7d18e, // SM8650.json
+    0xf0be4e5dedd1677c, // SM8750.json
+    0x8a62bd7a8c1ed952, // SM8845.json
+    0x0c31b8cd5dc633f5, // SM8850.json
+    0x456392a0971691cd, // XRING_O3.json
+    0x0c33949cfb137311, // XRING_O3.json (v2.11.1)
     // Current schema-2 defaults.
     0x0a54bd0af41800f6,0xc75ef8e9e069bed6,0x6401b330f5ea6fa5,0x9b85f833053fee13,0xc2617dcfd60f3372,0xf1707125ea2a1933,0xe1d863d1e4e5cc37,0x19bba46aa364a9fd,0xe2d7accce3dd4fa8,0xda9e3b2b3c4a74cc,
     // v2.11.0 新增：SM8845（骁龙 8 Gen 5）、MT6989（天玑 9300+ 极限性能策略）
@@ -87,7 +101,7 @@ const STOCK_FINGERPRINTS: &[u64] = &[
     0x90510745d88dc256,
     0xb487f424ae626b25,
     0x4581603aaa8b806c,
-    // v2.10.0 / 390 出厂默认（2W/3W 功耗档 + feed_video 信息流锁帧块）
+    // v2.10.0 / 390 出厂默认（2W/3W 功耗档）
     0x23bcc8578177bdd2,
     0x47e9345a8d7f2b2f,
     0x6ddd5769b9d56236,
@@ -190,6 +204,7 @@ pub fn test_hardware(soc: Soc) -> Hardware {
                     current_governor: "schedutil".into(),
                     min_freq: 300000,
                     max_freq: 3000000,
+                    capacity: None,
                 }
             })
             .collect(),

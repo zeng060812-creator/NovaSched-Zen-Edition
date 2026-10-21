@@ -1,6 +1,0 @@
-id=NovaSched_Zen_Edition
-name=NovaSched Zen Edition
-version=v2.11.1
-versionCode=412
-author=ZenJooo
-description=按内核能力执行四档 CPU 策略与 NovaFAS 帧感知调度。检测到 Scene 后自动备份并接管其调度入口，支持应用规则同步和液态玻璃 WebUI；卸载恢复原调度与原厂节点。首次解锁后启动，三星自动采用保守策略。

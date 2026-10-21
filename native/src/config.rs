@@ -7,7 +7,8 @@ use crate::util::{self, Result};
 pub const MODES: [&str; 4] = ["powersave", "balance", "performance", "fast"];
 /// Profile generation, independent of the UI version. Bump when defaults change
 /// so unedited configurations update while custom tuning migrates in place.
-pub const PROFILE_VERSION: i64 = 390;
+pub const PROFILE_VERSION: i64 = 391;
+pub const MAX_CPU_COUNT: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Meta {
@@ -162,32 +163,6 @@ impl Default for FasConfig {
     }
 }
 
-/// 信息流视频应用锁帧：前台命中 packages 时把屏幕刷新率限制到 fps Hz。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FeedVideoConfig {
-    pub enabled: bool,
-    pub fps: u32,
-    pub packages: Vec<String>,
-}
-
-impl Default for FeedVideoConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            fps: 30,
-            packages: [
-                "com.ss.android.ugc.aweme",
-                "com.smile.gifmaker",
-                "com.xingin.xhs",
-                "tv.danmaku.bili",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        }
-    }
-}
-
 /// devfreq GPU 档位包络：按档位写 GPU min_freq/max_freq（可用频表归一化）。
 /// 0% = 不限制（写设备频表端点）。设备缺少可调频 GPU 节点时运行时降级：
 /// 记一条日志并保持 GPU 完全由内核管理，不影响其它功能。
@@ -217,7 +192,6 @@ pub struct Functions {
     pub foreground_monitor: ForegroundMonitorConfig,
     pub perf_service_lock: PerfServiceLock,
     pub fas: FasConfig,
-    pub feed_video: FeedVideoConfig,
     pub gpu_devfreq: GpuDevfreq,
 }
 
@@ -232,7 +206,13 @@ pub struct ClusterProfile {
 #[derive(Clone, Debug)]
 pub struct ModeProfile {
     pub clusters: [ClusterProfile; 4],
-    pub online: [bool; 8],
+    pub online: Vec<bool>,
+}
+
+impl ModeProfile {
+    pub fn cpu_online(&self, cpu: u32) -> bool {
+        self.online.get(cpu as usize).copied().unwrap_or(true)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -417,7 +397,14 @@ impl Config {
                 };
             }
             let online_node = node.get("CoreOnline")?;
-            let mut online = [true; 8];
+            let Value::Object(online_fields) = online_node else {
+                return Err(format!("{mode}.CoreOnline 必须为对象"));
+            };
+            let count = online_fields.len();
+            if count == 0 || count > MAX_CPU_COUNT {
+                return Err(format!("{mode}.CoreOnline 必须包含 1..{MAX_CPU_COUNT} 个核心"));
+            }
+            let mut online = vec![true; count];
             for (index, slot) in online.iter_mut().enumerate() {
                 let value = integer(online_node, &format!("Core{index}"))?;
                 if value != 0 && value != 1 {
@@ -441,7 +428,6 @@ impl Config {
                 foreground_monitor,
                 perf_service_lock,
                 fas: FasConfig::default(),
-            feed_video: FeedVideoConfig::default(),
             gpu_devfreq: GpuDevfreq::default(),
             },
             modes,
@@ -593,7 +579,7 @@ mod tests {
     #[test]
     fn own_format_rejects_bad_cpu_ranges_and_service_names() {
         let text = include_str!("../../module-template/config/SM8650.json");
-        assert!(Config::from_text(&text.replace("\"0-7\"", "\"0-8\"")).is_err());
+        assert!(Config::from_text(&text.replace("\"0-7\"", "\"0-64\"")).is_err());
         assert!(
             Config::from_text(&text.replace("\"services\": []", "\"services\": [\"-bad\"]"))
                 .is_err()
