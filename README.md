@@ -1,10 +1,10 @@
-# NovaSched Zen Edition v2.11.0
+# NovaSched Zen Edition v2.11.1
 
 作者：**ZenJooo**。Android arm64 root 模块，提供四档 CPU 策略、应用规则、自动调度、NovaFAS 与 iOS 液态玻璃风格的 WebUI。
 
 ## 安装
 
-在 Magisk / Alpha、KernelSU 及其兼容分支、APatch 管理器中刷入 `NovaSched-v2.11.0-release.zip`，然后重启。兼容性根据实际执行与命令能力判断，不使用管理器名称或版本白名单。首次解锁稳定等待 30 秒后启动服务。
+在 Magisk / Alpha、KernelSU 及其兼容分支、APatch 管理器中刷入 `NovaSched-v2.11.1-release.zip`，然后重启。兼容性根据实际执行与命令能力判断，不使用管理器名称或版本白名单。首次解锁稳定等待 30 秒后启动服务。
 
 升级保留配置、应用规则与自动调度偏好。旧服务仍在运行时，目录迁移推迟到重启后；重复文件会保留并报告，避免覆盖用户数据。
 
