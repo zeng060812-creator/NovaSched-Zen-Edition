@@ -733,7 +733,7 @@ pub fn encode(config: &Config, soc: Soc) -> Value {
     ])
 }
 
-pub fn migrate(root: &Value, config: &Config, soc: Soc) -> Result<Value> {
+pub fn migrate(root: &Value, config: &Config, soc: Soc, gpu_template: Option<Value>) -> Result<Value> {
     if field(root, "schema").is_some() {
         let mut out = root.clone();
         if let Value::Object(map) = &mut out {
@@ -767,9 +767,15 @@ pub fn migrate(root: &Value, config: &Config, soc: Soc) -> Result<Value> {
                             features.insert("fas".into(), fas.clone());
                         }
                     }
-                    if !features.contains_key("gpu_devfreq") && config.functions.gpu_devfreq.enabled {
-                        if let Some(gpu) = default_features.get("gpu_devfreq") {
-                            features.insert("gpu_devfreq".into(), gpu.clone());
+                    if !features.contains_key("gpu_devfreq") {
+                        // 仅当当前处理器模板确实携带该块时才注入，且注入时
+                        // 保持关闭：老配置的功能面在升级前后不变（未编辑过
+                        // 的默认配置走整包重调，拿到模板原始开关）。
+                        if let Some(mut gpu) = gpu_template {
+                            if let Value::Object(fields) = &mut gpu {
+                                fields.insert("enabled".into(), Value::Bool(false));
+                            }
+                            features.insert("gpu_devfreq".into(), gpu);
                         }
                     }
                     if let Some(Value::Object(cpuset_block)) = features.get_mut("cpuset") {
@@ -1014,6 +1020,43 @@ mod tests {
     }
 
     #[test]
+    fn missing_gpu_devfreq_block_is_injected_disabled_and_only_when_template_ships_it() {
+        for (soc, ships) in [(Soc::Gen5, true), (Soc::Gen3, true), (Soc::Gen2, false)] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../module-template/config")
+                .join(soc.file());
+            let template_text = std::fs::read_to_string(&path).unwrap();
+            let mut root = crate::json::parse(&template_text).unwrap();
+            if let Value::Object(features) = at_mut(&mut root, &["features"]) {
+                features.remove("gpu_devfreq");
+            }
+            let text = crate::json::stringify(&root).unwrap();
+            let config = Config::from_text(&text).unwrap();
+            let parsed = crate::json::parse(&text).unwrap();
+            let gpu_template = crate::json::parse(&template_text)
+                .ok()
+                .and_then(|template| {
+                    template
+                        .get("features")
+                        .and_then(|features| features.get("gpu_devfreq"))
+                        .ok()
+                        .cloned()
+                });
+            assert_eq!(gpu_template.is_some(), ships, "{}", soc.id());
+            let merged = migrate(&parsed, &config, soc, gpu_template).unwrap();
+            let gpu = merged.get("features").and_then(|f| f.get("gpu_devfreq"));
+            if ships {
+                let gpu = gpu.unwrap_or_else(|e| panic!("{}: gpu_devfreq 未随迁移注入: {e}", soc.id()));
+                // 注入保持关闭：老配置的功能面在升级前后不变。
+                assert_eq!(gpu.get("enabled").unwrap().as_bool().unwrap(), false);
+                assert!(gpu.get("modes").unwrap().get("fast").is_ok());
+            } else {
+                assert!(gpu.is_err(), "{}: 模板没有的块不应注入", soc.id());
+            }
+        }
+    }
+
+    #[test]
     fn fas_encoding_matches_shipped_templates() {
         for soc in crate::soc::SUPPORTED {
             let config = crate::profiles::test_config(soc);
@@ -1124,7 +1167,8 @@ mod tests {
             );
         }
         let config = Config::from_text(&crate::json::stringify(&root).unwrap()).unwrap();
-        let after = migrate(&root, &config, Soc::Gen3).unwrap();
+        // legacy（schema-1）路径不消费模板 gpu_devfreq 块，传 None 即可。
+        let after = migrate(&root, &config, Soc::Gen3, None).unwrap();
         let extras = after.get("legacy_extensions").unwrap().get("root").unwrap();
         assert_eq!(
             extras.get("features").unwrap().as_str().unwrap(),

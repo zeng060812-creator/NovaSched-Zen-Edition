@@ -20,8 +20,12 @@ pub struct CpuctlLive {
 pub struct CpuctlLiveState {
     /// The baseline cpu.uclamp.min the dispatcher maintains for top-app
     /// (rule floor while an explicitly ruled app is foreground, stock
-    /// otherwise). Input-boost pulses expire back to this value.
+    /// otherwise). Input-boost pulses expire back to this value. Owned by
+    /// the dispatcher thread only.
     pub top_app_min: String,
+    /// NovaFAS 引擎当前的 top-app uclamp.min 加压值；空 = 引擎未加压。
+    /// 与调度器基线分字段管理，避免引擎回落时把基线写没。
+    pub fas_min: String,
     /// The pulse value applied on input activity; empty = disabled.
     pub boost_min: String,
     pub duration_ms: u64,
@@ -389,9 +393,12 @@ impl Scheduler {
         // non-frequency drift stay hard errors.
         let mut hard = Vec::new();
         for item in drift {
-            let ceiling =
-                item.path.file_name().and_then(|v| v.to_str()) == Some("scaling_max_freq");
-            if ceiling {
+            let frequency_node = item
+                .path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .is_some_and(|name| matches!(name, "scaling_max_freq" | "scaling_min_freq"));
+            if frequency_node {
                 if !self
                     .pending_enforcement
                     .iter()
@@ -529,7 +536,12 @@ impl Scheduler {
         // (governor, cpuset, uclamp) warrants a repair pass here.
         let described: Vec<String> = drift.iter().map(|item| item.describe()).collect();
         let pending_only = drift.iter().all(|item| {
-            item.path.file_name().and_then(|v| v.to_str()) == Some("scaling_max_freq")
+            let frequency_node = item
+                .path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .is_some_and(|name| matches!(name, "scaling_max_freq" | "scaling_min_freq"));
+            frequency_node
                 && self
                     .pending_enforcement
                     .iter()
@@ -693,6 +705,17 @@ impl Scheduler {
                 ControlKind::FrequencyCeiling,
                 true,
             );
+            // 最低频率只在 NovaFAS 关闭时纳入审计：引擎启用期间最低频率
+            // 由它按帧信号动态维护并自带重断言，审计强行写回会互相拉锯。
+            // 关闭时厂商 QoS 抬高下限属于真实漂移，进入限次重申队列。
+            if !self.config.functions.fas.enabled {
+                add(
+                    base.join("scaling_min_freq"),
+                    normalize_frequency(&base, &data.min_freq, true),
+                    ControlKind::FrequencyCeiling,
+                    false,
+                );
+            }
             if !self.hardware.samsung {
                 add(
                     base.join("scaling_governor"),

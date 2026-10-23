@@ -63,7 +63,11 @@ for path in sorted((root / "module-template/config").glob("*.json")):
     assert 50 <= int(features["cpuctl"]["modes"]["powersave"]["background_max"]) < int(features["cpuctl"]["modes"]["balance"]["background_max"]) < 100
     gpu = features.get("gpu_devfreq")
     if gpu is not None:
-        assert gpu["enabled"] is True and set(gpu["modes"]) == set(modes)
+        # 默认启用的仅限已真机确认节点的处理器；SM8650 携带停用的候选包，
+        # 待真机 A/B 验证后才允许把 enabled 翻成 True。
+        GPU_ENABLED = {"SM8845", "MT6989"}
+        assert gpu["enabled"] is (path.stem in GPU_ENABLED), path.stem
+        assert set(gpu["modes"]) == set(modes)
         for mode in modes:
             lo, hi = gpu["modes"][mode]["min"], gpu["modes"][mode]["max"]
             assert 0 <= lo <= hi <= 100, (path.stem, mode, lo, hi)

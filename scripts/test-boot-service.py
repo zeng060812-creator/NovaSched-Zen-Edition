@@ -55,9 +55,10 @@ sleep() {
     assert result.returncode == 0, result.stderr
     calls = (module / "calls").read_text().splitlines()
     assert calls[-1] == "start" and calls.count("start") == 1
-    assert calls.count("boot-ready") >= 18, calls
+    # 2 次解锁前失败 + 1 次门控通过 + 8 次连续 settle 探测，随后 start。
+    assert calls.count("boot-ready") >= 11, calls
     assert (module / "started").exists()
-    print("PASS: first unlock and 30-second settle precede native startup")
+    print("PASS: first unlock gate and bounded settle precede native startup")
     for options in [{"NOVA_LOCKED": "1", "NOVA_DISABLE_AFTER": "3"}, {"NOVA_DISABLE_AFTER": "6"}]:
         result = run(**options)
         assert result.returncode == 0, result.stderr
@@ -72,9 +73,11 @@ sleep() {
     print('PASS: late boot does not recreate removed data directories')
     result = run(NOVA_BROKEN="1")
     assert result.returncode == 1
-    assert (module / 'calls').read_text().splitlines() == ['boot-ready', 'version']
+    # 退出码 127（ELF 无法执行）立即放弃，不再无限等待解锁，也不再有
+    # 独立的 version 探针（boot-ready 失败本身已证明二进制不可用）。
+    assert (module / 'calls').read_text().splitlines() == ['boot-ready']
     assert not (module / 'started').exists()
-    print("PASS: a broken executable exits instead of waiting indefinitely for unlock")
+    print("PASS: a broken executable exits immediately instead of waiting for unlock")
     result = run(NOVA_USER_FAILURE="1", NOVA_DISABLE_AFTER="12")
     assert result.returncode == 0
     assert not (module / 'started').exists()

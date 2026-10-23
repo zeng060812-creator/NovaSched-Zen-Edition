@@ -566,17 +566,32 @@ impl Hardware {
                 original.functions.launch_boost.frequencies[*source].clone();
         }
         // Migrate only the shipped placement defaults. User app/mode masks stay explicit.
+        // 集合相等判断（而非字符串相等）：同一核心集合的 "0-7" 与
+        // "0,1,2,3,4,5,6,7" 等写法都按旧默认迁移，避免 cpu8/9 被静默排除。
+        let matches_set = |raw: &str, expected: &[u32]| -> bool {
+            parse_cpu_list(raw)
+                .map(|set| set.iter().copied().collect::<Vec<_>>() == expected)
+                .unwrap_or(false)
+        };
         let full = "0-9";
         let little = policies[0].cpus.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
         let background = policies[0].cpus.iter().take(2).map(u32::to_string).collect::<Vec<_>>().join(",");
         let cpuset = &mut config.functions.cpuset;
         for raw in [&mut cpuset.top_app, &mut cpuset.foreground] {
-            if matches!(raw.as_str(), "0-7" | "0-9") { *raw = full.into(); }
+            if matches_set(raw.as_str(), &(0..8).collect::<Vec<_>>())
+                || matches_set(raw.as_str(), &(0..10).collect::<Vec<_>>())
+            {
+                *raw = full.into();
+            }
         }
         for raw in [&mut cpuset.restricted, &mut cpuset.system_background] {
-            if raw == "4-7" { *raw = little.clone(); }
+            if matches_set(raw.as_str(), &(4..8).collect::<Vec<_>>()) {
+                *raw = little.clone();
+            }
         }
-        if cpuset.background == "4-5" { cpuset.background = background; }
+        if matches_set(cpuset.background.as_str(), &[4, 5]) {
+            cpuset.background = background;
+        }
         changes.push(format!(
             "玄戒 O3 十核：按{}映射全部 {} 个实际 policy {:?}",
             if use_capacity { "内核 CPU capacity" } else { "物理最高频率回退排序（缺少 CPU capacity）" },
@@ -723,7 +738,12 @@ impl Hardware {
             }
             let free = (0..4)
                 .find(|i| config.policy[*i] < 0)
-                .ok_or("硬件需要超过四个可独立控制的 CPU policy")?;
+                .ok_or_else(|| {
+                    format!(
+                        "设备暴露 {} 个独立 cpufreq policy，超过当前 4 个控制槽位；本检查未下发任何调度策略，请保留 probe 日志反馈机型",
+                        self.policies.len()
+                    )
+                })?;
             for (mode, profile) in &mut config.modes {
                 profile.clusters[free] =
                     original.modes.get(mode).ok_or("配置缺少原始档位")?.clusters[source].clone();
@@ -940,6 +960,25 @@ mod tests {
         let text = crate::json::stringify(&crate::config_v2::encode(&custom, Soc::XringO3)).unwrap();
         assert_eq!(Config::from_text(&text).unwrap().modes["fast"].online.len(), 10);
     }
+
+    #[test]
+    fn ten_core_cpuset_migration_matches_core_sets_not_strings() {
+        let hardware = xring_ten_core_fixture();
+        let mut config = xring_config();
+        // 同一核心集合的不同写法都必须被迁移，否则 cpu8/9 被静默排除在
+        // cpuset 之外且安装期无任何报错。
+        config.functions.cpuset.top_app = "0,1,2,3,4,5,6,7".into();
+        config.functions.cpuset.foreground = "0-7".into();
+        config.functions.cpuset.restricted = "4,5,6,7".into();
+        config.functions.cpuset.system_background = "4-7".into();
+        config.functions.cpuset.background = "4,5".into();
+        hardware.adapt_config(&mut config).unwrap();
+        assert_eq!(config.functions.cpuset.top_app, "0-9");
+        assert_eq!(config.functions.cpuset.foreground, "0-9");
+        assert_eq!(config.functions.cpuset.restricted, "0,1");
+        assert_eq!(config.functions.cpuset.system_background, "0,1");
+        assert_eq!(config.functions.cpuset.background, "0,1");
+    }
     #[test]
     fn ten_core_fallback_is_explicit_and_other_soc_admission_stays_strict() {
         let mut hardware = xring_ten_core_fixture();
@@ -1109,8 +1148,9 @@ mod tests {
                 match soc {
                     Soc::Gen1 | Soc::Gen1Plus | Soc::Gen2 | Soc::XringO3 => "1620000",
                     Soc::Dimensity8350 | Soc::Dimensity8400 => "1680000",
-                    // SM8650 按 2W 功耗预算重调：省电小核 60%（无表夹取）。
-                    Soc::Gen3 => "1800000",
+                    // SM8650 按 2W 功耗预算重调：省电小核 66%（无表夹取），
+                    // 缓解轻负载在小核排队而被推向中核的反噬。
+                    Soc::Gen3 => "1980000",
                     Soc::Elite | Soc::Elite5 | Soc::Dimensity9400Plus | Soc::Gen5 => "1560000",
                     // MT6989 全大核：省电档首簇（A720）留 60% 保底日常流畅。
                     Soc::Dimensity9300Plus => "1800000",
@@ -1374,7 +1414,7 @@ mod tests {
         assert_ne!(before, format!("{config:?}"));
         assert_eq!(
             config.profile("powersave").unwrap().clusters[0].max_freq,
-            "1800000"
+            "1980000"
         );
     }
     #[test]

@@ -30,7 +30,7 @@ CEILINGS = {
     'SM8450':            ([54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]),
     'SM8475':            ([54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]),
     'SM8550':            ([54, 46, 46, 0],  [60, 54, 54, 0],  [84, 82, 82, 0],  [92, 98, 100, 0]),
-    'SM8650':            ([60, 45, 49, 45], [70, 58, 56, 59], [85, 84, 85, 82], [95, 100, 100, 100]),
+    'SM8650':            ([66, 45, 49, 45], [70, 58, 56, 59], [85, 84, 85, 82], [95, 100, 100, 100]),
     'SM8750':            ([52, 46, 0, 0],   [58, 50, 0, 0],   [80, 72, 0, 0],   [90, 100, 0, 0]),
     'SM8850':            ([52, 46, 0, 0],   [58, 50, 0, 0],   [80, 70, 0, 0],   [90, 100, 0, 0]),
     # SM8845（骁龙 8 Gen 5，一加 PLR110 真机：6+2 Oryon，policy0=cpu0-5 /
@@ -93,14 +93,20 @@ CPUCTL_OVERRIDES = {
                'balance': {'background_max': '72'}},
 }
 # GPU devfreq 档位（百分比，0 = 物理端点不限）。按运行时检测到的 GPU OPP
-# 表 snap；节点缺失时守护仅告警降级，不影响 CPU 调度。仅新适配的处理器
-# 默认启用（SM8845 = kgsl-3d0，MT6989 = mali，均已真机确认节点存在）。
+# 表 snap；节点缺失时守护仅告警降级，不影响 CPU 调度。默认启用的仅限已
+# 真机确认节点存在且完成基础验证的处理器；SM8650 的包是候选档位，默认
+# 停用，待真机 A/B 验证后再决定是否启用（见 docs/v2.12.0-report.md）。
 GPU_DEVFREQ = {
     'SM8845': {'powersave': {'min': 0, 'max': 55}, 'balance': {'min': 0, 'max': 80},
                'performance': {'min': 0, 'max': 100}, 'fast': {'min': 0, 'max': 100}},
     'MT6989': {'powersave': {'min': 0, 'max': 55}, 'balance': {'min': 0, 'max': 80},
                'performance': {'min': 0, 'max': 100}, 'fast': {'min': 25, 'max': 100}},
+    'SM8650': {'powersave': {'min': 0, 'max': 70}, 'balance': {'min': 0, 'max': 80},
+               'performance': {'min': 0, 'max': 90}, 'fast': {'min': 0, 'max': 0}},
 }
+# 已确认 GPU devfreq 节点并默认启用该功能的处理器；不在集合内的模板
+# （如 SM8650）携带停用的候选包。
+GPU_DEVFREQ_ENABLED = {'SM8845', 'MT6989'}
 
 def profile(soc, policies):
     def slots(value):
@@ -156,7 +162,7 @@ def profile(soc, policies):
     }
     if soc in GPU_DEVFREQ:
         features['gpu_devfreq'] = {
-            'enabled': True,
+            'enabled': soc in GPU_DEVFREQ_ENABLED,
             'modes': {name: dict(values) for name, values in GPU_DEVFREQ[soc].items()},
         }
     if soc == 'XRING_O3':
@@ -164,7 +170,7 @@ def profile(soc, policies):
                                  restricted='4-7', system_background='4-7', background='4-5')
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 391,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 392,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': features,

@@ -54,7 +54,14 @@ pub fn start(module: &Path, restart: bool) -> Result<()> {
         .open(crate::storage::path(&state, "bootstrap.log"))
         .map_err(|e| e.to_string())?;
     let stderr = log.try_clone().map_err(|e| e.to_string())?;
-    let exe = fs::canonicalize(module.join("bin/novasched")).map_err(|e| e.to_string())?;
+    let exe = match fs::canonicalize(module.join("bin/novasched")) {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("定位 NovaSched ELF 失败: {error}");
+            let _ = record_failure(state, "启动监督", &message, false);
+            return Err(message);
+        }
+    };
     let mut command = Command::new(exe);
     command
         .arg("supervise")
@@ -71,11 +78,20 @@ pub fn start(module: &Path, restart: bool) -> Result<()> {
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|e| format!("启动监督失败: {e}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let message = format!("启动监督失败: {error}");
+            // 残留 state=launching 会让 WebUI 永远显示“正在启动”并吞掉诊断。
+            let _ = record_failure(state, "启动监督", &message, false);
+            return Err(message);
+        }
+    };
     let deadline = Instant::now() + Duration::from_secs(130);
     while Instant::now() < deadline {
         if ensure_not_removing(module).is_err() {
             stop_inner(module)?;
+            let _ = record_failure(state, "卸载取消启动", "模块进入卸载/停用流程，启动已取消", false);
             return Err("卸载已开始，已取消启动".into());
         }
         if let Some(exit) = child.try_wait().map_err(|e| e.to_string())? {
@@ -93,7 +109,9 @@ pub fn start(module: &Path, restart: bool) -> Result<()> {
         }
         util::sleep(Duration::from_millis(200));
     }
-    Err("启动等待超时，未报告成功；请运行 diagnose，勿重复点击启动".into())
+    let message = "启动等待超时，未报告成功；请运行 diagnose，勿重复点击启动";
+    let _ = record_failure(state, "启动等待", message, false);
+    Err(message.into())
 }
 pub fn supervise(module: &Path) -> Result<()> {
     root()?;
@@ -106,8 +124,12 @@ pub fn supervise(module: &Path) -> Result<()> {
     logger.info("启动监督就绪；异常退出最多自动重启三次");
     let binary = module.join("bin/novasched");
     let mut last_error = String::new();
+    // 守护子进程是否在本监督进程内崩溃过：崩溃的守护来不及执行退出回滚，
+    // 之后任何退出路径都必须补一次原厂恢复，不能带着模块的限制退出。
+    let mut crashed_child = false;
     for attempt in 0..=3 {
         if stop_requested(state) {
+            supervisor_restore_if_crashed(module, crashed_child)?;
             finish_requested_stop(state)?;
             return Ok(());
         }
@@ -125,6 +147,7 @@ pub fn supervise(module: &Path) -> Result<()> {
                 logger.error(&last_error);
                 record_failure(state, "执行 ELF", &last_error, true)?;
                 if attempt < 3 && wait_retry_or_stop(state, attempt + 1) {
+                    supervisor_restore_if_crashed(module, crashed_child)?;
                     finish_requested_stop(state)?;
                     return Ok(());
                 }
@@ -132,11 +155,16 @@ pub fn supervise(module: &Path) -> Result<()> {
             }
         };
         let exit = wait_child(&mut child, module, state)?;
+        if !exit.success() {
+            crashed_child = true;
+        }
         if module.join("disable").exists() {
+            supervisor_restore_if_crashed(module, crashed_child)?;
             return Err("启动保护已停用模块，本次不再重试".into());
         }
         if stop_requested(state) {
             logger.info("收到停止标记，取消守护重启");
+            supervisor_restore_if_crashed(module, crashed_child)?;
             finish_requested_stop(state)?;
             return Ok(());
         }
@@ -148,6 +176,7 @@ pub fn supervise(module: &Path) -> Result<()> {
         logger.error(&last_error);
         record_failure(state, "进程退出", &last_error, true)?;
         if attempt < 3 && wait_retry_or_stop(state, attempt + 1) {
+            supervisor_restore_if_crashed(module, crashed_child)?;
             finish_requested_stop(state)?;
             return Ok(());
         }
@@ -200,6 +229,21 @@ fn wait_retry_or_stop(state: &Path, retry: usize) -> bool {
         util::sleep(Duration::from_millis(100));
     }
     stop_requested(state)
+}
+
+/// 崩溃过的守护无法自行回滚节点：监督进程按所有权退出前恢复原厂值。
+/// 恢复失败时写入 last_error，让 WebUI 诊断能看到具体原因。
+fn supervisor_restore_if_crashed(module: &Path, crashed: bool) -> Result<()> {
+    if !crashed {
+        return Ok(());
+    }
+    match daemon::restore_after_supervisor_crash(module) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = record_failure(Path::new(STATE_DIR), "停止前恢复", &error, true);
+            Err(error)
+        }
+    }
 }
 pub fn record_failure(state: &Path, stage: &str, error: &str, preserve: bool) -> Result<()> {
     let old = if preserve {
@@ -279,18 +323,32 @@ pub fn request_webui_start(module: &Path) -> Result<&'static str> {
     let state = Path::new(STATE_DIR);
     util::create_dir(state)?;
     let _lock = util::acquire_flock(&crate::storage::path(&state, "webui-start.lock"))?;
-    let phase = util::read_trimmed(crate::storage::path(&state, "startup")).unwrap_or_default();
-    if phase == "state=failed" || phase == "state=stopped" || stop_requested(state) {
-        return Ok("服务已停止或启动失败；点状态卡读取诊断，可使用「启动服务」重试");
+    // 短暂持有 control.lock：停止/恢复/卸载期间不抢启动，同时关闭
+    // “检查锁之后、service.sh 启动之前”与 stop 竞争的窗口。函数返回即
+    // 释放，随后 service.sh 里的 start 才会申请同一把锁。
+    let _control = match util::acquire_flock(&crate::storage::path(&state, "control.lock")) {
+        Ok(lock) => lock,
+        Err(_) => return Ok("模块正在停止或恢复，页面稍后自动重连"),
+    };
+    if stop_requested(state) {
+        return Ok("正在执行停止操作，页面稍后自动重连");
     }
     if process_identity::lock_held(&crate::storage::path(&state, "daemon.lock"))?
         || process_identity::lock_held(&crate::storage::path(&state, "supervisor.lock"))?
-        || process_identity::lock_held(&crate::storage::path(&state, "control.lock"))?
-    { return Ok("服务正在启动，页面会自动重连"); }
+    {
+        return Ok("服务正在启动，页面会自动重连");
+    }
     let boot = util::read_trimmed("/proc/sys/kernel/random/boot_id")?;
     let ticket = crate::storage::path(&state, "webui-start.boot");
     if util::read_trimmed(&ticket).ok().as_deref() == Some(&boot) {
         return Ok("本次开机已尝试补启动；点状态卡读取诊断");
+    }
+    // state=failed 不再一票否决补启动：监督退出前已恢复节点，每开机
+    // 一次的受控重试不会造成无限崩溃循环；用户手动停止（stopped）仍
+    // 保持不自动拉起。
+    let phase = util::read_trimmed(crate::storage::path(&state, "startup")).unwrap_or_default();
+    if phase == "state=stopped" {
+        return Ok("服务已手动停止；点状态卡读取诊断，可使用「启动服务」重试");
     }
     let log = OpenOptions::new().create(true).append(true)
         .open(module.join("boot-entry.log")).map_err(|e| e.to_string())?;

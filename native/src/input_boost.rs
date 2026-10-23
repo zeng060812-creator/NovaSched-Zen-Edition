@@ -250,10 +250,14 @@ impl Pulse {
         {
             *self = Self::default();
         }
-        let baseline = if state.top_app_min.is_empty() {
-            stock
-        } else {
+        // 脉冲过期的回落目标：NovaFAS 加压值优先（引擎仍在加压时脉冲不能
+        // 把 uclamp 打回基线），否则是调度器基线，最后是快照原值。
+        let baseline = if !state.fas_min.is_empty() {
+            &state.fas_min
+        } else if !state.top_app_min.is_empty() {
             &state.top_app_min
+        } else {
+            stock
         };
         if activity && state.active && !state.boost_min.is_empty() {
             let target = if percent(baseline)? >= percent(&state.boost_min)? {
@@ -282,6 +286,7 @@ mod tests {
             active: true,
             boost_min: "30".into(),
             top_app_min: "15".into(),
+            fas_min: String::new(),
             duration_ms: 300,
         }
     }
@@ -322,6 +327,22 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn expired_pulse_returns_to_fas_boost_before_dispatcher_baseline() {
+        let now = Instant::now();
+        let mut pulse = Pulse::default();
+        let mut state = state();
+        // NovaFAS 加压 36 高于脉冲上限 30：按下沿直接保持 36，不写脉冲。
+        state.fas_min = "36".into();
+        assert_eq!(pulse.update(&state, now, true, "36", "0"), None);
+        // 引擎回落清空 fas_min 后，脉冲到期回到调度器基线 15。
+        state.fas_min.clear();
+        assert_eq!(
+            pulse.update(&state, now + Duration::from_millis(301), false, "36", "0"),
+            Some("15".into())
+        );
+    }
+
     #[test]
     fn volume_keys_and_sync_events_do_not_trigger_touch_boost() {
         let event = |kind: u16, code: u16, value: i32| {

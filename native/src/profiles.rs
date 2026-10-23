@@ -32,12 +32,15 @@ const STOCK_FINGERPRINTS: &[u64] = &[
     0xd3de93288e9bcb84, // SM8450.json
     0x7fcfa826a938a6c5, // SM8475.json
     0x83677585e49a2724, // SM8550.json
-    0xfa7b44c30bb7d18e, // SM8650.json
+    0xfa7b44c30bb7d18e, // SM8650.json (v2.11.1/v2.11.2)
     0xf0be4e5dedd1677c, // SM8750.json
     0x8a62bd7a8c1ed952, // SM8845.json
     0x0c31b8cd5dc633f5, // SM8850.json
     0x456392a0971691cd, // XRING_O3.json
     0x0c33949cfb137311, // XRING_O3.json (v2.11.1)
+    // v2.12.0 / 392 SM8650 日用重调（省电档小核上限 60%→66%，附 gpu_devfreq
+    // 候选包，默认停用）。其余处理器模板内容与 v2.11.2 一致。
+    0xfaaa52a2740901c0, // SM8650.json
     // Current schema-2 defaults.
     0x0a54bd0af41800f6,0xc75ef8e9e069bed6,0x6401b330f5ea6fa5,0x9b85f833053fee13,0xc2617dcfd60f3372,0xf1707125ea2a1933,0xe1d863d1e4e5cc37,0x19bba46aa364a9fd,0xe2d7accce3dd4fa8,0xda9e3b2b3c4a74cc,
     // v2.11.0 新增：SM8845（骁龙 8 Gen 5）、MT6989（天玑 9300+ 极限性能策略）
@@ -501,6 +504,26 @@ mod tests {
         assert!(!crate::storage::path(&state, "config.default.json").exists());
         fs::remove_dir_all(state).unwrap();
     }
+
+    #[test]
+    fn corrupt_quarantine_keeps_only_the_latest_copy() {
+        let state = state();
+        util::create_dir(&state).unwrap();
+        for name in ["config.corrupt-100.json", "config.corrupt-200.json"] {
+            fs::write(crate::storage::path(&state, name), "broken").unwrap();
+        }
+        let keep = crate::storage::path(&state, "config.corrupt-300.json");
+        fs::write(&keep, "broken").unwrap();
+        prune_old_quarantines(&keep).unwrap();
+        assert!(keep.exists());
+        assert!(!crate::storage::path(&state, "config.corrupt-100.json").exists());
+        assert!(!crate::storage::path(&state, "config.corrupt-200.json").exists());
+        // 正常配置与回滚副本不受清理影响。
+        fs::write(crate::storage::path(&state, "config.json"), "{}").unwrap();
+        prune_old_quarantines(&keep).unwrap();
+        assert!(crate::storage::path(&state, "config.json").exists());
+        fs::remove_dir_all(state).unwrap();
+    }
 }
 fn restore(path: &Path, previous: &Option<String>) -> Result<()> {
     match previous {
@@ -531,6 +554,7 @@ pub fn recover_corrupt(module: &Path, hardware: &Hardware, state: &Path) -> Resu
     let quarantine = crate::storage::path(state, &stamp);
     fs::rename(&path, &quarantine)
         .map_err(|e| format!("隔离损坏配置失败: {e}"))?;
+    prune_old_quarantines(&quarantine)?;
     if let Some(backup) = read_optional(&crate::storage::path(state, "config.previous.json"))? {
         if Config::from_text(&backup).is_ok() {
             util::atomic_write(&path, backup.as_bytes(), 0o600)?;
@@ -539,6 +563,28 @@ pub fn recover_corrupt(module: &Path, hardware: &Hardware, state: &Path) -> Resu
     // 让标准初始化决定后续：有效备份触发迁移，无备份则从模板重建。
     initialize(module, hardware, state)?;
     Ok(true)
+}
+
+/// 损坏隔离文件只保留最新一份：反复“损坏→自愈”不能让配置目录越积越多。
+/// 旧文件的内容已无法被 Config 解析，保留多份没有诊断价值。
+fn prune_old_quarantines(keep: &Path) -> Result<()> {
+    let dir = keep.parent().ok_or_else(|| "隔离目录无效".to_string())?;
+    let mut stale = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("config.corrupt-")
+            && name.ends_with(".json")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+            && entry.path() != keep
+        {
+            stale.push(entry.path());
+        }
+    }
+    for path in stale {
+        util::remove_if_exists(&path)?;
+    }
+    Ok(())
 }
 pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<String> {
     let source = module.join("config").join(hardware.soc.file());
@@ -619,8 +665,18 @@ pub fn initialize(module: &Path, hardware: &Hardware, state: &Path) -> Result<St
     };
     if !replace {
         let old = current_root.as_ref().ok_or("保留配置不存在")?;
+        // 模板携带的 gpu_devfreq 候选块随迁移注入（开关保持关闭）；
+        // 模板没有该块的处理器不做任何注入。
+        let gpu_template = json::parse(&template)
+            .ok()
+            .and_then(|root| {
+                root.get("features")
+                    .and_then(|features| features.get("gpu_devfreq"))
+                    .ok()
+                    .cloned()
+            });
         let merged =
-            crate::config_v2::migrate(old, parsed.as_ref().ok_or("配置不存在")?, hardware.soc)?;
+            crate::config_v2::migrate(old, parsed.as_ref().ok_or("配置不存在")?, hardware.soc, gpu_template)?;
         let rendered = json::stringify(&merged)?;
         let mut retained = Config::from_text(&rendered)
             .map_err(|error| format!("迁移后的配置校验失败: {error}；原文件已保留"))?;

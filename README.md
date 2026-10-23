@@ -1,14 +1,14 @@
-# NovaSched Zen Edition v2.11.1
+# NovaSched Zen Edition v2.12.0
 
 作者：**ZenJooo**。Android arm64 root 模块，提供四档 CPU 策略、应用规则、自动调度、NovaFAS 与 iOS 液态玻璃风格的 WebUI。
 
 ## 安装
 
-在 Magisk / Alpha、KernelSU 及其兼容分支、APatch 管理器中刷入 `NovaSched-v2.11.1-release.zip`，然后重启。兼容性根据实际执行与命令能力判断，不使用管理器名称或版本白名单。首次解锁稳定等待 30 秒后启动服务。
+在 Magisk / Alpha、KernelSU 及其兼容分支、APatch 管理器中刷入 `NovaSched-v2.12.0-release.zip`，然后重启。兼容性根据实际执行与命令能力判断，不使用管理器名称或版本白名单。首次解锁后按有界门控等待稳定再启动服务；解锁确认异常时放弃本次自启并保留诊断，WebUI 打开会显示具体原因并可补启动。
 
 升级保留配置、应用规则与自动调度偏好。旧服务仍在运行时，目录迁移推迟到重启后；重复文件会保留并报告，避免覆盖用户数据。
 
-处理器模板：SM8450、SM8475、SM8550、SM8650、SM8750、SM8850、SM8845（骁龙 8 Gen 5）、天玑 8350 / 8400 / 9300+（极限性能策略）/ 9400+、玄戒 O3。型号和拓扑均需符合准入规则，共享平台码不能单独证明型号。三星使用已有的保守策略。骁龙 8 Gen 5 与天玑 9300+ 默认启用 GPU devfreq 档位（节点缺失时仅告警降级，不影响 CPU 调度）。
+处理器模板：SM8450、SM8475、SM8550、SM8650、SM8750、SM8850、SM8845（骁龙 8 Gen 5）、天玑 8350 / 8400 / 9300+（极限性能策略）/ 9400+、玄戒 O3。型号和拓扑均需符合准入规则，共享平台码不能单独证明型号。三星使用已有的保守策略。骁龙 8 Gen 5 与天玑 9300+ 默认启用 GPU devfreq 档位（节点缺失时仅告警降级，不影响 CPU 调度）；SM8650 携带默认停用的 GPU 候选包，验证状态与数据来源见[处理器适配表](docs/processor-adaptation.md)。
 
 O3 安装修复：v2.11.2 支持检测 CPU8、CPU9，并从内核读取十核设备的实际 policy。优先按 CPU capacity 映射，缺少该接口时会在安装记录中注明回退。旧八核参考配置保留兼容，不代表已完成所有 O3 固件的实机调优。
 
@@ -56,6 +56,6 @@ bash scripts/validate.sh
 CARGO=/path/to/cargo ANDROID_NDK_HOME=/path/to/android-ndk-r27d bash scripts/build.sh
 ```
 
-`dist/` 输出刷入包、单目录源码包及 SHA256 文件。源码包不包含目标文件、依赖目录、历史测试报告和设备运行数据。验证范围见 [docs/validation.md](docs/validation.md)。
+`dist/` 输出刷入包、单目录源码包及 SHA256 文件。源码包不包含目标文件、依赖目录、历史测试报告和设备运行数据。验证范围见 [docs/validation.md](docs/validation.md)，本次修订的审计结论与未验证问题见 [docs/v2.12.0-report.md](docs/v2.12.0-report.md)，SM8650 专项调整与对比测试见 [docs/sm8650-ab-test.md](docs/sm8650-ab-test.md)。
 
 核心许可 GPL-3.0-only；界面玻璃折射公式与 Apache-2.0 署名见 NOTICE 和随包许可文件。

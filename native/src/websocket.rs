@@ -273,6 +273,7 @@ pub fn start(
                     Ok((stream, _)) => {
                         if clients.load(Ordering::Relaxed) >= 16 {
                             logger.warn("WebUI 连接达到 16 个上限");
+                            reject_busy(stream);
                             continue;
                         }
                         let client_state = state.clone();
@@ -324,6 +325,25 @@ pub fn start(
 
 fn bind_listener() -> Result<(TcpListener, u16)> {
     bind_listener_range(PORT_START, PORT_END)
+}
+
+/// 满员时给客户端一个明确的 503 再关闭：WebUI 能区分“服务忙”与“服务
+/// 离线”，重连提示不再指向错误原因。
+fn reject_busy(mut stream: std::net::TcpStream) {
+    let body = "novasched webui busy";
+    let _ = std::io::Write::write_all(
+        &mut stream,
+        format!(
+            "HTTP/1.1 503 Service Unavailable\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Connection: close\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .as_bytes(),
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn bind_listener_range(start: u16, end: u16) -> Result<(TcpListener, u16)> {

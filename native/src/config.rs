@@ -7,7 +7,7 @@ use crate::util::{self, Result};
 pub const MODES: [&str; 4] = ["powersave", "balance", "performance", "fast"];
 /// Profile generation, independent of the UI version. Bump when defaults change
 /// so unedited configurations update while custom tuning migrates in place.
-pub const PROFILE_VERSION: i64 = 391;
+pub const PROFILE_VERSION: i64 = 392;
 pub const MAX_CPU_COUNT: usize = 64;
 
 #[derive(Clone, Debug)]

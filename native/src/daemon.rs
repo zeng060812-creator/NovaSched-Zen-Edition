@@ -732,26 +732,40 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         // NovaFAS 共享上下文：档位、前台包、可写状态与档位频率底线每轮同步。
         {
             let allowed = !scene.controls_locked();
-            // 待确认的频率上限（pending）不阻塞引擎：FAS 只抬最低频率，且
-            // 以内核当前实际接受的最高频率为顶，天然落在已生效的包络内。
-            // 之前把 pending 也算进就绪条件，厂商服务钳制上限的设备上引擎
-            // 会永远待命，WebUI 看到的就是“接管了却一动不动”。
+            // 待命原因随状态一起发布，WebUI 能解释“引擎为什么没在调度”。
+            let blocked: &'static str = if !allowed {
+                "外部调度器接管中，NovaFAS 已让位"
+            } else if !last_apply_error.is_empty() {
+                "调度下发未恢复，NovaFAS 暂停加压"
+            } else if current_extreme_power {
+                // 极限省电优先级高于 FAS：直接暂停引擎而不是在钳制后的
+                // 包络内继续抬底频；关闭极限省电后本字段清空，引擎自动
+                // 恢复，无需重启。
+                "极限省电已启用，NovaFAS 暂停动态加压；关闭后自动恢复"
+            } else {
+                ""
+            };
             // 桌面/系统界面不算可调度前台：待机停在桌面上时 FAS 不保持
             // 任何加压与底频，把待机功耗交给内核 idle。
             let idle_surface = is_idle_surface(scheduler.current_package());
-            let ready = allowed && last_apply_error.is_empty() && !idle_surface;
+            let ready = allowed
+                && last_apply_error.is_empty()
+                && !current_extreme_power
+                && !idle_surface;
             let floors = scheduler.profile_min_floors();
             if let Ok(mut state) = fas_shared.lock() {
                 if state.mode != scheduler.current_mode()
                     || state.package != scheduler.current_package()
                     || state.allowed != allowed
                     || state.ready != ready
+                    || state.blocked != blocked
                     || state.min_floor != floors
                 {
                     state.mode = scheduler.current_mode().to_string();
                     state.package = scheduler.current_package().to_string();
                     state.allowed = allowed;
                     state.ready = ready;
+                    state.blocked = blocked;
                     state.min_floor = floors;
                 }
             }
@@ -887,11 +901,13 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         if let Err(error) = boot_guard.finish_cleanly() {
             logger.error(format!("保存正常停止记录失败: {error}"));
         }
-        if let Err(error) =
-            util::atomic_write(&crate::storage::path(&state_dir, "startup"), b"state=stopped\n", 0o600)
-        {
-            logger.error(error);
-        }
+    }
+    // 进程退出后 startup 必须反映真实状态：回滚失败已记录在 last_error，
+    // 但状态文件不能再声称 running，否则 WebUI 的诊断指引会指向错误阶段。
+    if let Err(error) =
+        util::atomic_write(&crate::storage::path(&state_dir, "startup"), b"state=stopped\n", 0o600)
+    {
+        logger.error(error);
     }
     drop(cleanup);
     restore.map(|_| ())

@@ -20,7 +20,7 @@ const CEILINGS = {
   SM8450:            [[54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]],
   SM8475:            [[54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]],
   SM8550:            [[54, 46, 46, 0],  [60, 54, 54, 0],  [84, 82, 82, 0],  [92, 98, 100, 0]],
-  SM8650:            [[60, 45, 49, 45], [70, 58, 56, 59], [85, 84, 85, 82], [95, 100, 100, 100]],
+  SM8650:            [[66, 45, 49, 45], [70, 58, 56, 59], [85, 84, 85, 82], [95, 100, 100, 100]],
   SM8750:            [[52, 46, 0, 0],   [58, 50, 0, 0],   [80, 72, 0, 0],   [90, 100, 0, 0]],
   SM8850:            [[52, 46, 0, 0],   [58, 50, 0, 0],   [80, 70, 0, 0],   [90, 100, 0, 0]],
   /* SM8845（骁龙 8 Gen 5，一加 PLR110 真机：6+2 Oryon）：两簇差异更收敛。 */
@@ -72,13 +72,17 @@ const INPUT_BOOST_OVERRIDES = {
 const CPUCTL_OVERRIDES = {
   MT6989: { powersave: { background_max: "60" }, balance: { background_max: "72" } },
 };
-/* GPU devfreq 档位（百分比，0 = 物理端点不限）；仅新适配处理器默认启用。 */
+/* GPU devfreq 档位（百分比，0 = 物理端点不限）。默认启用的仅限已真机
+ * 确认节点存在的处理器；SM8650 携带停用的候选包（待真机 A/B 验证）。 */
 const GPU_DEVFREQ = {
   SM8845: { powersave: { min: 0, max: 55 }, balance: { min: 0, max: 80 },
             performance: { min: 0, max: 100 }, fast: { min: 0, max: 100 } },
   MT6989: { powersave: { min: 0, max: 55 }, balance: { min: 0, max: 80 },
             performance: { min: 0, max: 100 }, fast: { min: 25, max: 100 } },
+  SM8650: { powersave: { min: 0, max: 70 }, balance: { min: 0, max: 80 },
+            performance: { min: 0, max: 90 }, fast: { min: 0, max: 0 } },
 };
+const GPU_DEVFREQ_ENABLED = new Set(["SM8845", "MT6989"]);
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const slots = (policies, value) => policies.map((policy) => (policy >= 0 ? value : "0"));
@@ -130,11 +134,11 @@ function profile(soc, policies) {
     perf_lock: { enabled: false, services: [] },
     fas: { enabled: true, override_scene: true, step_ms: "200", sample_ms: "1000", modes: fasModes },
   };
-  if (GPU_DEVFREQ[soc]) features.gpu_devfreq = { enabled: true, modes: clone(GPU_DEVFREQ[soc]) };
+  if (GPU_DEVFREQ[soc]) features.gpu_devfreq = { enabled: GPU_DEVFREQ_ENABLED.has(soc), modes: clone(GPU_DEVFREQ[soc]) };
   if (soc === "XRING_O3") Object.assign(features.cpuset, { top_app: "0-9", foreground: "0-9", restricted: "4-7", system_background: "4-7", background: "4-5" });
   return {
     schema: "novasched/2", module: "NovaSched_Zen_Edition",
-    meta: { name: "NovaSched Zen Edition", author: "ZenJooo", version: 391, soc, loglevel: "INFO" },
+    meta: { name: "NovaSched Zen Edition", author: "ZenJooo", version: 392, soc, loglevel: "INFO" },
     policies,
     features,
     modes,

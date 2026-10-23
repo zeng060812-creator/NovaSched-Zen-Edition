@@ -59,6 +59,9 @@ pub struct FasShared {
     pub ready: bool,
     /// 当前档位各簇最低频率（内核适配后的 kHz 字符串），未启用簇为空。
     pub min_floor: Vec<String>,
+    /// 引擎待命的具体原因（空串 = 无）：极限省电、下发失败、外部调度器
+    /// 接管等。供 WebUI 与日志解释“为什么引擎没在调度”。
+    pub blocked: &'static str,
 }
 
 pub struct EngineCtx {
@@ -165,12 +168,22 @@ pub struct Controller {
     stable_fps: f32,
     bad_streak: u32,
     calm: u32,
+    /// 连续低于基线的采样数。持续不足时缓慢下调基线，防止引擎启用瞬间
+    /// 抓到高刷过场（如 120fps 开屏动画）当目标后，进入永远“低于基线”
+    /// →永远加压、永不回落的死锁。
+    slowed_streak: u32,
 }
 
 const BOOST_STEP: u32 = 12;
 const DECAY_STEP: u32 = 4;
 const BAD_STREAK_TRIGGER: u32 = 2;
 const CALM_DECAY_TICKS: u32 = 5;
+/// 连续低于基线达到该采样数（默认采样周期下约 10 秒）才判定“目标本来就
+/// 更低”，开始把基线缓慢拉回实际帧率；短暂抖动不会触发，加压行为不变。
+const SUSTAINED_SLOW_TICKS: u32 = 10;
+/// 基线下调的每采样权重：从 120 收敛到 60 需要约 30 个采样，期间瞬态
+/// 掉帧仍正常加压。
+const REBASE_WEIGHT: f32 = 0.1;
 
 impl Controller {
     pub fn reset(&mut self) {
@@ -205,12 +218,25 @@ impl Controller {
         if dropping || slowed {
             self.bad_streak += 1;
             self.calm = 0;
+            if slowed {
+                self.slowed_streak += 1;
+                // 持续达不到基线说明基线本身错了（开局抓到高刷过场、游戏
+                // 中途切换帧率目标），缓慢把基线拉回实际帧率，让回落路径
+                // 重新可用；短暂抖动达不到阈值，不影响加压。
+                if self.slowed_streak >= SUSTAINED_SLOW_TICKS {
+                    self.stable_fps = self.stable_fps * (1.0 - REBASE_WEIGHT)
+                        + sample.fps * REBASE_WEIGHT;
+                }
+            } else {
+                self.slowed_streak = 0;
+            }
             if dropping || self.bad_streak >= BAD_STREAK_TRIGGER {
                 self.boost = (self.boost + BOOST_STEP).min(ceiling);
                 self.bad_streak = 0;
             }
         } else {
             self.bad_streak = 0;
+            self.slowed_streak = 0;
             self.calm += 1;
             if self.boost == 0 {
                 // 未加压时的帧率就是真实基线，向新值缓慢收敛。
@@ -317,6 +343,11 @@ const NO_SIGNAL_RELEASE_TICKS: u32 = 25;
 /// 加压 > 0 而帧/负载信号停更超过此时长：按 2 倍速率受控泄压，加压值
 /// 绝不悬挂在高位。
 const STALE_BOOST_AFTER: Duration = Duration::from_secs(8);
+/// 信号源确认失效后的低频探测周期：降级待命期间按此节奏尝试恢复采样，
+/// 不再按采样周期持续 fork dumpsys——省电调度不能自己制造负载。
+const SIGNAL_DEAD_REPROBE: Duration = Duration::from_secs(10);
+/// fas-rs 进程扫描的缓存周期：override_scene 关闭时用它判断是否需要让位。
+const FOREIGN_FAS_SCAN: Duration = Duration::from_secs(1);
 /// boost 不变时按去重跳过节点写入；每 25 拍（默认步长下约 5 秒）强制
 /// 校验一轮，恢复被调度器 force apply 覆盖的底频与 uclamp。
 const REASSERT_TICKS: u32 = 25;
@@ -415,6 +446,15 @@ struct SceneOverride {
 impl SceneOverride {
     fn refresh(&mut self, wanted: bool, logger: &Logger) {
         if !self.enabled {
+            // 运行中关闭接管（override_scene=false）时必须立即恢复被暂停的
+            // fas-rs；旧实现提前 return，冻结的进程要等引擎线程退出才解冻。
+            if !self.suspended.is_empty() {
+                for pid in &self.suspended {
+                    unsafe { crate::ffi::kill(*pid, SIGCONT) };
+                }
+                logger.info("NovaFAS 已恢复 fas-rs 进程运行（帧信号接管已关闭）");
+                self.suspended.clear();
+            }
             return;
         }
         if wanted {
@@ -499,6 +539,8 @@ fn run(ctx: EngineCtx) {
     // 底频写回档位基线，而 boost 未变时本引擎按去重逻辑不重写。每
     // REASSERT_TICKS 拍强制校验一轮节点，堵住这个被覆盖后不自愈的窗口。
     let mut reassert: u32 = 0;
+    let mut foreign_scan_at = Instant::now() - FOREIGN_FAS_SCAN;
+    let mut foreign_fas = false;
     loop {
         // 每拍递增：WebUI 看到它变化即证明引擎线程活着，即使帧率与
         // 加压值都稳定不动。
@@ -539,15 +581,40 @@ fn run(ctx: EngineCtx) {
             }
         }
         let mode_cfg = cfg.modes.get(&shared.mode).cloned();
+        // 接管开关关闭而 Scene fas-rs 仍在运行：它才是帧感知调度器，本引擎
+        // 必须让位，避免两个调度器争抢同一批 uclamp/最低频率节点。
+        if !cfg.override_scene && Instant::now() >= foreign_scan_at {
+            foreign_scan_at = Instant::now() + FOREIGN_FAS_SCAN;
+            foreign_fas = !crate::fas::running_pids().is_empty();
+        }
+        let foreign_active = !cfg.override_scene && foreign_fas;
         let want_active = shared.allowed
             && shared.ready
             && !shared.package.is_empty()
             && crate::config::MODES.contains(&shared.mode.as_str())
-            && mode_cfg.as_ref().is_some_and(|mode| mode.ceiling > 0);
+            && mode_cfg.as_ref().is_some_and(|mode| mode.ceiling > 0)
+            && !foreign_active;
         if !cfg.enabled || !want_active {
             // 外部调度器接管（!shared.allowed）时节点已不归本模块管理：
             // 跳过恢复写，避免覆盖对方刚设置的值。
-            release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status, shared.allowed);
+            let reason = if !shared.allowed {
+                "外部调度器接管中，NovaFAS 已让位"
+            } else if foreign_active {
+                "Scene fas-rs 正在运行且未开启接管，NovaFAS 待命避免双调度"
+            } else if !shared.blocked.is_empty() {
+                shared.blocked
+            } else {
+                "NovaFAS 当前未执行调度"
+            };
+            release(
+                &ctx,
+                &mut controller,
+                &mut clusters,
+                &mut scene,
+                &mut status,
+                shared.allowed,
+                reason,
+            );
             publish(&ctx.status, &status);
             std::thread::sleep(Duration::from_millis(cfg.step_ms.max(300)));
             continue;
@@ -555,6 +622,13 @@ fn run(ctx: EngineCtx) {
         let mode_cfg = mode_cfg.unwrap_or(FasMode::default());
         // 已确认无任何信号源时保持 fas-rs 运行，不再空占接管位。
         scene.refresh(!signal_dead, &ctx.logger);
+        if signal_dead && last_sample.elapsed() < SIGNAL_DEAD_REPROBE {
+            // 降级待命：低频探测恢复（约 10 秒一次），不按采样周期持续
+            // fork dumpsys；恢复信号后正常采样路径会清掉 signal_dead。
+            publish(&ctx.status, &status);
+            std::thread::sleep(Duration::from_millis(cfg.step_ms.max(500)));
+            continue;
+        }
         stats.ensure_enabled(&ctx.logger);
 
         // 采样时钟：帧信号按 sample_ms 周期；无帧信号时每 tick 用 GPU 负载。
@@ -638,7 +712,15 @@ fn run(ctx: EngineCtx) {
         if no_signal >= NO_SIGNAL_RELEASE_TICKS {
             no_signal = 0;
             signal_dead = true;
-            release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status, shared.allowed);
+            release(
+                &ctx,
+                &mut controller,
+                &mut clusters,
+                &mut scene,
+                &mut status,
+                shared.allowed,
+                "NovaFAS 当前未执行调度",
+            );
             status.state = "degraded";
             status.reason = "连续采样无有效帧或负载信号，已释放 NovaFAS 加压并回退到当前档位";
             publish(&ctx.status, &status);
@@ -669,7 +751,15 @@ fn run(ctx: EngineCtx) {
         publish(&ctx.status, &status);
         std::thread::sleep(Duration::from_millis(cfg.step_ms));
     }
-    release(&ctx, &mut controller, &mut clusters, &mut scene, &mut status, true);
+    release(
+        &ctx,
+        &mut controller,
+        &mut clusters,
+        &mut scene,
+        &mut status,
+        true,
+        "NovaFAS 已停止，节点与 fas-rs 状态已恢复",
+    );
     stats.disable();
 }
 
@@ -680,6 +770,7 @@ fn release(
     scene: &mut SceneOverride,
     status: &mut EngineStatus,
     restore_nodes: bool,
+    idle_reason: &'static str,
 ) {
     scene.refresh(false, &ctx.logger);
     if restore_nodes && (status.state == "active" || controller.boost > 0) {
@@ -695,7 +786,7 @@ fn release(
         "off"
     };
     status.source = "none";
-    status.reason = "NovaFAS 当前未执行调度";
+    status.reason = idle_reason;
     status.fps = 0.0;
     status.gpu = 0.0;
     status.boost = 0;
@@ -733,11 +824,23 @@ fn restore_uclamp_baseline(ctx: &EngineCtx) {
     if !node.exists() {
         return;
     }
-    let Ok(state) = ctx.live.inner.lock() else { return };
-    if state.top_app_min.is_empty() {
-        return;
-    }
-    let _ = ctx.snapshot.write(&node, state.top_app_min.trim());
+    let baseline = {
+        let Ok(mut state) = ctx.live.inner.lock() else { return };
+        // 引擎释放后不再拥有该节点：清掉自己的加压值，恢复调度器基线；
+        // 基线为空（档位/规则都未设置 floor）时回落到快照原值。
+        state.fas_min.clear();
+        if state.top_app_min.trim().is_empty() {
+            ctx.snapshot
+                .original_value(&node)
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "0".into())
+        } else {
+            state.top_app_min.trim().to_string()
+        }
+    };
+    let _ = ctx.snapshot.write(&node, baseline.trim());
 }
 
 /// 把控制器 boost 映射为节点写入：top-app uclamp.min 与各簇最低频率。
@@ -770,11 +873,22 @@ fn apply_targets(
                 }
             }
         }
+        // 所有权分离：top_app_min 归调度器（档位/应用规则基线），fas_min 归
+        // 本引擎。boost==0 时恢复基线而不是写 0；基线高于加压目标时保持
+        // 基线（规则地板不允许被引擎降挡）。
+        let baseline = ctx
+            .live
+            .inner
+            .lock()
+            .map(|state| state.top_app_min.clone())
+            .unwrap_or_default();
+        let (write_value, next_fas_min) =
+            resolve_uclamp_write(baseline.trim(), uclamp_target, &bounded);
         if let Ok(mut state) = ctx.live.inner.lock() {
-            state.top_app_min = bounded.clone();
+            state.fas_min = next_fas_min;
         }
-        if util::read_trimmed(&node).ok().as_deref() != Some(bounded.as_str()) {
-            if let Err(error) = ctx.snapshot.write(&node, &bounded) {
+        if util::read_trimmed(&node).ok().as_deref() != Some(write_value.as_str()) {
+            if let Err(error) = ctx.snapshot.write(&node, &write_value) {
                 ctx.logger.debug(format!("NovaFAS uclamp 写入失败: {error}"));
             }
         }
@@ -865,6 +979,29 @@ fn policy_base(policy: i32) -> Option<PathBuf> {
     Some(PathBuf::from(format!(
         "/sys/devices/system/cpu/cpufreq/policy{policy}"
     )))
+}
+
+/// 计算 top-app uclamp.min 本拍应写入的值与引擎的 fas_min 状态。
+/// 返回 (节点写入值, 新 fas_min)：
+/// - 加压为 0：恢复调度器基线（无基线写 0），fas_min 清空；
+/// - 基线高于加压目标：保持基线，fas_min 清空（引擎此时不拥有节点）；
+/// - 其余：写入加压目标，fas_min 记录之（输入加速脉冲到期回到该值）。
+fn resolve_uclamp_write(baseline: &str, uclamp_target: u32, bounded: &str) -> (String, String) {
+    if uclamp_target == 0 {
+        let restore = if baseline.trim().is_empty() {
+            "0".to_string()
+        } else {
+            baseline.trim().to_string()
+        };
+        return (restore, String::new());
+    }
+    let baseline_pct = parse_percent(baseline).unwrap_or(0);
+    let target_pct = parse_percent(bounded).unwrap_or(uclamp_target);
+    if baseline_pct > target_pct {
+        (baseline.trim().to_string(), String::new())
+    } else {
+        (bounded.to_string(), bounded.to_string())
+    }
 }
 
 /// cgroup 返回的百分比可能是 "30"、"30.00" 或 "max"。
@@ -1066,6 +1203,45 @@ mod tests {
         assert_eq!(controller.boost, 0);
         assert_eq!(controller.stable_fps, 0.0);
         assert_eq!(controller.calm, 0);
+    }
+
+    #[test]
+    fn sustained_shortfall_rebaselines_and_transient_dips_do_not() {
+        // 开局抓到 120fps 高刷过场后游戏锁定 60：持续不足必须把基线拉回
+        // 实际帧率，让回落路径重新可用，而不是永久锁死在上限。
+        let mut controller = Controller::default();
+        assert_eq!(controller.on_frame(80, sample(120.0, 0.0)), 0);
+        let mut boost = 0;
+        for _ in 0..200 {
+            boost = controller.on_frame(80, sample(60.0, 0.0));
+        }
+        assert_eq!(boost, 0, "基线必须重新收敛到 60fps，加压完全回落");
+        // 短暂抖动（<10 个采样）不改变基线：恢复 60fps 基线后，几次低于
+        // 基线的抖动仍按原节奏加压。
+        assert_eq!(controller.on_frame(80, sample(50.0, 0.0)), 0);
+        assert_eq!(controller.on_frame(80, sample(50.0, 0.0)), 12);
+    }
+
+    #[test]
+    fn uclamp_write_respects_ownership_and_never_lowers_a_baseline() {
+        // 加压归零：恢复调度器基线而不是写 0；基线为空回落 0。
+        assert_eq!(resolve_uclamp_write("40", 0, "0"), ("40".into(), "".into()));
+        assert_eq!(resolve_uclamp_write("", 0, "0"), ("0".into(), "".into()));
+        // 规则地板 40 高于本拍加压 24：保持地板，引擎不拥有节点。
+        assert_eq!(
+            resolve_uclamp_write("40", 24, "24"),
+            ("40".into(), "".into())
+        );
+        // 加压高于基线：写加压值并记录 fas_min，脉冲到期回到加压值。
+        assert_eq!(
+            resolve_uclamp_write("15", 36, "36"),
+            ("36".into(), "36".into())
+        );
+        // 基线允许带小数（cgroup 读回 "40.00"）。
+        assert_eq!(
+            resolve_uclamp_write("40.00", 24, "24"),
+            ("40.00".into(), "".into())
+        );
     }
 
     #[test]

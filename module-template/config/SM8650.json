@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 391,
+    "version": 392,
     "soc": "SM8650",
     "loglevel": "INFO"
   },
@@ -109,6 +109,27 @@
           "freq_scale": "80"
         }
       }
+    },
+    "gpu_devfreq": {
+      "enabled": false,
+      "modes": {
+        "powersave": {
+          "min": 0,
+          "max": 70
+        },
+        "balance": {
+          "min": 0,
+          "max": 80
+        },
+        "performance": {
+          "min": 0,
+          "max": 90
+        },
+        "fast": {
+          "min": 0,
+          "max": 0
+        }
+      }
     }
   },
   "modes": {
@@ -120,7 +141,7 @@
         "0%"
       ],
       "max": [
-        "60%",
+        "66%",
         "45%",
         "49%",
         "45%"
