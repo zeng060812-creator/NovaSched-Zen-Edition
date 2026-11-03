@@ -2775,7 +2775,7 @@ mod daemon_policy_tests {
         let state = fixture.scheduler.cpuctl_live.inner.lock().unwrap();
         assert_eq!(state.top_app_min, "12.34");
         assert_eq!(state.boost_min, "40");
-        assert_eq!(state.duration_ms, 220);
+        assert_eq!(state.duration_ms, 240);
         assert_eq!(util::read_trimmed(&path).unwrap(), "12.34");
     }
     #[test]
@@ -2807,7 +2807,7 @@ mod daemon_policy_tests {
         fs::write(&path, "12.34").unwrap();
         fixture.scheduler.snapshot.capture(&path).unwrap();
         assert_eq!(fixture.scheduler.input_boost_node(), path);
-        for (mode, value, duration) in [("powersave", "15", 100), ("balance", "20", 140), ("performance", "28", 180), ("fast", "40", 220)] {
+        for (mode, value, duration) in [("powersave", "12", 90), ("balance", "20", 130), ("performance", "30", 180), ("fast", "40", 240)] {
             fixture.scheduler.apply_mode_cpuctl(mode, false).unwrap();
             let state = fixture.scheduler.cpuctl_live.inner.lock().unwrap();
             assert_eq!(state.top_app_min, "12.34");

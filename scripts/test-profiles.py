@@ -40,7 +40,11 @@ for path in sorted((root / "module-template/config").glob("*.json")):
             else:
                 assert floor <= 10, "A permanent high floor wastes idle power"
             limits.append(ceiling)
-            assert profile["governors"][slot] == ("walt" if path.stem.startswith("SM") else "schedutil")
+            # 骁龙 = walt；天玑 9500 用 OEM 的 sugov_ext（实测默认，缺失时运行时
+            # 回退）；其余 MTK/玄戒 = schedutil。
+            expected = "walt" if path.stem.startswith("SM") else (
+                "sugov_ext" if path.stem == "DIMENSITY9500" else "schedutil")
+            assert profile["governors"][slot] == expected
         if policy >= 0:
             if extreme:
                 assert all(a <= b for a, b in zip(limits, limits[1:])), limits

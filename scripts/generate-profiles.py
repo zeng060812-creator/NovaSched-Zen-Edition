@@ -32,7 +32,12 @@ CEILINGS = {
     'SM8450':            ([54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]),
     'SM8475':            ([54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]),
     'SM8550':            ([54, 46, 46, 0],  [60, 54, 54, 0],  [84, 82, 82, 0],  [92, 98, 100, 0]),
-    'SM8650':            ([66, 45, 49, 45], [70, 58, 56, 59], [85, 84, 85, 82], [95, 100, 100, 100]),
+    # SM8650（K70 Pro / houji 真机 OPP 表定版，策略代际 393）：
+    # c0 A520×2 2.2656G / c2 A720×3 3.1488G(cap 923) / c5 A720×2 2.9568G(cap 867) /
+    # c7 X4 3.3024G(cap 1024)。省电档压 X4 到 31%（1.0176G，X4 低频能效差，
+    # 重活交给 A720）；均衡四簇 75/65/65/62 给日用留余量；性能 90/86/87/84
+    # 逼近但不到顶（留 boost 与温控余量）；极速四簇 100% 全开。
+    'SM8650':            ([66, 45, 44, 31], [75, 65, 65, 62], [90, 86, 87, 84], [100, 100, 100, 100]),
     'SM8750':            ([52, 46, 0, 0],   [58, 50, 0, 0],   [80, 72, 0, 0],   [90, 100, 0, 0]),
     'SM8850':            ([52, 46, 0, 0],   [58, 50, 0, 0],   [80, 70, 0, 0],   [90, 100, 0, 0]),
     # SM8845（骁龙 8 Gen 5，一加 PLR110 真机：6+2 Oryon，policy0=cpu0-5 /
@@ -92,13 +97,32 @@ FAS_MODE_OVERRIDES = {
         'performance': {'ceiling': '90', 'freq_scale': '75'},
         'fast': {'ceiling': '100', 'freq_scale': '90'},
     },
+    # SM8650（K70 Pro 真机定版）：四档语义分离——省电收紧引擎上限（少抬
+    # uclamp/底频），性能按 A720/X4 实际余量给 82/62，极速放开到 100/85
+    # （仍受档位 max 包络与原生温控约束）。
+    'SM8650': {
+        'powersave': {'ceiling': '25', 'freq_scale': '22'},
+        'performance': {'ceiling': '82', 'freq_scale': '62'},
+        'fast': {'ceiling': '100', 'freq_scale': '85'},
+    },
 }
 INPUT_BOOST_OVERRIDES = {
     'MT6989': {'fast': {'top_app_min': '50', 'duration_ms': '260'}},
+    # SM8650：省电档触摸脉冲更短更轻（90ms/12%），极速档 240ms/40%
+    # ——跟手性靠脉冲时长而不是常驻抬底频（40% 上限沿用模板约束）。
+    'SM8650': {
+        'powersave': {'top_app_min': '12', 'duration_ms': '90'},
+        'balance': {'top_app_min': '20', 'duration_ms': '130'},
+        'performance': {'top_app_min': '30', 'duration_ms': '180'},
+        'fast': {'top_app_min': '40', 'duration_ms': '240'},
+    },
 }
 CPUCTL_OVERRIDES = {
     'MT6989': {'powersave': {'background_max': '60'},
                'balance': {'background_max': '72'}},
+    # SM8650：省电档后台 uclamp.max 60（后台彻底不抢大核），均衡 70。
+    'SM8650': {'powersave': {'background_max': '60'},
+               'balance': {'background_max': '70'}},
 }
 # GPU devfreq 档位（百分比，0 = 物理端点不限）。按运行时检测到的 GPU OPP
 # 表 snap；节点缺失时守护仅告警降级，不影响 CPU 调度。默认启用的仅限已
@@ -178,7 +202,7 @@ def profile(soc, policies):
                                  restricted='4-7', system_background='4-7', background='4-5')
     return {
         'schema': 'novasched/2', 'module': 'NovaSched_Zen_Edition',
-        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 392,
+        'meta': {'name': 'NovaSched Zen Edition', 'author': 'ZenJooo', 'version': 393,
                  'soc': soc, 'loglevel': 'INFO'},
         'policies': policies,
         'features': features,

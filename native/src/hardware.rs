@@ -1435,8 +1435,8 @@ mod tests {
             .all(|p| p.clusters[1].governor == "schedutil"));
         assert_eq!(
             config.profile("powersave").expect("mode").clusters[1].max_freq,
-            // 共享 policy 的两簇取更紧的上限：min(45%,49%) = 45% × 3000000。
-            "1350000"
+            // 共享 policy 的两簇取更紧的上限：min(45%,44%) = 44% × 3000000。
+            "1320000"
         );
     }
     #[test]

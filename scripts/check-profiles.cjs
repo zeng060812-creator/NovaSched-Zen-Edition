@@ -22,7 +22,9 @@ const CEILINGS = {
   SM8450:            [[54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]],
   SM8475:            [[54, 46, 44, 0],  [60, 54, 52, 0],  [84, 80, 80, 0],  [92, 98, 100, 0]],
   SM8550:            [[54, 46, 46, 0],  [60, 54, 54, 0],  [84, 82, 82, 0],  [92, 98, 100, 0]],
-  SM8650:            [[66, 45, 49, 45], [70, 58, 56, 59], [85, 84, 85, 82], [95, 100, 100, 100]],
+  /* SM8650（K70 Pro/houji 真机 OPP 表定版，代际 393）：省电压 X4 到 31%，
+     均衡 75/65/65/62，性能 90/86/87/84，极速四簇全开。 */
+  SM8650:            [[66, 45, 44, 31], [75, 65, 65, 62], [90, 86, 87, 84], [100, 100, 100, 100]],
   SM8750:            [[52, 46, 0, 0],   [58, 50, 0, 0],   [80, 72, 0, 0],   [90, 100, 0, 0]],
   SM8850:            [[52, 46, 0, 0],   [58, 50, 0, 0],   [80, 70, 0, 0],   [90, 100, 0, 0]],
   /* SM8845（骁龙 8 Gen 5，一加 PLR110 真机：6+2 Oryon）：两簇差异更收敛。 */
@@ -71,12 +73,24 @@ const FAS_MODE_OVERRIDES = {
     performance: { ceiling: "90", freq_scale: "75" },
     fast: { ceiling: "100", freq_scale: "90" },
   },
+  SM8650: {
+    powersave: { ceiling: "25", freq_scale: "22" },
+    performance: { ceiling: "82", freq_scale: "62" },
+    fast: { ceiling: "100", freq_scale: "85" },
+  },
 };
 const INPUT_BOOST_OVERRIDES = {
   MT6989: { fast: { top_app_min: "50", duration_ms: "260" } },
+  SM8650: {
+    powersave: { top_app_min: "12", duration_ms: "90" },
+    balance: { top_app_min: "20", duration_ms: "130" },
+    performance: { top_app_min: "30", duration_ms: "180" },
+    fast: { top_app_min: "40", duration_ms: "240" },
+  },
 };
 const CPUCTL_OVERRIDES = {
   MT6989: { powersave: { background_max: "60" }, balance: { background_max: "72" } },
+  SM8650: { powersave: { background_max: "60" }, balance: { background_max: "70" } },
 };
 /* GPU devfreq 档位（百分比，0 = 物理端点不限）。默认启用的仅限已真机
  * 确认节点存在的处理器；SM8650 携带停用的候选包（待真机 A/B 验证）。 */
@@ -144,7 +158,7 @@ function profile(soc, policies) {
   if (soc === "XRING_O3") Object.assign(features.cpuset, { top_app: "0-9", foreground: "0-9", restricted: "4-7", system_background: "4-7", background: "4-5" });
   return {
     schema: "novasched/2", module: "NovaSched_Zen_Edition",
-    meta: { name: "NovaSched Zen Edition", author: "ZenJooo", version: 392, soc, loglevel: "INFO" },
+    meta: { name: "NovaSched Zen Edition", author: "ZenJooo", version: 393, soc, loglevel: "INFO" },
     policies,
     features,
     modes,

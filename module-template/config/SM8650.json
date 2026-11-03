@@ -4,7 +4,7 @@
   "meta": {
     "name": "NovaSched Zen Edition",
     "author": "ZenJooo",
-    "version": 392,
+    "version": 393,
     "soc": "SM8650",
     "loglevel": "INFO"
   },
@@ -28,10 +28,10 @@
       "enabled": true,
       "modes": {
         "powersave": {
-          "background_max": "65"
+          "background_max": "60"
         },
         "balance": {
-          "background_max": "75"
+          "background_max": "70"
         }
       }
     },
@@ -41,20 +41,20 @@
       "duration_ms": "300",
       "modes": {
         "powersave": {
-          "top_app_min": "15",
-          "duration_ms": "100"
+          "top_app_min": "12",
+          "duration_ms": "90"
         },
         "balance": {
           "top_app_min": "20",
-          "duration_ms": "140"
+          "duration_ms": "130"
         },
         "performance": {
-          "top_app_min": "28",
+          "top_app_min": "30",
           "duration_ms": "180"
         },
         "fast": {
           "top_app_min": "40",
-          "duration_ms": "220"
+          "duration_ms": "240"
         }
       }
     },
@@ -93,20 +93,20 @@
       "sample_ms": "1000",
       "modes": {
         "powersave": {
-          "ceiling": "28",
-          "freq_scale": "25"
+          "ceiling": "25",
+          "freq_scale": "22"
         },
         "balance": {
           "ceiling": "45",
           "freq_scale": "45"
         },
         "performance": {
-          "ceiling": "80",
-          "freq_scale": "60"
+          "ceiling": "82",
+          "freq_scale": "62"
         },
         "fast": {
-          "ceiling": "95",
-          "freq_scale": "80"
+          "ceiling": "100",
+          "freq_scale": "85"
         }
       }
     },
@@ -143,8 +143,8 @@
       "max": [
         "66%",
         "45%",
-        "49%",
-        "45%"
+        "44%",
+        "31%"
       ],
       "governors": [
         "walt",
@@ -177,10 +177,10 @@
         "0%"
       ],
       "max": [
-        "70%",
-        "58%",
-        "56%",
-        "59%"
+        "75%",
+        "65%",
+        "65%",
+        "62%"
       ],
       "governors": [
         "walt",
@@ -213,10 +213,10 @@
         "8%"
       ],
       "max": [
-        "85%",
-        "84%",
-        "85%",
-        "82%"
+        "90%",
+        "86%",
+        "87%",
+        "84%"
       ],
       "governors": [
         "walt",
@@ -249,7 +249,7 @@
         "0%"
       ],
       "max": [
-        "95%",
+        "100%",
         "100%",
         "100%",
         "100%"
