@@ -480,6 +480,10 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     let mut current_extreme_power = extreme_power.load(Ordering::Relaxed);
     // ZenJooo · DeepSeek 事件驱动的边沿追踪（触发器；限频在 ai::consider 内）。
     let mut ai_prev_game = false;
+    // AI 配置/策略 5 秒缓存 + 接管期 mode.txt 快照（用户改档判定用）。
+    let mut ai_config = crate::ai::load_config();
+    let mut ai_refresh_at = Instant::now();
+    let mut ai_mode_snapshot: Option<(u64, String)> = None;
     let mut ai_prev_bottleneck = String::new();
     let mut ai_prev_scene_sig = String::new();
     let mut ai_failure_since: Option<Instant> = None;
@@ -724,14 +728,43 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         // ZenJooo · DeepSeek 临时策略消费（三态之 auto；观察模式不落盘）。
         // 优先级（docs/arbitration-v2.13.md）：低于手动保持与应用规则、高于
         // 自动分类；Scene 签名不一致即失效（切档需重新分析）；TTL 过期失效。
+        // 配置/策略文件 5 秒缓存：旧实现每拍（2 秒）各读一次磁盘，白耗 IO。
+        if ai_refresh_at.elapsed() >= Duration::from_secs(5) {
+            ai_config = crate::ai::load_config();
+            ai_refresh_at = Instant::now();
+        }
         let scene_signature =
             format!("{:?}|{}|{}", scene.provider, scene.linked(), scene.mode.as_deref().unwrap_or(""));
-        let ai_config = crate::ai::load_config();
-        let ai_policy = if ai_config.mode == crate::ai::Mode::Auto && !scene.controls_locked() && manual_hold.is_none() {
+        let mut ai_policy = if ai_config.mode == crate::ai::Mode::Auto
+            && !scene.controls_locked()
+            && manual_hold.is_none()
+        {
             crate::ai::active_policy(util::now_secs(), &scene_signature)
         } else {
             None
         };
+        // 用户显式改档（mode.txt 相对 AI 接管时变化）高于 AI：立即放弃建议。
+        // AI 接管期间我们不写 mode.txt，所以任何变化都是用户/Scene 的动作。
+        if let Some((_, snapshot)) = &ai_mode_snapshot {
+            if app_modes::read_mode_file().as_deref() != Some(snapshot.as_str()) {
+                logger.info("检测到用户手动切档，AI 临时策略已让位");
+                crate::ai::clear_policy();
+                ai_policy = None;
+                ai_mode_snapshot = None;
+            }
+        }
+        if let Some(policy) = &ai_policy {
+            if ai_mode_snapshot.is_none() {
+                // 记录接管起点：此刻 mode.txt 就是用户的原档位。
+                ai_mode_snapshot = Some((
+                    policy.issued_at,
+                    app_modes::read_mode_file().unwrap_or_default(),
+                ));
+            }
+        } else if ai_mode_snapshot.is_some() {
+            ai_mode_snapshot = None;
+        }
+        let mut selected_from_ai = false;
         let (selected, explicit) = if scene.controls_locked() {
             let retained = if app_modes::supported(scheduler.current_mode()) {
                 scheduler.current_mode().to_string()
@@ -749,7 +782,8 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         } else if automatic_enabled {
             // Neither a manual daily-app rule nor an expired manual hold can
             // keep fast selected after the foreground game ends.
-            if manual_hold.is_none() {
+            // AI 接管期间不把 mode.txt 当手动切档证据（我们本就不写它）。
+            if manual_hold.is_none() && ai_policy.is_none() {
                 if let Some(mode) = app_modes::read_mode_file() {
                     if !package.is_empty()
                         && app_modes::supported(&mode)
@@ -772,7 +806,10 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                 Some((mode, _, _)) => (mode.clone(), false),
                 None => match ai_policy.as_ref().and_then(|policy| policy.suggested_mode.clone()) {
                     // AI 临时档位（低于手动保持，高于自动分类；已过验证层+TTL+签名三关）。
-                    Some(mode) => (mode, false),
+                    Some(mode) => {
+                        selected_from_ai = true;
+                        (mode, false)
+                    }
                     None => (
                         classification.kind.mode().to_string(),
                         classification.kind == crate::automatic::AppKind::Game,
@@ -791,7 +828,10 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                 ai_policy.as_ref().and_then(|policy| policy.suggested_mode.clone())
             };
             let selected = match ai_selected {
-                Some(mode) => mode,
+                Some(mode) => {
+                    selected_from_ai = true;
+                    mode
+                }
                 None => app_modes::select_local_mode(
                     explicit,
                     configured,
@@ -855,7 +895,11 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                 suspended = false;
                 last_apply_error.clear();
                 apply_failures = 0;
-                if let Err(error) = app_modes.write_current_mode(scheduler.current_mode()) {
+                // AI 临时档位绝不写进 mode.txt：它是持久状态（重启后仍在），
+                // 在手动模式下就是用户自己的档位——被 AI 覆盖等于永久改配置。
+                if selected_from_ai {
+                    // 保持用户原档位不变；AI 结束/TTL 到期后自然回退。
+                } else if let Err(error) = app_modes.write_current_mode(scheduler.current_mode()) {
                     logger.error(format!("写入 mode.txt 失败: {error}"));
                     last_apply_error = error;
                     retry_at = Instant::now() + Duration::from_secs(10);

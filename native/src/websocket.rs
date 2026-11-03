@@ -664,7 +664,21 @@ fn handle_state(
                             Err(error) => state.runtime.set_extreme_power_error(&format!("保存极限省电设置失败: {error}")),
                         }
                     } else if app_endpoint {
-                        if let Some(rest) = message.strip_prefix("set\t") {
+                        if message == "clear" {
+                            // 一键清空按应用规则（保留默认档位 "*"）。
+                            match state.app_modes.clear_all_rules() {
+                                Ok(count) => state
+                                    .runtime
+                                    .set_command_error(if count == 0 {
+                                        "没有可删除的按应用规则"
+                                    } else {
+                                        ""
+                                    }),
+                                Err(error) => state
+                                    .runtime
+                                    .set_command_error(&format!("清空规则失败: {error}")),
+                            }
+                        } else if let Some(rest) = message.strip_prefix("set\t") {
                             if let Some((package, mode)) = rest.split_once('\t') {
                                 match state.app_modes.set_rule(package, mode) {
                                     Ok(()) => state.runtime.set_command_error(""),

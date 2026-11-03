@@ -20,6 +20,7 @@ function mockHost(options){
     else if(message==='auto\toff'){f.automatic=false;f.effective=f.mode;}
     else if(message.startsWith('set\t')){const[,pkg,mode]=message.split('\t');f.rules=f.rules.filter(r=>r.package!==pkg);f.rules.push({package:pkg,mode});}
     else if(message.startsWith('delete\t'))f.rules=f.rules.filter(r=>r.package!==message.split('\t')[1]);
+    else if(message==='clear')f.rules=[];
     for(const socket of f.sockets)socket.push();
   }
   window.ksu={exec(command,settings,callback){
@@ -36,6 +37,7 @@ function mockHost(options){
     else if(command.includes(' ai-log'))stdout='{"at":1700000000,"event":"game_start","accepted":true,"summary":"建议保持 fast"}\n{"at":1700000100,"kind":"info","text":"建议已通过本地验证"}\n';
     else if(command.includes(' ai-mode ')||command.includes(' ai-key ')||command.includes(' ai-model ')||command.includes(' ai-url ')||command.includes(' ai-restore')||command.includes(' ai-decide'))stdout='ok\n';
     else if(command.includes(' ai-test'))stdout='连接成功（123 ms，模型 deepseek-chat）\n';
+    else if(command.includes(' ai-decide'))stdout='分析任务已提交（低频事件驱动）\n';
     else if(command.includes('webui-rpc')){
       const raw=command.match(/--request '([^']+)'/)[1],request=JSON.parse(raw);
       if(request.message)update(request.message);

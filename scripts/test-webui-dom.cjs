@@ -132,6 +132,11 @@ for(const options of [{linked:true,automatic:true,presence:'available'},{presenc
       const search=d.querySelector('#rule-search');search.value='com.example.test';search.dispatchEvent(new w.Event('input'));assert.equal(d.querySelectorAll('#rule-list .rule-row').length,1);
       click(d,'[data-edit="com.example.test"]');click(d,'#dialog-delete');click(d,'#dialog-confirm');await until(()=>!d.querySelector('#dialog-layer').classList.contains('open'));await pause();
       search.value='';search.dispatchEvent(new w.Event('input'));assert.equal(d.querySelectorAll('#rule-list .rule-row').length,1);
+      // 一键清空：确认弹窗 → 发送 clear → 规则清空且默认档位保留
+      click(d,'#rules-clear');await until(()=>d.querySelector('#dialog-confirm'));
+      click(d,'#dialog-confirm');
+      await until(()=>d.querySelectorAll('#rule-list .rule-row').length===0);
+      assert(w.fixture.rules.length===0,'按应用规则已清空');
     }
     click(d,'.dock [data-page="overview"]');click(d,'#scene-diagnose');assert(d.querySelector('main').inert);click(d,'#dialog-run');await until(()=>!d.querySelector('#dialog-report').hidden);assert(d.querySelector('#dialog-report').textContent.includes('scene_presence=available'));
     click(d,'#dialog-close');await pause();

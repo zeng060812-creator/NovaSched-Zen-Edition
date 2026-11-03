@@ -332,8 +332,12 @@ fn run() -> Result<()> {
         }
         "ai-decide" => {
             let event = requested_mode.as_deref().ok_or("ai-decide 需要 <事件名>")?;
-            let payload = graphics_backend.as_deref().unwrap_or("{}");
-            let note = ai::consider(event, payload, "manual", util::now_secs())?;
+            // 手动分析：诊断模式（只记录不写临时策略）；未给载荷时自采最小快照。
+            let payload = match graphics_backend.as_deref() {
+                Some(text) if !text.trim().is_empty() => text.to_string(),
+                _ => ai::snapshot_from_device(),
+            };
+            let note = ai::consider_with(event, &payload, "manual", util::now_secs(), true)?;
             println!("{note}");
             Ok(())
         }

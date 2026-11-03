@@ -522,29 +522,48 @@ pub fn log_entries(limit: usize) -> Vec<String> {
 // ============================================================
 // HTTP 客户端（curl -K 0600 配置优先，wget 兜底；Key 永不进 argv/URL）
 // ============================================================
-fn has_curl() -> bool {
-    util::run_command("sh", &["-c", "command -v curl 2>/dev/null"])
-        .map(|output| !output.trim().is_empty())
-        .unwrap_or(false)
+/// HTTP 结果：区分「请求已到达服务端」（计入用量/可能计费）与
+/// 「网络层失败」（未计费），费用统计才可信。
+struct AiError {
+    reached: bool,
+    message: String,
 }
 
-fn chat_request(config: &AiConfig, payload: &str) -> std::result::Result<String, String> {
+impl AiError {
+    fn network(message: impl Into<String>) -> Self {
+        Self { reached: false, message: message.into() }
+    }
+    fn http(message: impl Into<String>) -> Self {
+        Self { reached: true, message: message.into() }
+    }
+}
+
+fn curl_path() -> Option<String> {
+    let output = util::run_command("sh", &["-c", "command -v curl 2>/dev/null"]).ok()?;
+    let path = output.trim().to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+fn chat_request(config: &AiConfig, payload: &str) -> std::result::Result<String, AiError> {
     let key = util::read_text(Path::new(KEY_PATH))
         .ok()
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
-        .ok_or("未设置 API Key")?;
+        .ok_or_else(|| AiError::network("未设置 API Key"))?;
     let url = format!("{}/chat/completions", config.base_url);
-    util::atomic_write(Path::new(BODY_PATH), payload.as_bytes(), 0o600)?;
-    if has_curl() {
-        // Authorization 走 0600 配置文件：ps/URL/日志都看不到 Key。
+    util::atomic_write(Path::new(BODY_PATH), payload.as_bytes(), 0o600)
+        .map_err(AiError::network)?;
+    // curl 优先：Authorization 走 0600 配置文件（Key 不进 argv/URL）。平台路径
+    // 由 command -v 解析，不写死 /system/bin/curl（曾因此在部分 ROM 上失效）。
+    if let Some(curl) = curl_path() {
         let cfg = format!(
             "header = \"Content-Type: application/json\"\nheader = \"Authorization: Bearer {}\"\nrequest = \"POST\"\ndata = \"@{BODY_PATH}\"\n",
             escape(key.as_str())
         );
-        util::atomic_write(Path::new(CURL_CONFIG_PATH), cfg.as_bytes(), 0o600)?;
+        util::atomic_write(Path::new(CURL_CONFIG_PATH), cfg.as_bytes(), 0o600)
+            .map_err(AiError::network)?;
         let output = util::run_command(
-            "/system/bin/curl",
+            &curl,
             &[
                 "-sS",
                 "--max-time",
@@ -555,11 +574,15 @@ fn chat_request(config: &AiConfig, payload: &str) -> std::result::Result<String,
                 CURL_CONFIG_PATH,
                 &url,
             ],
-        )?;
-        return finish_response(&output);
+        )
+        .map_err(|error| AiError::network(format!("网络请求失败: {error}")));
+        // 立即清掉含 Authorization 的配置文件与请求体：Key 不长期留在第二个文件里。
+        let _ = util::remove_if_exists(Path::new(CURL_CONFIG_PATH));
+        let _ = util::remove_if_exists(Path::new(BODY_PATH));
+        return output.and_then(|text| finish_response(&text));
     }
     // wget 兜底：header 在 argv（root 域短暂可见）——如实降级路径。
-    let output = util::run_command(
+    let result = util::run_command(
         "/system/bin/wget",
         &[
             "-q",
@@ -571,11 +594,15 @@ fn chat_request(config: &AiConfig, payload: &str) -> std::result::Result<String,
             &format!("--post-data={payload}"),
             &url,
         ],
-    )?;
-    finish_response_wget(&output)
+    );
+    let _ = util::remove_if_exists(Path::new(BODY_PATH));
+    match result {
+        Ok(output) => finish_response_wget(&output),
+        Err(error) => Err(AiError::network(format!("网络请求失败: {error}"))),
+    }
 }
 
-fn finish_response(output: &str) -> std::result::Result<String, String> {
+fn finish_response(output: &str) -> std::result::Result<String, AiError> {
     // curl -w 追加的末行是 http_code。
     let (body, code) = match output.rsplit_once('\n') {
         Some((body, code)) => (body, code.trim().to_string()),
@@ -584,32 +611,32 @@ fn finish_response(output: &str) -> std::result::Result<String, String> {
     classify_http(&code, body)
 }
 
-fn finish_response_wget(output: &str) -> std::result::Result<String, String> {
+fn finish_response_wget(output: &str) -> std::result::Result<String, AiError> {
     // wget 无状态码输出：成功=有 JSON body；失败由空体/错误文本体现。
     if output.trim().is_empty() {
-        return Err("网络请求失败（wget 无输出）".into());
+        return Err(AiError::network("网络请求失败（wget 无输出）"));
     }
     Ok(output.to_string())
 }
 
-fn classify_http(code: &str, body: &str) -> std::result::Result<String, String> {
+fn classify_http(code: &str, body: &str) -> std::result::Result<String, AiError> {
     let code_value: u32 = code.trim().parse().unwrap_or(0);
     match code_value {
         200..=299 => Ok(body.to_string()),
-        401 | 403 => Err(format!("鉴权失败（HTTP {code_value}）：API Key 无效或无权限")),
-        429 => Err("API 限流（HTTP 429）：冷却将加倍".into()),
-        code if code >= 400 => Err(format!(
+        401 | 403 => Err(AiError::http(format!(
+            "鉴权失败（HTTP {code_value}）：API Key 无效或无权限"
+        ))),
+        429 => Err(AiError::http("API 限流（HTTP 429）：冷却将加倍")),
+        402 => Err(AiError::http("余额不足（HTTP 402）：请到 DeepSeek 控制台充值")),
+        code if code >= 400 => Err(AiError::http(format!(
             "HTTP {code}: {}",
             body.trim().chars().take(160).collect::<String>()
-        )),
-        _ => Err(if body.trim().is_empty() {
+        ))),
+        _ => Err(AiError::network(if body.trim().is_empty() {
             "网络请求失败（无响应体）".into()
         } else {
-            format!(
-                "响应异常: {}",
-                body.trim().chars().take(160).collect::<String>()
-            )
-        }),
+            format!("响应异常: {}", body.trim().chars().take(160).collect::<String>())
+        })),
     }
 }
 
@@ -645,9 +672,22 @@ pub fn consider(
     scene_signature: &str,
     now: u64,
 ) -> Result<String> {
+    consider_with(event, payload, scene_signature, now, false)
+}
+
+/// 带诊断标志的决策入口：`diagnostic=true`（CLI 手动分析）只做分析记录，
+/// **绝不写入临时策略**——旧实现由 ai-decide 写入 scene_signature="manual"
+/// 的策略，守护侧签名永不匹配，文件白留且状态显示错乱。
+pub fn consider_with(
+    event: &str,
+    payload: &str,
+    scene_signature: &str,
+    now: u64,
+    diagnostic: bool,
+) -> Result<String> {
     let config = load_config();
-    if config.mode == Mode::Off {
-        return Err("AI 引擎处于关闭状态".into());
+    if config.mode == Mode::Off && !diagnostic {
+        return Err("AI 引擎处于关闭状态（手动分析请用 ai-decide）".into());
     }
     if !key_present() {
         return Err("未设置 API Key".into());
@@ -656,8 +696,12 @@ pub fn consider(
     let usage = usage_today(now);
     let gate = GateState { last_call_at: last_call_at(), usage };
     let last_signature = last_signature_value();
-    let verdict = gate_verdict(&config, &gate, now, signature, last_signature, false);
+    // signature_changed 用于「状态确实变化」时冷却减半（规格要求优先响应
+    // 状态变化）；旧实现恒传 false，减半分支从未生效。
+    let signature_changed = last_signature != 0 && signature != last_signature;
+    let verdict = gate_verdict(&config, &gate, now, signature, last_signature, signature_changed);
     match verdict {
+        GateVerdict::ModeOff if diagnostic => {}
         GateVerdict::ModeOff => return Err("AI 引擎处于关闭状态".into()),
         GateVerdict::QuotaExhausted { max } => {
             return Err(format!("今日配额已用尽（{max} 次），明日自动恢复——费用保护"))
@@ -675,10 +719,12 @@ pub fn consider(
     let event = event.to_string();
     let scene_signature = scene_signature.to_string();
     let payload = payload.to_string();
-    let observe_only = config.mode == Mode::Observe;
+    let observe_only = config.mode != Mode::Auto;
     match std::thread::Builder::new()
         .name("novasched-ai".into())
-        .spawn(move || run_decision(event, payload, scene_signature, observe_only, now))
+        .spawn(move || {
+            run_decision(event, payload, scene_signature, observe_only, diagnostic, now)
+        })
     {
         Ok(handle) => {
             let _ = handle; // 结果写盘，不 join：绝不让网络等待阻塞守护。
@@ -691,19 +737,30 @@ pub fn consider(
     }
 }
 
-fn run_decision(event: String, payload: String, scene_signature: String, observe_only: bool, now: u64) {
+fn run_decision(
+    event: String,
+    payload: String,
+    scene_signature: String,
+    observe_only: bool,
+    diagnostic: bool,
+    now: u64,
+) {
     let config = load_config();
-    let prompt = build_prompt(&payload);
-    let outcome = (|| -> std::result::Result<(String, u64), String> {
+    // 系统提示只放在 system 消息里；user 消息只带设备快照——旧实现把
+    // SYSTEM_PROMPT 重复拼进 user 内容，白付一倍 input token。
+    let outcome = (|| -> std::result::Result<(String, u64), AiError> {
         let body = format!(
             "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"system\",\"content\":{} }},{{\"role\":\"user\",\"content\":{} }}],\"temperature\":0.2,\"max_tokens\":400,\"response_format\":{{\"type\":\"json_object\"}}}}",
             json_string(&config.model),
             json_string(SYSTEM_PROMPT),
-            json_string(&prompt),
+            json_string(&payload),
         );
         let raw = chat_request(&config, &body)?;
-        let root = json::parse(raw.trim()).map_err(|error| format!("响应解析失败: {error}"))?;
-        let Value::Object(map) = root else { return Err("响应不是 JSON 对象".into()) };
+        let root = json::parse(raw.trim())
+            .map_err(|error| AiError::http(format!("响应解析失败: {error}")))?;
+        let Value::Object(map) = root else {
+            return Err(AiError::http("响应不是 JSON 对象"));
+        };
         let content = map
             .get("choices")
             .and_then(|value| match value {
@@ -722,7 +779,7 @@ fn run_decision(event: String, payload: String, scene_signature: String, observe
                 Value::String(text) => Some(text),
                 _ => None,
             })
-            .ok_or("响应缺少 choices[0].message.content")?;
+            .ok_or_else(|| AiError::http("响应缺少 choices[0].message.content"))?;
         let tokens = match map.get("usage").and_then(|usage| match usage {
             Value::Object(object) => object.get("total_tokens").cloned(),
             _ => None,
@@ -732,16 +789,21 @@ fn run_decision(event: String, payload: String, scene_signature: String, observe
         };
         Ok((content, tokens))
     })();
-    record_usage(now, outcome.as_ref().map(|(_, tokens)| *tokens).unwrap_or(0));
+    // 只统计「已到达服务端」的请求：纯网络失败不计费，不能虚增用量。
+    if outcome.as_ref().map(|_| true).unwrap_or_else(|error| error.reached) {
+        record_usage(now, outcome.as_ref().map(|(_, tokens)| *tokens).unwrap_or(0));
+    }
     match outcome {
         Ok((content, _tokens)) => match validate_decision(&content, now, &scene_signature, &event) {
             Ok(policy) => {
-                let apply_note = if observe_only {
+                let apply_note = if diagnostic {
+                    "手动诊断：建议仅记录，不写入临时策略"
+                } else if observe_only {
                     "观察模式：建议仅记录，不参与调度"
                 } else {
                     "自动模式：建议已通过验证，交由仲裁消费"
                 };
-                if !observe_only {
+                if !observe_only && !diagnostic {
                     let _ = save_policy(&policy);
                 }
                 let decision = format!(
@@ -773,30 +835,28 @@ fn run_decision(event: String, payload: String, scene_signature: String, observe
             }
         },
         Err(error) => {
-            let rate_limited = error.contains("429");
-            if rate_limited {
-                // 限流：冷却加倍（写回 last_call 推迟下一次尝试）。
+            if error.message.contains("429") {
+                // 限流：冷却加倍（把 last_call 推到未来，推迟下一次尝试）。
                 mark_call_started(now + config.cooldown_min * 60, 0);
             }
             let decision = format!(
                 "{{\"at\":{},\"event\":\"{}\",\"accepted\":false,\"error\":\"{}\"}}",
                 now,
                 escape(&event),
-                escape(&error),
+                escape(&error.message),
             );
             append_log(&decision);
             write_decision(&decision);
-            log_info(&format!("DeepSeek 分析失败（{event}）：{error}；本地调度不受影响"));
+            log_info(&format!(
+                "DeepSeek 分析失败（{event}）：{}；本地调度不受影响",
+                error.message
+            ));
         }
     }
     IN_FLIGHT.store(false, Ordering::SeqCst);
 }
 
 const SYSTEM_PROMPT: &str = "你是 Android 性能调度分析引擎。只输出一个 JSON 对象，字段：suggested_mode(powersave|balance|performance|fast 之一，可省略)、fas_ceiling(0-100 整数，可省略)、ttl_min(5-120)、summary(不超过200字的中文结论)。规则：电池温度≥43℃或温度上升明显时建议降档或降低 fas_ceiling；帧率长期达标且加压高时建议降低 fas_ceiling；持续掉帧且 GPU 负载不高时才建议升档；不确定时省略字段并在 summary 说明。";
-
-fn build_prompt(payload: &str) -> String {
-    format!("{SYSTEM_PROMPT}\n\n设备快照（最小字段）：\n{payload}")
-}
 
 fn json_string(value: &str) -> String {
     format!("\"{}\"", escape(value))
@@ -853,8 +913,9 @@ pub fn set_mode(mode: Mode) -> Result<()> {
     let mut config = load_config();
     config.mode = mode;
     save_config(&config)?;
-    if mode == Mode::Off {
-        // 规格 PART 3 第 7 条：AI 关闭即清理自身临时请求。
+    if mode != Mode::Auto {
+        // 规格 PART 3 第 7 条：非自动态（关闭/观察）不得保留可消费的临时策略。
+        // 旧实现只在 Off 清理，自动→观察后旧策略在 TTL 内仍可被「切回自动」复活。
         clear_policy();
     }
     Ok(())
@@ -893,6 +954,61 @@ pub fn restore_local() -> Result<()> {
     Ok(())
 }
 
+/// 手动分析（CLI `ai-decide` / WebUI「立即分析」）的最小快照：直接读设备
+/// 节点，不依赖守护线程，因此关掉 AI 或守护重启后也能做一次体检。
+pub fn snapshot_from_device() -> String {
+    let mut snapshot = BTreeMap::new();
+    for key in ["ro.soc.model", "ro.board.platform", "ro.product.model"] {
+        let value = util::getprop(key);
+        if !value.is_empty() {
+            snapshot.insert(key.replace("ro.", ""), value);
+        }
+    }
+    let mut freqs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+        let mut policies: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("policy"))
+            })
+            .collect();
+        policies.sort();
+        for policy in policies {
+            if let Ok(value) = util::read_trimmed(&policy.join("scaling_cur_freq")) {
+                freqs.push(value);
+            }
+        }
+    }
+    if !freqs.is_empty() {
+        snapshot.insert("freqs_khz".into(), freqs.join(";"));
+    }
+    if let Some(busy) = crate::frame_ctrl::read_gpu_busy() {
+        snapshot.insert("gpu_busy".into(), format!("{busy:.0}"));
+    }
+    let (battery, charging, temp) = crate::history::Recorder::read_battery();
+    snapshot.insert(
+        "battery".into(),
+        format!(
+            "{}% {} {}℃",
+            battery.map(|value| value.to_string()).unwrap_or_else(|| "?".into()),
+            match charging {
+                Some(true) => "charging",
+                Some(false) => "discharging",
+                None => "unknown",
+            },
+            temp.map(|value| format!("{value:.1}")).unwrap_or_else(|| "?".into()),
+        ),
+    );
+    snapshot.insert(
+        "mode".into(),
+        crate::app_modes::read_mode_file().unwrap_or_else(|| "unknown".into()),
+    );
+    build_payload(&snapshot)
+}
+
 /// 连接测试（最小请求，费用由用户自担并计入用量）。
 pub fn test_connection() -> Result<String> {
     if !key_present() {
@@ -904,12 +1020,57 @@ pub fn test_connection() -> Result<String> {
         "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"输出 JSON: {{\\\"ok\\\":true}}\"}}],\"max_tokens\":10}}",
         json_string(&config.model),
     );
-    let raw = chat_request(&config, &payload)?;
+    let raw = chat_request(&config, &payload).map_err(|error| error.message)?;
     let _ = json::parse(raw.trim()).map_err(|error| format!("响应解析失败: {error}"))?;
     Ok(format!(
         "连接成功（{} ms，模型 {}）",
         started.elapsed().as_millis(),
         config.model
+    ))
+}
+
+/// 状态展示用：读取策略文件，不做签名匹配（ai-status 不持有守护内的实时
+/// 签名）。返回 (策略, 是否已过期, 签名是否与本进程可验证的上下文无关)。
+fn peek_policy(now: u64) -> Option<(Policy, bool)> {
+    let text = util::read_text(Path::new(POLICY_PATH)).ok()?;
+    let root = json::parse(&text).ok()?;
+    let Value::Object(map) = root else { return None };
+    let number = |key: &str| -> Option<u64> {
+        match map.get(key) {
+            Some(Value::Number(value)) => Some(*value as u64),
+            _ => None,
+        }
+    };
+    let issued_at = number("issued_at")?;
+    let expires_at = number("expires_at")?;
+    let suggested_mode = match map.get("suggested_mode") {
+        Some(Value::String(mode)) if MODES.contains(&mode.as_str()) => Some(mode.clone()),
+        _ => None,
+    };
+    let fas_ceiling = number("fas_ceiling").unwrap_or(0) as u32;
+    if suggested_mode.is_none() && fas_ceiling == 0 {
+        return None;
+    }
+    Some((
+        Policy {
+            suggested_mode,
+            fas_ceiling,
+            issued_at,
+            expires_at,
+            scene_signature: match map.get("scene_signature") {
+                Some(Value::String(value)) => value.clone(),
+                _ => String::new(),
+            },
+            summary: match map.get("summary") {
+                Some(Value::String(value)) => value.clone(),
+                _ => String::new(),
+            },
+            event: match map.get("event") {
+                Some(Value::String(value)) => value.clone(),
+                _ => String::new(),
+            },
+        },
+        now >= expires_at,
     ))
 }
 
@@ -922,19 +1083,37 @@ pub fn status(now: u64) -> String {
     out.push_str(&format!("model={}\n", config.model));
     out.push_str(&format!("base_url={}\n", config.base_url));
     out.push_str(&format!("key={}\n", key_hint()));
+    out.push_str(&format!("key_present={}\n", if key_present() { "yes" } else { "no" }));
     out.push_str(&format!("calls_today={}/{}\n", usage.calls, config.max_calls_per_day));
     out.push_str(&format!("tokens_today={}\n", usage.total_tokens));
     out.push_str(&format!("last_tokens={}\n", usage.last_tokens));
-    let now_secs = util::now_secs();
-    match active_policy(now_secs, &current_scene_signature_placeholder()) {
-        Some(policy) => {
+    out.push_str(&format!("cooldown_min={}\n", config.cooldown_min));
+    // 冷却剩余：last_call 在未来（限流加倍）时 remaining 正常计算。
+    let last_call = last_call_at();
+    let elapsed = now.saturating_sub(last_call);
+    let remaining = (config.cooldown_min * 60).saturating_sub(elapsed);
+    out.push_str(&format!(
+        "cooldown_remaining={}\n",
+        if last_call == 0 { 0 } else { remaining }
+    ));
+    // 策略状态：旧实现用空签名调用 active_policy → 永远 policy=none，
+    // 界面因此看不到真实有效期。这里直接读文件并如实标注过期/待匹配。
+    match peek_policy(now) {
+        Some((policy, expired)) => {
             out.push_str(&format!(
-                "policy=valid;mode={};fas_ceiling={};expires_in={}s\n",
+                "policy={};mode={};fas_ceiling={};expires_in={};event={}\n",
+                if expired { "expired" } else { "stored" },
                 policy.suggested_mode.as_deref().unwrap_or(""),
                 policy.fas_ceiling,
-                policy.expires_at.saturating_sub(now_secs),
+                policy.expires_at.saturating_sub(now),
+                policy.event,
             ));
-            out.push_str(&format!("policy_summary={}\n", policy.summary));
+            if !policy.summary.is_empty() {
+                out.push_str(&format!("policy_summary={}\n", policy.summary));
+            }
+            out.push_str(
+                "policy_note=是否被调度消费由守护侧校验（auto 模式 + 未过期 + Scene 签名一致）\n",
+            );
         }
         None => out.push_str("policy=none\n"),
     }
@@ -943,12 +1122,6 @@ pub fn status(now: u64) -> String {
         out.push_str(&format!("last_decision={decision}\n"));
     }
     out
-}
-
-/// 状态展示用的占位签名（ai-status 不持有守护内的真实签名——策略是否
-/// 可消费以守护侧 active_policy(实时签名) 为准）。
-fn current_scene_signature_placeholder() -> String {
-    String::new()
 }
 
 #[cfg(test)]
@@ -1058,6 +1231,33 @@ mod tests {
         ] {
             assert!(validate_decision(bad, now, "s", "e").is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn observe_mode_still_analyzes_but_diagnostic_needs_no_mode() {
+        // 观察模式必须允许分析（只记录），只有关闭态拒绝。
+        let now = 1_000_000;
+        let gate = GateState { last_call_at: 0, usage: Usage { day: day_index(now), ..Default::default() } };
+        assert_eq!(gate_verdict(&config(Mode::Observe), &gate, now, 5, 0, false), GateVerdict::Allow);
+        // 诊断（手动分析）在关闭态不走「引擎已关闭」短路；Key 缺失时如实报
+        // 未设置 Key（主机环境无 /data，key 必然缺失）——旧实现返回的是
+        // 模糊的“引擎关闭”，无法区分是没开还是没 Key。
+        let closed = consider_with("manual", "{}", "manual", now, true).unwrap_err();
+        assert!(closed.contains("未设置 API Key"), "{closed}");
+        let normal = consider_with("event", "{}", "sig", now, false).unwrap_err();
+        assert!(normal.contains("AI 引擎处于关闭状态"), "{normal}");
+    }
+
+    #[test]
+    fn negative_or_missing_fields_are_rejected_by_validation() {
+        let now = 5_000;
+        // 负数 ceiling 落到默认 0；没有任何可执行字段 → 拒绝。
+        assert!(validate_decision("{\"fas_ceiling\":-5,\"ttl_min\":10}", now, "s", "e").is_err());
+        // 只有 summary → 拒绝（不允许只有描述没有动作）。
+        assert!(validate_decision("{\"summary\":\"温度高\"}", now, "s", "e").is_err());
+        // 合法边界：0 与 100。
+        assert_eq!(validate_decision("{\"fas_ceiling\":0,\"suggested_mode\":\"balance\"}", now, "s", "e").unwrap().fas_ceiling, 0);
+        assert_eq!(validate_decision("{\"fas_ceiling\":100}", now, "s", "e").unwrap().fas_ceiling, 100);
     }
 
     #[test]

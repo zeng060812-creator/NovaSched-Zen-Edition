@@ -88,7 +88,7 @@
         <div class="section-divider"><span>全部应用</span><i aria-hidden="true"></i><span class="sec-time" id="rules-count">—</span></div>
         <label class="search-field"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input id="rule-search" type="search" placeholder="搜索应用或包名" aria-label="搜索应用规则" autocomplete="off"></label>
         <div class="rule-list" id="rule-list"></div>
-        <button class="btn-capsule accent g wide" id="add-rule" data-role="accent" data-radius="999" type="button" disabled>添加应用规则</button>
+        <div class="rule-actions"><button class="btn-capsule accent g" id="add-rule" data-role="accent" data-radius="999" type="button" disabled>添加应用规则</button><button class="btn-capsule ghost g" id="rules-clear" data-role="pill" data-radius="999" type="button" disabled>一键清空</button></div>
         <p class="section-note" id="rules-note">本地自动模式关闭后，应用规则生效。</p>
         <div class="section-divider"><span>逐应用图形 / Vulkan</span><i aria-hidden="true"></i><span class="sec-time" id="graphics-cap-time">—</span></div>
         <article class="course-card g" data-role="panel" data-radius="22">
@@ -149,8 +149,9 @@
           <p class="course-meta mono" id="ai-usage-tokens">今日 token —</p>
           <p class="course-note" id="ai-last-decision">最近决策：—</p>
           <p class="course-note" id="ai-policy-note">临时策略：—</p>
+          <p class="course-note" id="ai-cooldown-note">冷却与配额：—</p>
         </article>
-        <button class="btn-capsule ghost g wide" id="ai-restore" type="button" style="margin:10px 0;">恢复本地调度（清除 AI 临时策略）</button>
+        <div class="rule-actions"><button class="btn-capsule accent g" id="ai-analyze" type="button">立即分析（手动诊断）</button><button class="btn-capsule ghost g" id="ai-restore" type="button">恢复本地调度</button></div>
         <div class="section-divider"><span>AI 调度日志</span><i aria-hidden="true"></i><span class="sec-time" id="ai-log-count">—</span></div>
         <div class="rule-list" id="ai-log-list"></div>
         <p class="section-note">触发条件：游戏启动 / Scene 变化 / 瓶颈结论变化 / 温控状态变化 / 持续下发失败。冷却+每日配额双重限频；重复状态不重复请求。</p>
@@ -191,7 +192,7 @@
         </div>
         <button class="setting-row" id="ai-settings-entry" type="button"><span class="setting-icon orange"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg></span><span class="row-copy"><h3>DeepSeek 自适应引擎</h3><p>AI 三态（关闭/观察/自动）、Key、用量与调度日志</p></span></button>
         <p class="settings-label">模块信息</p>
-        <article class="settings-group g module-info" data-role="settings" data-radius="18"><h3>NovaSched <span>Zen Edition</span></h3><p>按处理器与内核能力调整 CPU 策略，NovaFAS 按帧动态调度。</p><dl class="fact-list"><div><dt>作者</dt><dd>ZenJooo</dd></div><div><dt>界面版本</dt><dd id="about-version">v2.13.0</dd></div><div><dt>服务版本</dt><dd id="about-engine-version">待连接</dd></div><div><dt>处理器</dt><dd id="about-soc">待识别</dd></div><div><dt>配置模板</dt><dd id="about-profile">待识别</dd></div><div><dt>Scene FAS</dt><dd id="about-fas">待识别</dd></div></dl><p class="version-note" id="version-note" hidden></p></article>
+        <article class="settings-group g module-info" data-role="settings" data-radius="18"><h3>NovaSched <span>Zen Edition</span></h3><p>按处理器与内核能力调整 CPU 策略，NovaFAS 按帧动态调度。</p><dl class="fact-list"><div><dt>作者</dt><dd>ZenJooo</dd></div><div><dt>界面版本</dt><dd id="about-version">v2.13.1</dd></div><div><dt>服务版本</dt><dd id="about-engine-version">待连接</dd></div><div><dt>处理器</dt><dd id="about-soc">待识别</dd></div><div><dt>配置模板</dt><dd id="about-profile">待识别</dd></div><div><dt>Scene FAS</dt><dd id="about-fas">待识别</dd></div></dl><p class="version-note" id="version-note" hidden></p></article>
         <p class="section-note">支持 APatch、KernelSU 系列和 Magisk 系列（含 Alpha）。没有内置 WebUI 的管理器可使用独立 WebUI 宿主。</p>
       </section>
     </main>

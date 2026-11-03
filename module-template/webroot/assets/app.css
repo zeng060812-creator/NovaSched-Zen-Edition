@@ -128,6 +128,17 @@ button:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px so
 .course-note{font-size:12.5px;line-height:1.65;margin-top:6px;overflow-wrap:anywhere;color:var(--muted)}
 .card-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px}
 .card-label,.package-badge{font-size:11.5px;color:var(--muted)}
+/* 规则页操作区：主按钮 + 一键清空并排（清空为次要点，仅在有规则时可用） */
+.rule-actions{display:flex;gap:10px;margin:10px 0 4px}
+.rule-actions .btn-capsule{flex:1;min-height:44px}
+.rule-actions .btn-capsule.accent{flex:1.6}
+/* 流畅度：行内容纳件隔离布局/绘制，长列表滚动不再重排整页；
+   滚动瞬间临时关闭 CSS 模糊（WebGL 玻璃路径本就无 CSS 模糊）。 */
+.rule-row{contain:content}
+body.is-scrolling .rule-row.g,
+body.is-scrolling .settings-group.g,
+body.is-scrolling .course-card.g{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+@media(prefers-reduced-motion:reduce){.rule-actions .btn-capsule{transition:none}}
 .app-avatar{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:rgba(255,255,255,.24);font-size:17px;font-weight:700;flex-shrink:0}
 img.app-avatar{object-fit:contain;background:transparent}
 /* 统一占位图标（AppInfo 未就绪/失败）：中性描边图形，不用首字母/随机色 */

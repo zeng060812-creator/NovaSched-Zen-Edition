@@ -237,6 +237,26 @@ impl AppModes {
         )?;
         Ok(())
     }
+
+    /// 一键清空全部按应用规则（保留 "*" 默认档位）。返回删除条数。
+    /// 只改本模块的 app_modes.txt 与 Scene 同步，不触碰其它配置。
+    pub fn clear_all_rules(&self) -> Result<usize> {
+        let mut removed = 0usize;
+        self.change(
+            |rules| {
+                removed = rules.keys().filter(|package| package.as_str() != "*").count();
+                rules.retain(|package, _| package == "*");
+            },
+            false,
+            true,
+        )?;
+        if removed > 0 {
+            self.logger
+                .info(format!("已清空 {removed} 条按应用规则（保留默认档位）"));
+        }
+        Ok(removed)
+    }
+
     fn change(
         &self,
         mutate: impl FnOnce(&mut Rules),

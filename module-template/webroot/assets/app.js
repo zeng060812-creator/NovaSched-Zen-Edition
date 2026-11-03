@@ -15,7 +15,7 @@
     if (match) { MODULE = match[1]; MODULE_CANDIDATES.unshift(MODULE); }
   } catch (_) {}
   const STORAGE = "novasched.zen.ui.v2";
-  const UI_VERSION = window.NovaRelease?.version || "2.13.0";
+  const UI_VERSION = window.NovaRelease?.version || "2.13.1";
 
   const MODES = {
     powersave:   { name: "省电", copy: "限制 CPU 频率上限，适合消息、阅读和轻量日用。" },
@@ -695,7 +695,7 @@
       if (typeof data.version === "string" && /^v?\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(data.version)) s.version = data.version.replace(/^v/, "");
       if (own(MODES, data.defaultMode)) s.mode = data.defaultMode;
       ensureAppInfo([s.pkg, ...s.rules.map(r => r.package), ...Object.keys(s.overrides)]);
-      confirmPending(); render();
+      confirmPending(); render(); settleClear();
     } catch (_) { toast("应用规则数据无法解析，请重连后再试"); }
   }
   function parseLog(line) {
@@ -1111,6 +1111,10 @@
     const key = JSON.stringify([ruleQuery, s.rulesLoaded, s.rules, [...labels.entries()].map(([k, v]) => [k, v.appLabel, v.icon]), s.graphics.rules, s.fpsRules]);
     if (root.dataset.key === key) return;
     root.dataset.key = key;
+    /* FLIP：重建前记录每行位置，重建后按位移做补间——新增/删除规则时
+       存活行平滑让位，而不是整表瞬移（动效标准：连续性优先）。 */
+    const before = new Map();
+    $$(".rule-row", root).forEach(row => { if (row.dataset.edit) before.set(row.dataset.edit, row.getBoundingClientRect().top); });
     if (!s.rulesLoaded) {
       root.innerHTML = `<div class="rule-empty">等待应用规则<br><small>成功连接后，这里会显示守护进程保存的应用策略。</small></div>`;
     } else if (!s.rules.length) {
@@ -1145,8 +1149,28 @@
     }
     /* 新增的玻璃行注册到渲染器 */
     window.NovaGlass?.scan(root);
+    /* FLIP 收尾：只对仍然存在的行做位移补间（删除的行已不在 DOM）。 */
+    if (!reducedMotion() && before.size) {
+      $$(".rule-row", root).forEach(row => {
+        const edit = row.dataset.edit;
+        const previous = edit ? before.get(edit) : undefined;
+        if (previous == null) return;
+        const delta = previous - row.getBoundingClientRect().top;
+        if (Math.abs(delta) < 1) return;
+        row.animate(
+          [{ transform: `translateY(${delta}px)` }, { transform: "none" }],
+          { duration: 280, easing: "cubic-bezier(.22,.72,.2,1)" },
+        );
+      });
+    }
+    /* 一键清空按钮：仅在存在按应用规则且可编辑时可用。 */
+    const clearButton = $("#rules-clear");
+    if (clearButton) {
+      const removable = s.rules.filter(rule => rule.package !== "*").length;
+      clearButton.disabled = !editable() || !removable || !!s.pending;
+      clearButton.textContent = removable > 1 ? `一键清空（${removable} 条）` : "一键清空";
+    }
   }
-  /* ================= 逐应用图形 / Vulkan 视图（规则页卡 + 独立页） ================= */
   const GRAPHICS_STATUS_TEXT = {
     applied: "已写入（读回一致）", pending: "已配置 · 待同步", follow: "跟随系统",
     auto: "自动", unsupported: "不支持", disabled: "已停用", failed: "失败",
@@ -1225,11 +1249,16 @@
     present("#ai-usage-calls", get("calls_today") || "0");
     present("#ai-usage-tokens", `今日 token ${get("tokens_today") || 0}（最近一次 ${get("last_tokens") || 0}）；用量与费用由用户在 DeepSeek 侧承担，本地已做配额+冷却+签名去重三重限频。`);
     const policyRaw = get("policy");
-    const policyValid = policyRaw.startsWith("valid");
-    const expiresMatch = policyRaw.match(/expires_in=(\d+)/);
-    present("#ai-policy-note", policyValid
-      ? `临时策略生效（Scene 切档即失效）：${policyRaw.split(";").slice(1).join(" · ")}${get("policy_summary") ? " · " + get("policy_summary") : ""}`
-      : "临时策略：无（关闭/观察模式只记录建议，不参与调度；过期或 Scene 切换后自动失效）");
+    const policyState = policyRaw.split(";")[0];
+    const policyFields = Object.fromEntries(policyRaw.split(";").slice(1).map(part => part.split("=")).filter(pair => pair.length === 2));
+    const policyText = policyState === "expired"
+      ? "临时策略：已过期（不会再被调度消费；设备状态变化后会重新分析）"
+      : policyState === "stored"
+        ? `临时策略：有效，${policyFields.expires_in || "?"} 秒后过期 · 建议档位 ${policyFields.mode || "—"} · ceiling 上限 ${policyFields.fas_ceiling || 0}%${get("policy_summary") ? " · " + get("policy_summary") : ""}`
+        : "临时策略：无（关闭/观察模式只记录建议，不参与调度）";
+    present("#ai-policy-note", policyText);
+    const cooldown = Number(get("cooldown_remaining") || 0);
+    present("#ai-cooldown-note", `冷却与配额：今日 ${get("calls_today") || "0"} 次调用 · ${get("tokens_today") || 0} token${cooldown > 0 ? ` · 冷却剩余 ${Math.ceil(cooldown / 60)} 分钟` : " · 可立即分析"}`);
     const decision = get("last_decision");
     present("#ai-last-decision", `最近决策：${decision || "—"}`);
     const input = $("#ai-model-input");
@@ -2049,7 +2078,49 @@
       if (tip) tip.textContent = `${new Date(best.t * 1000).toLocaleTimeString()} · ${best.pkg || "无前台"} · ${best.mode}档 · 电量 ${best.battery ?? "—"}% · ${best.charging ? "充电中" : "未充电"} · 温度 ${best.temp ?? "—"}℃${best.fps != null ? ` · ${best.fps.toFixed(1)} FPS` : ""}${boostText}`;
     });
   }
+  /* 清空确认后的回执：收到规则为空即关弹窗并提示条数（超时兜底）。 */
+  let pendingClear = null;
+  function settleClear() {
+    if (!pendingClear) return;
+    const removable = s.rules.filter(rule => rule.package !== "*").length;
+    if (removable === 0) {
+      const removed = pendingClear.count;
+      pendingClear = null;
+      if ($("#dialog-layer").classList.contains("open")) closeDialog();
+      toast(`已删除 ${removed} 条按应用规则（默认档位保留）`);
+      return;
+    }
+    if (Date.now() - pendingClear.at > 6000) {
+      pendingClear = null;
+      if ($("#dialog-layer").classList.contains("open")) closeDialog();
+      toast("未收到清空确认，请在规则页确认结果");
+    }
+  }
   $("#add-rule").onclick = () => showRuleEditor("");
+  /* 一键清空按应用规则：二次确认（不可撤销），保留默认档位 "*"。 */
+  $("#rules-clear")?.addEventListener("click", () => {
+    const removable = s.rules.filter(rule => rule.package !== "*").length;
+    if (!removable) { toast("没有可删除的按应用规则"); return; }
+    if (!editable()) { toast(s.external ? "Scene 外部调度器接管中，暂不能修改规则" : "请先连接本地服务"); return; }
+    NovaHaptics.select();
+    openDialog(`
+      <p class="eyebrow">清空规则</p>
+      <h3 id="dialog-title">删除全部 ${removable} 条应用规则？</h3>
+      <p class="dialog-sub">只删除按应用规则，默认档位与其它设置保留；删除后无法恢复，需要重新添加。</p>
+      <div class="dialog-actions">
+        <button class="btn-capsule ghost" type="button" id="dialog-cancel">取消</button>
+        <button class="btn-capsule" type="button" id="dialog-confirm" style="background:rgba(255,69,58,.18);color:var(--err);">全部删除</button>
+      </div>
+    `);
+    $("#dialog-cancel").onclick = () => closeDialog();
+    $("#dialog-confirm").onclick = () => {
+      const button = $("#dialog-confirm");
+      if (button) button.disabled = true;
+      if (!send("apps", "clear")) { closeDialog(); return; }
+      pendingClear = { at: Date.now(), count: removable };
+      if (typeof NovaHaptics !== "undefined") setTimeout(() => NovaHaptics.success(), 220);
+    };
+  });
 
   /* ---------------- 捐赠与欢迎 ---------------- */
   const WELCOME_KEY = "novasched.welcome.v280";
@@ -2298,6 +2369,29 @@
   $("#ai-restore")?.addEventListener("click", () => {
     NovaHaptics.select();
     aiApply(rootExec(moduleCommand("ai-restore"), 8000, false), "已恢复本地调度（AI 临时策略已清除）");
+  });
+  /* 立即分析：手动诊断（只记录建议，不写入临时策略；未设置 Key 时给出明确原因）。 */
+  $("#ai-analyze")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    NovaHaptics.select();
+    button.disabled = true;
+    const original = button.textContent;
+    button.textContent = "分析中…";
+    try {
+      const outcome = await rootExec(moduleCommand("ai-decide ui_manual"), 45000, false);
+      const text = `${outcome.stdout || ""}\n${outcome.stderr || ""}`.trim();
+      if (outcome.errno !== 0) throw new Error(text.slice(0, 160) || "分析命令失败");
+      toast(text.slice(0, 180) || "已提交分析");
+      NovaHaptics.success();
+      probeAi(true);
+      probeAiLog();
+    } catch (error) {
+      toast(`分析未完成：${String(error?.message || error).slice(0, 150)}`);
+      NovaHaptics.failure();
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
+    }
   });
   $("#scene-release")?.addEventListener("click", () => {
     if (s.pending) return;
@@ -2639,4 +2733,17 @@
   render();
   renderLogs();
   discover();
+
+  /* 滚动期临时关闭 CSS 模糊：长规则列表滚动时避免大面积 backdrop-filter
+     每帧重算（低端机掉帧的主因之一）。结束 160ms 后恢复，外观不变。 */
+  let scrollTimer = 0;
+  const onScroll = () => {
+    if (!document.body.classList.contains("is-scrolling")) document.body.classList.add("is-scrolling");
+    clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(() => document.body.classList.remove("is-scrolling"), 160);
+  };
+  mainScroll.addEventListener("scroll", onScroll, { passive: true });
+  document.addEventListener("scroll", event => {
+    if (event.target && event.target !== document && event.target.scrollHeight > event.target.clientHeight) onScroll();
+  }, { passive: true, capture: true });
 })();
