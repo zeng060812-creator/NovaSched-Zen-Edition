@@ -57,7 +57,12 @@ check('dialog accessibility, motion preference and safe areas',()=>{
 });
 check('symmetric motion system: one token set drives open and close',()=>{
   assert(css.includes('--ease-out:cubic-bezier(.32,.72,0,1)'));
-  assert(ui.includes('frames : [...frames].reverse()') || ui.includes('[...frames].reverse()'));
+  /* 弹簧驱动 morph：开与关共用同一几何描述（from/to 状态插值），
+     不再用反向关键帧重放；中断时从当前计算矩阵继续。 */
+  assert(ui.includes('springKeyframes'));
+  assert(ui.includes('springFrames'));
+  assert(ui.includes('currentMotionState'));
+  assert(!ui.includes('[...frames].reverse()'));
   assert(ui.includes('animatePageSwitch'));
   assert(css.includes('.page.leaving'));
   assert(ui.includes('reducedMotion()'));

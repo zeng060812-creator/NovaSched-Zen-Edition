@@ -129,6 +129,10 @@ button:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px so
 .card-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px}
 .card-label,.package-badge{font-size:11.5px;color:var(--muted)}
 .app-avatar{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:rgba(255,255,255,.24);font-size:17px;font-weight:700;flex-shrink:0}
+img.app-avatar{object-fit:contain;background:transparent}
+/* 统一占位图标（AppInfo 未就绪/失败）：中性描边图形，不用首字母/随机色 */
+.app-avatar-ph{color:var(--ink);opacity:.62;background:rgba(120,120,128,.16)}
+.app-avatar-ph svg{width:22px;height:22px}
 .engine-meter{margin-top:12px;border-top:.5px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:6px}
 .engine-meter-row{display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted)}
 .engine-meter-row b{color:var(--ink);font-variant-numeric:tabular-nums}
@@ -149,6 +153,8 @@ button:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px so
 .rule-copy b{font-size:14px;display:block;overflow-wrap:anywhere}
 .rule-copy small{font-size:11px;color:var(--muted);display:block;overflow-wrap:anywhere;margin-top:4px}
 .mode-badge{font-size:12px;color:var(--accent);white-space:nowrap}
+.gfx-badge{flex:none;font-size:10px;line-height:1;padding:4px 7px;border-radius:9px;background:rgba(77,182,255,.16);color:var(--accent);font-weight:600}
+.morph-inner{transform-origin:0 0;}
 .rule-avatar{color:white}
 .rule-empty,.log-empty{padding:28px 12px;text-align:center;color:var(--muted);font-size:14px;line-height:1.8}
 .rule-empty small,.log-empty small{font-size:12px}
@@ -201,12 +207,14 @@ button:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px so
 
 /* ---------------- 底部 dock ---------------- */
 .dock-wrap{position:fixed;z-index:45;left:50%;bottom:calc(10px + var(--safe-bottom));transform:translateX(-50%);width:min(340px,calc(100vw - 32px - var(--safe-left) - var(--safe-right)));height:var(--dock-h);pointer-events:none}
-.dock{position:relative;width:100%;height:100%;border-radius:999px;padding:5px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));pointer-events:auto;touch-action:none}
+/* 五个页签（概览/规则/日志/设置/历史）同网格：v2.12.1 曾把本行漏在 4 列，
+   第 5 个页签换行溢出胶囊、选中镜头（按 /5 定宽）与网格错位。 */
+.dock{position:relative;width:100%;height:100%;border-radius:999px;padding:5px;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));pointer-events:auto;touch-action:none}
 .dock button{z-index:2;position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;min-width:0;padding:0;border-radius:999px;font-size:10px;font-weight:600;color:var(--ink);transition:color .22s var(--ease-out),transform .3s var(--ease-out)}
 .dock button svg{width:22px;height:22px;margin-bottom:1px}
 .dock button[aria-current=page]{color:var(--accent-press)}
 .dock button:active{transform:scale(1.1)}
-.dock-indicator{position:absolute;z-index:1;left:5px;top:5px;width:calc((100% - 10px)/4);height:calc(var(--dock-h) - 10px);border-radius:999px;transform:translateX(calc(var(--tab-index,0)*100%));pointer-events:none;background:rgba(255,255,255,.1);transition:transform .42s var(--ease-out)}
+.dock-indicator{position:absolute;z-index:1;left:5px;top:5px;width:calc((100% - 10px)/5);height:calc(var(--dock-h) - 10px);border-radius:999px;transform:translateX(calc(var(--tab-index,0)*100%));pointer-events:none;background:rgba(255,255,255,.1);transition:transform .42s var(--ease-out)}
 .dock-dragging .dock-indicator{transition:none;transform:translateX(var(--dock-drag-x,0px)) scale(1.06,1.04)}
 
 /* ---------------- 开关 ---------------- */
@@ -252,8 +260,9 @@ button:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px so
 .swatch-row{display:grid;grid-template-columns:repeat(6,1fr);gap:16px;padding:10px 4px}
 .theme-picker{margin:8px 0}
 .text-action{display:flex;justify-content:space-between;text-align:left;font-size:12px;color:var(--accent);padding:7px 0}
-.dock-preview{display:flex;align-items:center;justify-content:space-around;border-radius:999px;background:rgba(242,244,248,.4);width:240px;height:54px;margin:12px auto 6px;padding:4px;font-size:11px}
-.dock-preview span:first-child{display:grid;place-items:center;border-radius:999px;height:46px;width:58px;background:rgba(255,255,255,.18);color:var(--accent)}
+.glass-preview-caption{margin:10px 4px 0;font-size:11px;line-height:1.5;color:var(--text-dim,inherit);opacity:.75}
+.dock-preview{display:flex;align-items:center;justify-content:space-around;border-radius:22px;outline:1px dashed currentColor;outline-offset:-4px;background:transparent;width:200px;height:38px;margin:8px auto 6px;padding:3px 8px;font-size:10px;opacity:.62}
+.dock-preview span:first-child{display:grid;place-items:center;border-radius:14px;height:26px;width:38px;background:transparent;color:inherit}
 .dialog{width:min(100%,286px);max-height:calc(var(--app-height,100dvh) - 32px - var(--safe-top) - var(--safe-bottom));overflow:auto;border-radius:39px;padding:22px 14px 14px;overscroll-behavior:contain;box-shadow:0 10px 34px rgba(0,0,0,.12)}
 .dialog h3{font-size:18px;line-height:1.4;margin:4px 28px 13px 4px;overflow-wrap:anywhere}
 .dialog-sub{font-size:12px;color:var(--muted);line-height:1.75;margin:0 4px 13px}
@@ -321,3 +330,29 @@ body.overlay-open{overflow:hidden}
 .page.leaving{contain:layout paint}.personal-title{touch-action:none}button:disabled{cursor:default}
 @media(prefers-reduced-motion:reduce){.appearance-layer,.dialog-layer{animation:none!important}}
 [data-motion=reduce] .appearance-layer,[data-motion=reduce] .dialog-layer{animation:none!important}
+/* 动效标准·低性能设备（第 7 条）：系统声明"减少透明度"（省电/无障碍）时
+   整体退出大面积 backdrop-filter——卡片保留表面着色与描边，层级不塌，
+   模糊成本归零。WebGL 玻璃就绪时本就关闭 CSS 模糊（.glass-ready），此规则
+   覆盖的是 WebGL 不可用的降级路径。 */
+@media(prefers-reduced-transparency:reduce){
+  .g,[data-role]{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+  .g[data-role=course]{--surface-color:rgba(100,181,246,.42)}
+  .g[data-role=panel],.g[data-role=popup],.g[data-role=dialog]{--surface-color:rgba(242,244,248,.88)}
+  .g[data-role=settings]{--surface-color:rgba(255,255,255,.94)}
+  .dialog-layer{background:rgba(0,0,0,.34)}
+}
+
+/* 历史轨迹 */
+.history-range{display:flex;gap:8px;margin:6px 4px 10px}
+.history-range button{padding:7px 14px;border-radius:999px;font-size:12px;opacity:.65}
+.history-range button.active{opacity:1;background:var(--accent);color:#fff}
+#history-canvas{width:100%;height:auto;border-radius:18px;background:rgba(255,255,255,.06);touch-action:pan-y}
+.history-tip{font-size:11px;opacity:.7;margin:8px 4px}
+
+/* Scene 接管横幅（ZenJooo）：Scene 切档后锁定四档按钮，只留取回入口 */
+.scene-takeover{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0 10px;padding:12px 14px;border-radius:18px;background:rgba(255,183,77,.14);border:1px solid rgba(255,183,77,.35)}
+.scene-takeover[hidden]{display:none}
+.scene-takeover .takeover-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
+.scene-takeover .takeover-copy b{font-size:13px}
+.scene-takeover .takeover-copy small{font-size:11px;color:var(--muted);line-height:1.5}
+.scene-takeover .btn-capsule{min-height:34px;padding:0 14px;font-size:12px;flex-shrink:0}

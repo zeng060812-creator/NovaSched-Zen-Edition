@@ -65,8 +65,44 @@ for(const options of [{linked:true,automatic:true,presence:'available'},{presenc
   const {w,d,cleanup}=fixture(options);
   try {
     await until(()=>['已连接','外部接管'].includes(d.querySelector('#nav-cta-text').textContent));
-    await until(()=>d.querySelectorAll('.rule-row').length===1);
-    assert.equal(d.querySelectorAll('.dock button[data-page]').length,4);
+    await until(()=>d.querySelectorAll('#rule-list .rule-row').length===1);
+    // meta 通道（宿主桥缺失时）：规则行必须显示模块通道提供的应用名+图标，
+    // 且名称来自按键应答（fixture 提供 com.example.chat=聊天）。
+    if(options.labels===false && options.root){
+      await until(()=>d.querySelector('#rule-list .rule-row img.app-avatar')
+        && d.querySelector('#rule-list .rule-row .rule-copy b').textContent==='聊天'
+        && d.querySelector('#rule-list .rule-row .rule-copy small').textContent==='com.example.chat');
+    }
+    // Ultimate：应用图形管理子页（能力探测 + 逐应用状态）与 DeepSeek 页
+    // （三态/Key 指纹/用量/日志）可路由且数据驱动渲染。
+    if(options.root || options.labels!==false){
+      click(d,'.dock [data-page="rules"]');
+      click(d,'#open-graphics');
+      await until(()=>d.querySelector('#page-graphics').classList.contains('active')
+        && (d.querySelector('#gpage-vulkan')?.textContent||'').includes('Adreno'));
+      await until(()=>(d.querySelector('#graphics-page-list .rule-row')?.textContent||'').includes('com.example.chat'));
+      click(d,'.dock [data-page="about"]');
+      click(d,'#ai-settings-entry');
+      await until(()=>d.querySelector('#page-ai').classList.contains('active'));
+      assert(d.querySelector('#page-ai [data-ai-mode="observe"]'));
+      await until(()=>(d.querySelector('#ai-mode-note')?.textContent||'').includes('观察'));
+      await until(()=>(d.querySelector('#ai-key-badge')?.textContent||'').includes('****'));
+    }
+    assert.equal(d.querySelectorAll('.dock button[data-page]').length,5);
+    // dock 网格必须与页签数一致（5 列）：v2.12.1 曾漏改这行留在 4 列，
+    // 第 5 个页签换行溢出胶囊、选中镜头（/5 定宽）与网格错位（真机截图实测）。
+    const dockCss=fs.readFileSync(path.join(web,'assets','app.css'),'utf8');
+    assert(/\.dock\{[^}]*grid-template-columns:repeat\(5,/.test(dockCss),'dock 网格必须是 5 列');
+    assert(!/\.dock\{[^}]*grid-template-columns:repeat\(4,/.test(dockCss),'dock 网格不得回退到 4 列');
+    assert(/\.dock-indicator\{[^}]*\/5\)/.test(dockCss),'选中镜头定宽必须按 5 列折算');
+    // 动效标准（ZenJooo）：①弹层背景必须渐入渐出（不是突然变暗）；
+    // ②低性能/减少透明度逃生门必须存在（大面积模糊可整体退出）；
+    // ③无限动画只允许既有两个小元素，防止新增大面积常驻动画。
+    assert(/nova-overlay-in\{from\{background-color:transparent/.test(dockCss),'弹层背景必须渐变过渡');
+    assert(/nova-overlay-out\{to\{background-color:transparent/.test(dockCss),'弹层关闭必须渐出');
+    assert(/@media\(prefers-reduced-transparency:reduce\)/.test(dockCss),'低性能设备必须有减少透明度逃生门');
+    const infiniteAnimations=(dockCss.match(/infinite/g)||[]).length;
+    assert(infiniteAnimations<=2,`常驻无限动画不得超过 2 处（当前 ${infiniteAnimations}）`);
     assert.equal(d.querySelector('#stat-pkg-raw').textContent,'com.omarea.vtools');
     if(options.linked)assert(d.querySelector('#auto-switch').disabled);
     assert.equal(d.querySelector('#samsung-compat').hidden, !options.samsung);
@@ -92,10 +128,10 @@ for(const options of [{linked:true,automatic:true,presence:'available'},{presenc
     assert.equal(d.querySelector('.page.active').id,'page-rules');
     if(!options.external){
       click(d,'#add-rule');const input=d.querySelector('#dialog-input');input.value='invalid name';click(d,'#dialog-save');assert(!d.querySelector('#dialog-error').hidden);
-      input.value='com.example.test';click(d,'[data-chip="performance"]');click(d,'#dialog-save');await until(()=>!d.querySelector('#dialog-layer').classList.contains('open'));await pause();assert.equal(d.querySelectorAll('.rule-row').length,2);
-      const search=d.querySelector('#rule-search');search.value='com.example.test';search.dispatchEvent(new w.Event('input'));assert.equal(d.querySelectorAll('.rule-row').length,1);
+      input.value='com.example.test';click(d,'[data-chip="performance"]');click(d,'#dialog-save');await until(()=>!d.querySelector('#dialog-layer').classList.contains('open'));await pause();assert.equal(d.querySelectorAll('#rule-list .rule-row').length,2);
+      const search=d.querySelector('#rule-search');search.value='com.example.test';search.dispatchEvent(new w.Event('input'));assert.equal(d.querySelectorAll('#rule-list .rule-row').length,1);
       click(d,'[data-edit="com.example.test"]');click(d,'#dialog-delete');click(d,'#dialog-confirm');await until(()=>!d.querySelector('#dialog-layer').classList.contains('open'));await pause();
-      search.value='';search.dispatchEvent(new w.Event('input'));assert.equal(d.querySelectorAll('.rule-row').length,1);
+      search.value='';search.dispatchEvent(new w.Event('input'));assert.equal(d.querySelectorAll('#rule-list .rule-row').length,1);
     }
     click(d,'.dock [data-page="overview"]');click(d,'#scene-diagnose');assert(d.querySelector('main').inert);click(d,'#dialog-run');await until(()=>!d.querySelector('#dialog-report').hidden);assert(d.querySelector('#dialog-report').textContent.includes('scene_presence=available'));
     click(d,'#dialog-close');await pause();
@@ -183,7 +219,11 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
   const {w,d,cleanup}=fixture({version:'2.2.8',legacy:true,legacyMode:'balance'});
   try {
     await until(()=>d.querySelector('#about-engine-version').textContent==='v2.2.8');
-    assert.equal(d.querySelector('#about-version').textContent,'v2.12.0');
+    // UI 自身版本跟随 NovaRelease（version.js），不随服务端旧版本变化；
+    // 断言从发布标识读取，升版不再需要改测试。
+    const uiVersion=`v${fs.readFileSync(path.join(web,'assets/version.js'),'utf8')
+      .match(/version:\s*"([^"]+)"/)[1].replace(/^v/,'')}`;
+    assert.equal(d.querySelector('#about-version').textContent,uiVersion);
     assert.equal(d.querySelector('#version-note').hidden,false);
     await until(()=>d.querySelector('#fas-legacy-desc').textContent.includes('旧版服务'));
     assert(d.querySelector('#fas-legacy-desc').textContent.includes('fas-rs'));
@@ -267,7 +307,9 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
     click(d,'#about-update');
     await until(()=>d.querySelector('#dialog-layer').classList.contains('open'));
     assert(d.querySelector('#dialog-title').textContent.includes('检查更新'),'update dialog opened');
-    assert(d.querySelector('#update-status').textContent.includes('当前版本 v2.12.0'),'update dialog shows current version');
+    const releaseVersion=fs.readFileSync(path.join(web,'assets/version.js'),'utf8')
+      .match(/version:\s*"([^"]+)"/)[1].replace(/^v/,'');
+    assert(d.querySelector('#update-status').textContent.includes(`当前版本 v${releaseVersion}`),'update dialog shows current version');
     console.log('PASS cloud update entry and dialog');
   } finally {cleanup();}
 }
@@ -316,11 +358,89 @@ for(const bridgeStyle of ['native0','native2','callback2','promise1','sync1']) {
  const {w,d,cleanup}=fixture({ackDelay:160});
  try{
   await until(()=>d.querySelector('#nav-cta-text').textContent==='已连接');
-  click(d,'.dock [data-page="rules"]');await until(()=>d.querySelectorAll('.rule-row').length===1);click(d,'#add-rule');
+  click(d,'.dock [data-page="rules"]');await until(()=>d.querySelectorAll('#rule-list .rule-row').length===1);click(d,'#add-rule');
   d.querySelector('#dialog-input').value='com.example.delayed';click(d,'#dialog-save');click(d,'#dialog-close');await pause();
   click(d,'.dock [data-page="about"]');click(d,'#about-license');await until(()=>w.fixture.rules.length===2);await new Promise(resolve=>nativeTimeout(resolve,100));
   assert(d.querySelector('#dialog-layer').classList.contains('open'));assert(d.querySelector('#dialog-title').textContent.includes('来源与许可'));
   console.log('PASS delayed rule acknowledgement preserves the newer dialog');
+ }finally{cleanup();}
+}
+{
+ /* 图形后端入口：不支持时保持可见并给出原因；morph 内容包裹；预览标注 */
+ const {w,d,cleanup}=fixture({
+   root:true,
+   graphicsStatus:'angle_driver_available=no\nangle_package=com.google.android.angle\nandroid_sdk=35\nvulkan_devices=0\nrules_count=1\nrule_com.example.chat=angle;enabled=true;status=failed;detail=未找到 ANGLE 驱动包\n',
+ });
+ try{
+  await until(()=>d.querySelector('#nav-cta-text').textContent==='已连接');
+  // 图形状态经 root 通道探测（fixture 记录命令）
+  await until(()=>w.fixture.commands.some(c=>c.includes('graphics-status')));
+  click(d,'.dock [data-page="rules"]');await until(()=>d.querySelectorAll('#rule-list .rule-row').length===1);
+  // 列表摘要：非默认后端显示 ANGLE 徽标（等待探测响应落地后的重渲染）
+  await until(()=>d.querySelector('#rule-list .rule-row .gfx-badge'));
+  assert(d.querySelector('#rule-list .rule-row .gfx-badge'),'non-default backend badge shown');
+  // 规则编辑：图形后端入口存在；ANGLE 因驱动缺失禁用且给出原因；入口不隐藏
+  click(d,'[data-edit="com.example.chat"]');
+  await until(()=>d.querySelector('#dialog-layer').classList.contains('open'));
+  const angle=d.querySelector('[data-gfx="angle"]');
+  assert(angle,'ANGLE entry visible even when unsupported');
+  assert.equal(angle.disabled,true,'ANGLE disabled without driver, with reason shown');
+  // 已有 angle 规则的包：编辑时预选其当前后端（fixture 声明 com.example.chat=angle）
+  assert(d.querySelector('[data-gfx="angle"]').classList.contains('active'),'existing backend preselected');
+  assert(d.querySelector('#graphics-note').textContent.includes('ANGLE 驱动包'),'reason text present');
+  // 代表性交互：morph 内容包裹与圆角补偿结构存在
+  assert(d.querySelector('.dialog > .morph-inner'),'morph inner wrapper present');
+  // 独立保存：切换后端并保存 → graphics-set 命令走 root 通道（此处驱动缺失
+  // 按钮禁用，改为验证保存不发出 graphics 命令、档位规则照常保存）
+  click(d,'#dialog-save');await until(()=>w.fixture.rules.some(r=>r.mode==='fast'||r.mode==='balance'));
+  const gfxCommands=w.fixture.commands.filter(c=>c.includes('graphics-set'));
+  assert.equal(gfxCommands.length,0,'no graphics command when selection unchanged');
+  console.log('PASS graphics backend entry, unsupported reason, list badge, morph wrapper');
+ }finally{cleanup();}
+}
+{
+ /* 图形后端可用路径：ANGLE 可选并经 root 通道独立保存 */
+ const {w,d,cleanup}=fixture({
+   root:true,
+   graphicsStatus:'angle_driver_available=yes\nangle_package=com.google.android.angle\nandroid_sdk=35\nvulkan_devices=2\nvulkan_device=Adreno (TM) 740|API 1.3\nrules_count=0\n',
+ });
+ try{
+  await until(()=>d.querySelector('#nav-cta-text').textContent==='已连接');
+  click(d,'.dock [data-page="rules"]');await until(()=>d.querySelectorAll('#rule-list .rule-row').length===1);
+  click(d,'[data-edit="com.example.chat"]');
+  await until(()=>d.querySelector('#dialog-layer').classList.contains('open'));
+  // 编辑器打开时会强制重探一次；等待重探返回后就地启用的 ANGLE 按钮
+  await until(()=>{const b=d.querySelector('[data-gfx="angle"]');return b&&!b.disabled;});
+  const angle=d.querySelector('[data-gfx="angle"]');
+  assert(angle&&!angle.disabled,'ANGLE selectable when driver present');
+  // 与档位规则独立：仅切换图形后端并保存，档位规则保持不变
+  const rulesBefore=JSON.stringify(w.fixture.rules);
+  click(d,'[data-gfx="angle"]');click(d,'#dialog-save');
+  await until(()=>w.fixture.commands.some(c=>c.includes('graphics-set')));
+  await until(()=>d.querySelector('#rule-list .rule-row .gfx-badge'),'badge appears after enabling');
+  assert(d.querySelector('#rule-list .rule-row .gfx-badge'),'badge appears after enabling');
+  assert.equal(JSON.stringify(w.fixture.rules),rulesBefore,'mode rules untouched by graphics save');
+  console.log('PASS graphics backend independent save via root channel');
+ }finally{cleanup();}
+}
+{
+ /* 目标 FPS（调度目标）：chips、既有目标预选、独立保存、诚实文案 */
+ const {w,d,cleanup}=fixture({root:true, fpsStatus:'kind=scheduling-target\nrules_count=1\nrule_com.example.chat=60\n'});
+ try{
+  await until(()=>d.querySelector('#nav-cta-text').textContent==='已连接');
+  click(d,'.dock [data-page="rules"]');
+  await until(()=>{const row=d.querySelector('#rule-list .rule-row');return row&&row.textContent.includes('60FPS');});
+  assert(d.querySelector('#rule-list .rule-row').textContent.includes('60FPS'),'target fps badge');
+  click(d,'[data-edit="com.example.chat"]');
+  await until(()=>d.querySelector('#dialog-layer').classList.contains('open'));
+  assert(d.querySelector('[data-fps="60"]').classList.contains('active'),'existing target preselected');
+  assert(d.querySelector('#fps-note').textContent.includes('调度目标'),'honest scheduling-target wording');
+  assert(d.querySelector('#fps-note').textContent.includes('不是强制限帧'),'explicit non-forcing statement');
+  const rulesBefore=JSON.stringify(w.fixture.rules);
+  click(d,'[data-fps="90"]');click(d,'#dialog-save');
+  await until(()=>w.fixture.commands.some(c=>c.includes('fps-set')&&c.includes("'90'")));
+  assert.equal(JSON.stringify(w.fixture.rules),rulesBefore,'mode rules untouched by fps save');
+  console.log('PASS target fps editor, independent save, honest wording');
  }finally{cleanup();}
 }
 console.log('PASS: DOM and host scenarios. Geometry and Canvas are synthetic; this is not pixel verification.');

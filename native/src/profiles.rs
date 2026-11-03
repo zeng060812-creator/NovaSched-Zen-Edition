@@ -41,6 +41,10 @@ const STOCK_FINGERPRINTS: &[u64] = &[
     // v2.12.0 / 392 SM8650 日用重调（省电档小核上限 60%→66%，附 gpu_devfreq
     // 候选包，默认停用）。其余处理器模板内容与 v2.11.2 一致。
     0xfaaa52a2740901c0, // SM8650.json
+    // v2.12.1 / 392 天玑 9500（MT6993）初始模板（generate-profiles.py 生成）：
+    // 真机采集识别与拓扑准入已验证，档位包络为按 OPP 表推导的候选值，
+    // 能效待真机调优。
+    0xceac24b1a4915997, // DIMENSITY9500.json
     // Current schema-2 defaults.
     0x0a54bd0af41800f6,0xc75ef8e9e069bed6,0x6401b330f5ea6fa5,0x9b85f833053fee13,0xc2617dcfd60f3372,0xf1707125ea2a1933,0xe1d863d1e4e5cc37,0x19bba46aa364a9fd,0xe2d7accce3dd4fa8,0xda9e3b2b3c4a74cc,
     // v2.11.0 新增：SM8845（骁龙 8 Gen 5）、MT6989（天玑 9300+ 极限性能策略）

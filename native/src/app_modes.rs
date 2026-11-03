@@ -326,6 +326,14 @@ pub fn read_mode_file() -> Option<String> {
     supported(&value).then_some(value)
 }
 
+/// 应用规则条数（健康检查用；"*" 默认规则不计）。
+pub fn rule_count(path: &Path) -> Result<usize> {
+    Ok(read_rules(path)?
+        .keys()
+        .filter(|package| package.as_str() != "*")
+        .count())
+}
+
 fn read_rules(path: &Path) -> Result<Rules> {
     let text = util::read_text(path)?;
     let mut rules = Rules::new();

@@ -139,6 +139,75 @@ fn append_values(report: &mut String, base: &Path, names: &[&str]) {
     }
 }
 
+/// 厂商限频/锁帧机制只读采集。游戏被锁 60/90 时先看这里：这些节点是
+/// 温控、厂商游戏助手和 WALT 调度的真实约束来源，模块不修改它们——
+/// 诊断输出用于判断“限制来自哪里”，而不是绕过。
+pub(crate) fn vendor_limit_report(root: &Path) -> String {
+    let mut report = String::from("\n[vendor-limit: read-only evidence of external limiters]\n");
+    let mut found = 0usize;
+    let mut section = String::new();
+    let mut probe = |base: &Path, names: &[&str], out: &mut String| {
+        let before = out.len();
+        append_values(out, base, names);
+        if out.len() > before {
+            found += 1;
+        }
+    };
+    // 高通 WALT 全局频率上限（温控/厂商服务常用钳制点）。
+    probe(
+        &rooted(root, "proc/sys/walt"),
+        &["sched_fmax_cap", "sched_sbt_enable", "walt_rtg_cfs_boost_prio"],
+        &mut section,
+    );
+    // 小米/澎湃：温控档位、逐核热限频、MIGT 游戏提频、metis 调度。
+    probe(
+        &rooted(root, "sys/class/thermal/thermal_message"),
+        &["sconfig", "cpu_limits", "market_download_limit"],
+        &mut section,
+    );
+    probe(
+        &rooted(root, "sys/module/migt/parameters"),
+        &["migt_freq", "migt_ceiling_freq", "enable_pkg_monitor", "affinity_only"],
+        &mut section,
+    );
+    probe(
+        &rooted(root, "sys/module/metis/parameters"),
+        &["mi_freq_enable", "user_min_freq", "thermal_break_enable"],
+        &mut section,
+    );
+    // msm_performance / 一加 game_opt 的静态 min/max 钳制。
+    probe(
+        &rooted(root, "sys/module/msm_performance/parameters"),
+        &["cpu_max_freq", "cpu_min_freq"],
+        &mut section,
+    );
+    probe(
+        &rooted(root, "proc/game_opt"),
+        &["cpu_max_freq", "cpu_min_freq"],
+        &mut section,
+    );
+    // 小米面板实际输出帧率（max_fps_clone 为厂商信息流锁帧的写入点）。
+    for panel in ["disp-DSI-0", "dsi-0-mi_display"] {
+        probe(
+            &rooted(root, &format!("sys/class/mi_display/{panel}")),
+            &["dynamic_fps", "max_fps_clone", "fps_info"],
+            &mut section,
+        );
+    }
+    report.push_str(&section);
+    // 应用请求/系统允许的刷新率设置（面板 Hz ≠ 游戏 FPS）。
+    for key in ["peak_refresh_rate", "min_refresh_rate", "user_refresh_rate"] {
+        let setting = util::run_command("settings", &["get", "system", key])
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|_| "unavailable".into());
+        report.push_str(&format!("settings.system.{key}={setting}\n"));
+    }
+    if found == 0 {
+        report.push_str("no vendor limiter nodes found\n");
+    }
+    report
+}
+
 fn kernel_report(root: &Path) -> String {
     let mut report = String::from("\n[cpu: frequencies in kHz]\n");
     let policies = policy_paths(root);
@@ -265,6 +334,15 @@ fn kernel_report(root: &Path) -> String {
             "available_frequencies",
         ],
     );
+    // MTK Mali 平台没有 kgsl/devfreq 接口，频率与负载走 gpufreqv2/GED。
+    if !gpu.exists() {
+        append_values(
+            &mut report,
+            &rooted(root, "sys/kernel/ged/hw"),
+            &["gpu_freq", "gpu_meter", "gpu_busy"],
+        );
+    }
+    report.push_str(&vendor_limit_report(root));
     report.push_str("\n[thermal: raw temp values; standard thermal ABI is millidegrees C]\n");
     let thermal = rooted(root, "sys/class/thermal");
     match fs::read_dir(&thermal) {
@@ -344,5 +422,29 @@ mod tests {
         assert!(report.contains("cpufreq policies unavailable"));
         assert!(report.contains("KGSL interface unavailable"));
         assert!(report.contains("thermal unavailable"));
+    }
+
+    #[test]
+    fn vendor_limit_section_reports_present_and_absent_limiters() {
+        // 有 WALT 上限与 MIUI 热限频节点时输出原值。
+        let root = std::env::temp_dir().join(format!("nova-vendor-{}", std::process::id()));
+        let walt = rooted(&root, "proc/sys/walt");
+        let message = rooted(&root, "sys/class/thermal/thermal_message");
+        fs::create_dir_all(&walt).unwrap();
+        fs::create_dir_all(&message).unwrap();
+        fs::write(walt.join("sched_fmax_cap"), "2265600 3148800 2956800 3302400").unwrap();
+        fs::write(message.join("sconfig"), "0").unwrap();
+        let report = kernel_report(&root);
+        assert!(report.contains("sched_fmax_cap=2265600 3148800 2956800 3302400"));
+        assert!(report.contains("sconfig=0"));
+        // settings 命令在真机上可能返回真实值（如 120），只断言行存在。
+        assert!(report.contains("settings.system.peak_refresh_rate="));
+        fs::remove_dir_all(root).unwrap();
+        // 完全没有厂商节点时明确说明，不输出误导性的空段。
+        let empty = std::env::temp_dir().join(format!("nova-vendor-empty-{}", std::process::id()));
+        fs::create_dir_all(&empty).unwrap();
+        let report = kernel_report(&empty);
+        assert!(report.contains("no vendor limiter nodes found"));
+        fs::remove_dir_all(empty).unwrap();
     }
 }

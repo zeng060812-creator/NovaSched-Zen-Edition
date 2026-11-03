@@ -13,6 +13,8 @@ const LAYOUTS = {
   SM8845: [0, 6, -1, -1],
   DIMENSITY8350: [0, 4, 7, -1], DIMENSITY8400: [0, 4, 7, -1],
   DIMENSITY9400PLUS: [0, 4, 7, -1],
+  /* 天玑 9500（MT6993，Redmi prague 真机）：4+3+1 三簇。 */
+  DIMENSITY9500: [0, 4, 7, -1],
   MT6989: [0, 4, 7, -1],
   XRING_O3: [4, 0, 1, -1],
 };
@@ -28,6 +30,8 @@ const CEILINGS = {
   DIMENSITY8350:     [[56, 48, 46, 0],  [62, 56, 54, 0],  [86, 84, 84, 0],  [94, 100, 100, 0]],
   DIMENSITY8400:     [[56, 48, 46, 0],  [62, 56, 54, 0],  [86, 84, 84, 0],  [94, 100, 100, 0]],
   DIMENSITY9400PLUS: [[52, 46, 44, 0],  [58, 52, 50, 0],  [80, 78, 80, 0],  [90, 100, 100, 0]],
+  /* 天玑 9500：按真机 OPP 表推导的候选包络，能效待真机调优。 */
+  DIMENSITY9500:     [[52, 46, 45, 0],  [60, 54, 52, 0],  [82, 80, 80, 0],  [95, 100, 100, 0]],
   /* MT6989（天玑 9300+）极限性能取向：性能/极速档不做省电甜点，不永久锁最高频。 */
   MT6989:            [[60, 42, 38, 0],  [70, 60, 55, 0],  [90, 92, 100, 0], [100, 100, 100, 0]],
   XRING_O3:          [[54, 46, 48, 0],  [60, 52, 54, 0],  [82, 74, 80, 0],  [92, 100, 100, 0]],
@@ -47,6 +51,8 @@ const GOVERNORS = {
   SM8650: "walt", SM8750: "walt", SM8850: "walt", SM8845: "walt",
   DIMENSITY8350: "schedutil", DIMENSITY8400: "schedutil",
   DIMENSITY9400PLUS: "schedutil", MT6989: "schedutil",
+  /* 天玑 9500 真机 OEM 默认即 sugov_ext；缺失时运行时回退 OEM 当前调速器。 */
+  DIMENSITY9500: "sugov_ext",
   XRING_O3: "schedutil",
 };
 
@@ -180,4 +186,4 @@ for (const [soc, policies] of Object.entries(LAYOUTS)) {
   }
 }
 if (failures) { console.error(`${failures} profile mismatches`); process.exitCode = 1; }
-else console.log("12 profiles verified byte-exact");
+else console.log("13 profiles verified byte-exact");

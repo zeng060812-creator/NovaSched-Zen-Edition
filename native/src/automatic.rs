@@ -357,9 +357,16 @@ fn parse_platform_metadata(text: &str, package: &str) -> Option<AppKind> {
 fn known_game(package: &str) -> bool {
     // Exact package IDs only. No names, substring guesses, running background
     // processes, launchers, game centres, or advertising SDKs count as games.
-    include_str!("../games.list")
+    // 编译期内置清单之外，合成运行时来源（模块自有存档 + Scene 的
+    // games.xml / refresh_rate.txt，见 games.rs）；合成目录不可用或查不到
+    // 都不算游戏，按原路径降级。
+    if include_str!("../games.list")
         .lines()
         .any(|line| !line.starts_with('#') && line.trim() == package)
+    {
+        return true;
+    }
+    crate::games::cataloged(package)
 }
 
 fn parse_game_metadata(text: &str, package: &str) -> Option<AppKind> {

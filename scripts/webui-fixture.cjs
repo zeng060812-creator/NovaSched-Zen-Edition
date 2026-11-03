@@ -30,11 +30,25 @@ function mockHost(options){
     }
     let stdout;
     if(command.includes('webui-session'))stdout=JSON.stringify({port:31415,token:'a'.repeat(64),origin:location.origin,moduleDir:'/data/adb/modules/NovaSched_Zen_Edition'});
+    else if(command.includes('fps-status'))stdout=options.fpsStatus!==undefined?options.fpsStatus:'kind=scheduling-target\nrules_count=0\n';
+    else if(command.includes('graphics-status'))stdout=options.graphicsStatus!==undefined?options.graphicsStatus:'angle_driver_available=yes\nangle_package=com.google.android.angle\nandroid_sdk=35\nvulkan_devices=2\nvulkan_device=Adreno (TM) 740|API 1.3\nvulkan_device=Mali-G720|API 1.3\nrules_count=1\nrule_com.example.chat=angle;enabled=true;status=applied;detail=ANGLE 列表写入并读回一致；应用完全退出重开后使用所选后端\n';
+    else if(command.includes(' ai-status'))stdout='ai_mode=observe\nai_mode_label=观察（只分析建议，不修改参数）\nmodel=deepseek-chat\nbase_url=https://api.deepseek.com\nkey=已设置（****abcd）\ncalls_today=1/6\ntokens_today=420\nlast_tokens=420\npolicy=none\nlast_decision={"at":1700000000,"accepted":true,"summary":"保持 fast"}\n';
+    else if(command.includes(' ai-log'))stdout='{"at":1700000000,"event":"game_start","accepted":true,"summary":"建议保持 fast"}\n{"at":1700000100,"kind":"info","text":"建议已通过本地验证"}\n';
+    else if(command.includes(' ai-mode ')||command.includes(' ai-key ')||command.includes(' ai-model ')||command.includes(' ai-url ')||command.includes(' ai-restore')||command.includes(' ai-decide'))stdout='ok\n';
+    else if(command.includes(' ai-test'))stdout='连接成功（123 ms，模型 deepseek-chat）\n';
     else if(command.includes('webui-rpc')){
       const raw=command.match(/--request '([^']+)'/)[1],request=JSON.parse(raw);
       if(request.message)update(request.message);
       stdout=JSON.stringify({modes:modes(),apps:apps(),logs:request.logs&&!request.cursor?logs:'',cursor:'test',logsReset:false});
     }else if(command.includes('__NOVA_FAS_ABSENT__'))stdout=f.legacyMode;
+    else if(command.includes(' meta ')){
+      // 模块 meta 通道：按键返回 label/icon/system/enabled，验证规则页链路。
+      const pkgs=[...command.matchAll(/'([A-Za-z][A-Za-z0-9_.]+)'/g)].map(m=>m[1])
+        .filter(pkg=>pkg.includes('.'));
+      const out={};
+      for(const pkg of new Set(pkgs))out[pkg]={label:labels[pkg]||pkg,icon:'aWNvbg==',system:false,enabled:true};
+      stdout=JSON.stringify(out);
+    }
     else stdout='scene_presence=available\nscene_detection=fixture PackageManager\nscene_linked=true\n';
     setTimeout(()=>window[callback]?.(0,stdout,''),0);
     return options.emptyAsync ? '' : undefined;

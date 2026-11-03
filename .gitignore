@@ -1,9 +1,11 @@
 /native/target/
 /native/target-static/
+/native/meta-dex-build/
 /module-template/bin/novasched
 /node_modules/
 /dist/
 /validation/
 /ui-preview/
+/scripts/dist/
 __pycache__/
 *.pyc

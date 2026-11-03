@@ -23,6 +23,11 @@ pub const MODE_PATH: &str = "/data/adb/novasched/run/mode.txt";
 pub const SCENE_REQUEST_PATH: &str = "/data/adb/novasched/run/scene-request.txt";
 pub const APP_MODES_PATH: &str = "/data/adb/novasched/config/app_modes.txt";
 pub const AUTO_POLICY_PATH: &str = "/data/adb/novasched/config/automatic.json";
+/// ZenJooo · Scene 接管存档属性：powercfg.sh 回调每次被 Scene 调用都写
+/// 当前档位。非 persist——重启即失，自然回到"无接管"；WebUI 手动切档或
+/// 「取回控制权」时由命令通道清空。守护经 __system_property_get 直读，
+/// 每拍零 fork。
+pub const SCENE_MODE_PROP: &str = "novasched.scene.mode";
 
 pub type Result<T> = std::result::Result<T, String>;
 /// The constant is a last-resort fallback, not a root-framework path gate.
@@ -358,6 +363,32 @@ pub fn getprop(name: &str) -> String {
     }
 }
 
+/// 写系统属性（root 守护/回调脚本用）。Android 走 bionic 直写（零 fork）；
+/// 宿主环境无属性服务，按成功处理由调用方测试注入。失败如实报错——
+/// 接管横幅宁可少显示也不虚报。
+pub fn set_prop(name: &str, value: &str) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        let Ok(c_name) = CString::new(name) else {
+            return Err(format!("属性名非法: {name}"));
+        };
+        let Ok(c_value) = CString::new(value) else {
+            return Err(format!("属性值非法: {value}"));
+        };
+        // SAFETY: FFI 调用，两个参数均为合法 C 字符串。
+        let result = unsafe { ffi::__system_property_set(c_name.as_ptr(), c_value.as_ptr()) };
+        if result != 0 {
+            return Err(format!("写入系统属性 {name} 失败（errno={result}）"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (name, value);
+        Ok(())
+    }
+}
+
 pub fn run_command(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
@@ -463,6 +494,15 @@ impl QueryOutput {
         }
         Ok(false)
     }
+}
+
+/// Unix 秒（缓存 TTL / 轨迹时间戳用；系统时间回拨只影响缓存时效）。
+pub fn now_secs() -> u64 {
+    let mut raw: c_long = 0;
+    unsafe {
+        ffi::time(&mut raw as *mut c_long);
+    }
+    raw.max(0) as u64
 }
 
 pub fn local_timestamp() -> String {

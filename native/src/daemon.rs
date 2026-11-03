@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +23,11 @@ use crate::{lifecycle, process_identity};
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 手动切档在自动调度开启时的保持时长：期间分类结果不覆盖用户选择；
+/// 前台应用变化或到期后自动调度恢复。不持久化——守护重启视为回到
+/// 自动调度（安全默认），WebUI 会随广播显示实际档位。
+const MANUAL_HOLD: Duration = Duration::from_secs(10 * 60);
 
 extern "C" fn handle_signal(signal: i32) {
     if signal == ffi::SIGHUP {
@@ -224,7 +229,15 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         if let Err(error) = util::remove_if_exists(Path::new(SCENE_REQUEST_PATH)) {
             logger.warn(format!("清理上次失效的 Scene 请求失败: {error}"));
         }
+        // ZenJooo · 未联动时接管存档必然是上一会话残留：清掉，WebUI 不认。
+        let _ = util::set_prop(util::SCENE_MODE_PROP, "");
     }
+    // ZenJooo · Scene 接管存档（powercfg.sh 每次被 Scene 调用写
+    // novasched.scene.mode）。prop 非空 + 已联动 = Scene 正在主导档位：
+    // WebUI 显示接管横幅并锁定四档按钮。prop 非 persist，重启即失，
+    // 自然回到"无接管"；守护重启时 prop 仍在，状态无缝延续。
+    let mut scene_driving =
+        scene.linked() && !util::getprop(util::SCENE_MODE_PROP).trim().is_empty();
     if scene.controls_locked() {
         logger.info(format!(
             "检测到 {}，为避免双调度，WebUI 四档和应用规则已锁定",
@@ -445,6 +458,10 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     let mut monitor = ForegroundMonitor::default();
     let mut classifier = Classifier::default();
     let mut stamps = FileStamps::new();
+    // ZenJooo · 按应用刷新率：守护启动时记录原激活显示模式，作为所有
+    // "跟随系统"回落点与退出恢复点；读不到就保持 None（不猜、不恢复）。
+    let stock_refresh_mode = crate::refresh::active_mode();
+    let mut refresh_engaged = false;
     let mut watcher = EventLoop::new(&watch_paths(), touch_file);
     logger.info(watcher.describe());
     let mut last_status = String::new();
@@ -452,10 +469,21 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
     let mut retry_at = Instant::now();
     let mut apply_failures = u8::from(!last_apply_error.is_empty());
     let mut suspended = scene.controls_locked() || !last_apply_error.is_empty();
+    let mut manual_hold: Option<(String, String, Instant)> = None;
+    let mut last_scene_request = String::new();
+    // 历史轨迹（十九）：节流采样器。采集只在守护既有的唤醒节拍上进行，
+    // 不新增定时唤醒；写入间隔由 Recorder 决定（游戏 10s / 其余 20s）。
+    let mut history_recorder = crate::history::Recorder::default();
     let mut first_scan = true;
     let mut node_audit = NodeAuditClock::new(Instant::now());
     let mut scene_probe_at = Instant::now() + scene::PRESENCE_INTERVAL;
     let mut current_extreme_power = extreme_power.load(Ordering::Relaxed);
+    // ZenJooo · DeepSeek 事件驱动的边沿追踪（触发器；限频在 ai::consider 内）。
+    let mut ai_prev_game = false;
+    let mut ai_prev_bottleneck = String::new();
+    let mut ai_prev_scene_sig = String::new();
+    let mut ai_failure_since: Option<Instant> = None;
+    let mut ai_failure_fired_at: Option<Instant> = None;
     // 运行期间感知管理器的停用/卸载标记：守护继续写节点会与卸载流程并发
     // 冲突，且与"已停用"语义相悖。低频（15 秒）检查，命中即走正常停止
     // 与恢复路径。
@@ -493,6 +521,22 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             scheduler.set_extreme_power(current_extreme_power);
         }
         let scene_request_changed = stamps.changed(Path::new(SCENE_REQUEST_PATH));
+        // Scene 心跳会周期性重写 scene-request 文件（内容不变）——只有内容
+        // 真的变化才视为新请求，否则每次心跳都会触发全量节点重写。
+        let scene_request_content = if scene_request_changed {
+            util::read_text(Path::new(SCENE_REQUEST_PATH))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default()
+        } else {
+            last_scene_request.clone()
+        };
+        let scene_request_active = scene_request_changed
+            && scene_request_content != last_scene_request
+            && !scene_request_content.is_empty();
+        if scene_request_active {
+            last_scene_request = scene_request_content;
+        }
+        let scene_request_changed = scene_request_active;
         let scene_files_changed = scene::watched_paths().iter().fold(false, |changed, path| {
             stamps.changed(Path::new(path)) || changed
         });
@@ -603,6 +647,15 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
         if let Ok(mut state) = cpuctl_live.inner.lock() {
             state.allowed = !scene.controls_locked();
         }
+        // ZenJooo · 每拍回读接管存档（getprop 走 bionic 直读，零 fork）。
+        // 未联动但 prop 仍非空 = 回调刚被夺走/模块刚接管失败：清掉残留，
+        // 不让 WebUI 挂着无效的"已接管"横幅。
+        if scene.linked() {
+            scene_driving = !util::getprop(util::SCENE_MODE_PROP).trim().is_empty();
+        } else if scene_driving {
+            scene_driving = false;
+            let _ = util::set_prop(util::SCENE_MODE_PROP, "");
+        }
         // Bounded, spaced retries yield to vendor controls when exhausted.
         if !scene.controls_locked() && last_apply_error.is_empty() && scheduler.enforce_pending() {
             revision.fetch_add(1, Ordering::Relaxed);
@@ -620,6 +673,18 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             .as_deref()
             .unwrap_or(&monitor.current)
             .to_string();
+        // 手动切档保持：自动调度开启时，mode.txt 与当前生效档位不一致
+        // 说明用户（或 Scene 回调）刚显式切档——在当前前台应用上保持
+        // MANUAL_HOLD，前台应用变化或超时后自动调度恢复。修复旧逻辑
+        // “下一次心跳把手动切档静默打回分类档位”的同步缺陷。
+        if !automatic_enabled {
+            manual_hold = None;
+        } else if let Some((_, hold_package, _)) = &manual_hold {
+            if package != *hold_package {
+                logger.info("前台应用变化，手动切档保持结束，恢复自动调度");
+                manual_hold = None;
+            }
+        }
         let classification = if package.is_empty() && monitor.activity.is_none() {
             Classification {
                 kind: crate::automatic::AppKind::Unknown,
@@ -629,6 +694,44 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             classifier.classify(&package, &automatic)
         };
         runtime.set_classification(&classification);
+        // ZenJooo · 按应用刷新率跟随（Scene 同款，SurfaceFlinger 激活模式）：
+        // 有规则或曾处于规则应用状态时才跟随前台/恢复原模式，否则完全不
+        // fork dumpsys；外部调度接管时立即回到原模式让位。
+        let refresh_rules_now = crate::refresh::load();
+        let refresh_active = !refresh_rules_now.is_empty() || refresh_engaged;
+        if refresh_active && scene.controls_locked() {
+            if let Some(stock) = stock_refresh_mode {
+                if crate::refresh::active_mode().is_some_and(|current| current != stock) {
+                    if let Err(error) = crate::refresh::apply_mode_id(stock) {
+                        logger.warn(format!("外部调度接管中恢复原刷新率失败: {error}"));
+                    }
+                }
+            }
+            refresh_engaged = false;
+        } else if refresh_active {
+            if let Some(new_package) = foreground.as_deref() {
+                match crate::refresh::on_foreground(new_package, stock_refresh_mode) {
+                    crate::refresh::RefreshOutcome::Idle => {}
+                    crate::refresh::RefreshOutcome::Applied(note) => {
+                        refresh_engaged = true;
+                        logger.info(note);
+                    }
+                    crate::refresh::RefreshOutcome::Restored => refresh_engaged = false,
+                    crate::refresh::RefreshOutcome::Failed(note) => logger.warn(note),
+                }
+            }
+        }
+        // ZenJooo · DeepSeek 临时策略消费（三态之 auto；观察模式不落盘）。
+        // 优先级（docs/arbitration-v2.13.md）：低于手动保持与应用规则、高于
+        // 自动分类；Scene 签名不一致即失效（切档需重新分析）；TTL 过期失效。
+        let scene_signature =
+            format!("{:?}|{}|{}", scene.provider, scene.linked(), scene.mode.as_deref().unwrap_or(""));
+        let ai_config = crate::ai::load_config();
+        let ai_policy = if ai_config.mode == crate::ai::Mode::Auto && !scene.controls_locked() && manual_hold.is_none() {
+            crate::ai::active_policy(util::now_secs(), &scene_signature)
+        } else {
+            None
+        };
         let (selected, explicit) = if scene.controls_locked() {
             let retained = if app_modes::supported(scheduler.current_mode()) {
                 scheduler.current_mode().to_string()
@@ -644,28 +747,63 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                 false,
             )
         } else if automatic_enabled {
-            // Neither mode.txt nor a manual daily-app rule can keep
-            // fast selected after the foreground game ends.
-            (
-                classification.kind.mode().to_string(),
-                classification.kind == crate::automatic::AppKind::Game,
-            )
+            // Neither a manual daily-app rule nor an expired manual hold can
+            // keep fast selected after the foreground game ends.
+            if manual_hold.is_none() {
+                if let Some(mode) = app_modes::read_mode_file() {
+                    if !package.is_empty()
+                        && app_modes::supported(&mode)
+                        && mode != scheduler.current_mode()
+                    {
+                        logger.info(format!(
+                            "手动切档：保持 {mode}（当前应用，最长 10 分钟），之后恢复自动调度"
+                        ));
+                        manual_hold = Some((mode, package.clone(), Instant::now() + MANUAL_HOLD));
+                    }
+                }
+            }
+            if let Some((_, _, expires)) = &manual_hold {
+                if *expires <= Instant::now() {
+                    manual_hold = None;
+                    logger.info("手动切档保持到期，恢复自动调度");
+                }
+            }
+            match &manual_hold {
+                Some((mode, _, _)) => (mode.clone(), false),
+                None => match ai_policy.as_ref().and_then(|policy| policy.suggested_mode.clone()) {
+                    // AI 临时档位（低于手动保持，高于自动分类；已过验证层+TTL+签名三关）。
+                    Some(mode) => (mode, false),
+                    None => (
+                        classification.kind.mode().to_string(),
+                        classification.kind == crate::automatic::AppKind::Game,
+                    ),
+                },
+            }
         } else {
             let explicit = app_modes.has_rule(&package);
             let configured = app_modes.resolve(&package);
             let leaving_explicit =
                 !explicit && package != scheduler.current_package() && scheduler.last_explicit();
-            let selected = app_modes::select_local_mode(
-                explicit,
-                configured,
-                leaving_explicit,
-                app_modes.default_mode(),
-                if automatic_changed {
-                    None
-                } else {
-                    app_modes::read_mode_file()
-                },
-            );
+            // 应用规则（显式）优先于 AI；无显式规则时 AI 建议参与。
+            let ai_selected = if explicit {
+                None
+            } else {
+                ai_policy.as_ref().and_then(|policy| policy.suggested_mode.clone())
+            };
+            let selected = match ai_selected {
+                Some(mode) => mode,
+                None => app_modes::select_local_mode(
+                    explicit,
+                    configured,
+                    leaving_explicit,
+                    app_modes.default_mode(),
+                    if automatic_changed {
+                        None
+                    } else {
+                        app_modes::read_mode_file()
+                    },
+                ),
+            };
             (selected, explicit)
         };
         if let Ok(mut state) = cpuctl_live.inner.lock() {
@@ -753,6 +891,15 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                 && !current_extreme_power
                 && !idle_surface;
             let floors = scheduler.profile_min_floors();
+            // 目标 FPS（二十）：当前前台应用的用户调度目标，NovaFAS 以此
+            // 作为帧基线判断是否加压；无目标时保持基线自学习。
+            // 审计 P2-2：前台可能是 com.game:glssurface 这类子进程，规则按
+            // 主包名保存——与分类器一致先取 base 包名再查表。
+            let fps_target = crate::fps_rules::load()
+                .get(util::base_package(scheduler.current_package()))
+                .copied()
+                .unwrap_or(0);
+            let fas_ceiling = ai_policy.as_ref().map(|policy| policy.fas_ceiling).unwrap_or(0);
             if let Ok(mut state) = fas_shared.lock() {
                 if state.mode != scheduler.current_mode()
                     || state.package != scheduler.current_package()
@@ -760,6 +907,8 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                     || state.ready != ready
                     || state.blocked != blocked
                     || state.min_floor != floors
+                    || state.target_fps != fps_target
+                    || state.ai_ceiling != fas_ceiling
                 {
                     state.mode = scheduler.current_mode().to_string();
                     state.package = scheduler.current_package().to_string();
@@ -767,7 +916,40 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
                     state.ready = ready;
                     state.blocked = blocked;
                     state.min_floor = floors;
+                    state.target_fps = fps_target;
+                    state.ai_ceiling = fas_ceiling;
                 }
+            }
+            // 历史轨迹采样（十九）：due() 节流（游戏 10s / 其余 20s），
+            // 到期才读电池与频率——不为记录制造额外唤醒或高频 IO。
+            let game_foreground = classification.kind == crate::automatic::AppKind::Game
+                && !scheduler.current_package().is_empty();
+            if history_recorder.due(util::now_secs(), game_foreground) {
+                let engine = fas_status_slot
+                    .lock()
+                    .map(|status| status.clone())
+                    .unwrap_or_default();
+                let fps_value = if engine.state == "active" && engine.source == "timestats" {
+                    Some(engine.fps)
+                } else {
+                    None
+                };
+                // 第二阶段·闭环反馈：同时记录加压幅度，轨迹上"加压 ↔ 帧率"
+                // 可直接对照——没有帧收益的加压在图上一目了然。
+                let boost_value = if engine.state == "active" { engine.boost } else { 0 };
+                let (battery, charging, temp) = crate::history::Recorder::read_battery();
+                history_recorder.append(&crate::history::Sample {
+                    t: util::now_secs(),
+                    pkg: scheduler.current_package().to_string(),
+                    mode: scheduler.current_mode().to_string(),
+                    fps: fps_value,
+                    target: fps_target,
+                    boost: boost_value,
+                    freqs: scheduler.live_frequencies(),
+                    battery,
+                    charging,
+                    temp,
+                });
             }
         }
         let engine_status = fas_status_slot
@@ -776,6 +958,121 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             .unwrap_or_default();
         runtime.set_fas_engine(&engine_status);
         runtime.set_frequencies(scheduler.live_frequencies());
+
+        // ZenJooo · DeepSeek 事件驱动触发（规格：绝不按采样周期调用）。
+        // 五类事件：游戏启动 / Scene 变化 / 瓶颈结论变化 / 极限省电变化 /
+        // 持续下发失败（≥10 分钟）。冷却+配额+签名去重在 consider 内部，
+        // 关闭态直接短路，噪声事件静默不刷日志。
+        if ai_config.mode != crate::ai::Mode::Off {
+            let bottleneck_now = if engine_status.state == "active"
+                && engine_status.reason.contains("瓶颈")
+            {
+                engine_status.reason.to_string()
+            } else {
+                String::new()
+            };
+            let mut events: Vec<&str> = Vec::new();
+            let game_now = classification.kind == crate::automatic::AppKind::Game
+                && !scheduler.current_package().is_empty();
+            if game_now && !ai_prev_game {
+                events.push("game_start");
+            }
+            if !bottleneck_now.is_empty() && bottleneck_now != ai_prev_bottleneck {
+                events.push("bottleneck_change");
+            }
+            if scene_signature != ai_prev_scene_sig && !ai_prev_scene_sig.is_empty() {
+                events.push("scene_change");
+            }
+            if extreme_power_changed {
+                events.push("thermal_state_change");
+            }
+            if !last_apply_error.is_empty() {
+                match ai_failure_since {
+                    None => ai_failure_since = Some(Instant::now()),
+                    Some(since) => {
+                        let fired_recently = ai_failure_fired_at
+                            .map(|at| at.elapsed() < Duration::from_secs(30 * 60))
+                            .unwrap_or(false);
+                        if since.elapsed() >= Duration::from_secs(10 * 60) && !fired_recently {
+                            events.push("sustained_apply_failure");
+                            ai_failure_fired_at = Some(Instant::now());
+                        }
+                    }
+                }
+            } else {
+                ai_failure_since = None;
+            }
+            if !events.is_empty() {
+                let mut snapshot = BTreeMap::new();
+                snapshot.insert("soc".into(), selected_soc.name().into());
+                snapshot.insert("soc_id".into(), selected_soc.id().into());
+                let freqs = scheduler.live_frequencies();
+                snapshot.insert(
+                    "freqs_khz".into(),
+                    freqs.iter().map(u32::to_string).collect::<Vec<_>>().join(";"),
+                );
+                snapshot.insert("gpu_busy".into(), format!("{:.0}", engine_status.gpu));
+                snapshot.insert(
+                    "fas".into(),
+                    format!(
+                        "{}/{} {}/{}%",
+                        engine_status.state, engine_status.source,
+                        format_args!("{:.1}", engine_status.fps),
+                        engine_status.boost
+                    ),
+                );
+                snapshot.insert("mode".into(), scheduler.current_mode().into());
+                snapshot.insert("package".into(), scheduler.current_package().into());
+                snapshot.insert("scene".into(), scene.controller().into());
+                snapshot.insert("extreme_power".into(), current_extreme_power.to_string());
+                snapshot.insert(
+                    "bottleneck".into(),
+                    if bottleneck_now.is_empty() { "none".into() } else { bottleneck_now.clone() },
+                );
+                let (battery, charging, temp) = crate::history::Recorder::read_battery();
+                snapshot.insert(
+                    "battery".into(),
+                    format!(
+                        "{}% {} {}℃",
+                        battery.map(|value| value.to_string()).unwrap_or_else(|| "?".into()),
+                        match charging {
+                            Some(true) => "charging",
+                            Some(false) => "discharging",
+                            None => "unknown",
+                        },
+                        temp.map(|value| format!("{:.1}", value)).unwrap_or_else(|| "?".into()),
+                    ),
+                );
+                if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+                    let mut total = String::new();
+                    let mut available = String::new();
+                    for line in meminfo.lines() {
+                        if let Some(value) = line.strip_prefix("MemTotal:") {
+                            total = value.trim().trim_end_matches(" kB").to_string();
+                        }
+                        if let Some(value) = line.strip_prefix("MemAvailable:") {
+                            available = value.trim().trim_end_matches(" kB").to_string();
+                        }
+                    }
+                    if !total.is_empty() {
+                        snapshot.insert("mem_total_kb".into(), total);
+                    }
+                    if !available.is_empty() {
+                        snapshot.insert("mem_available_kb".into(), available);
+                    }
+                }
+                let payload = crate::ai::build_payload(&snapshot);
+                for event in events {
+                    match crate::ai::consider(event, &payload, &scene_signature, util::now_secs()) {
+                        Ok(note) => logger.debug(format!("AI 分析({event}): {note}")),
+                        Err(_) => {} // 冷却/配额/关闭：静默，绝不刷日志。
+                    }
+                }
+            }
+            ai_prev_game = game_now;
+            ai_prev_bottleneck = bottleneck_now;
+            ai_prev_scene_sig = scene_signature.clone();
+        }
 
         if engine_status.state != "active"
             && (force_apply
@@ -812,6 +1109,7 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
             controller: scene.controller(),
             foreign: scene.controls_locked(),
             linked: scene.linked(),
+            driving: scene_driving,
             automatic: automatic_enabled && !scene.controls_locked() && last_apply_error.is_empty(),
             phase,
             error: &policy_error,
@@ -871,6 +1169,21 @@ pub fn run_daemon(module_dir: PathBuf) -> Result<()> {
 
     logger.info("收到停止请求，正在恢复原厂快照");
     web_stop.store(true, Ordering::Relaxed);
+    // ZenJooo · 退出恢复刷新率：仅在守护真的切换过（或仍有规则可能被
+    // 应用过）时执行；读不回激活模式就保留现状并告警，不猜。
+    if refresh_engaged || !crate::refresh::load().is_empty() {
+        if let Some(stock) = stock_refresh_mode {
+            match crate::refresh::active_mode() {
+                Some(current) if current != stock => {
+                    if let Err(error) = crate::refresh::apply_mode_id(stock) {
+                        logger.warn(format!("退出恢复原刷新率失败: {error}"));
+                    }
+                }
+                Some(_) => {}
+                None => logger.warn("退出时无法读回激活显示模式，刷新率保持现状"),
+            }
+        }
+    }
     if let Some(handle) = input_thread {
         if handle.join().is_err() {
             logger.error("输入加速线程异常退出");
@@ -1013,6 +1326,24 @@ pub fn restore_stock(module: &Path) -> Result<()> {
     Snapshot::load(state, Logger::new(state))?
         .restore()
         .map(|_| ())
+}
+
+/// 「撤销 NovaSched 控制」：停止本模块继续下发，按所有权撤销自身约束
+/// （节点快照、图形后端表项、fas-rs 解冻），保留用户配置与规则。
+/// 不恢复外部温控、不清空共享系统配置、不覆盖其它模块或用户后续修改；
+/// 恢复失败时保留恢复数据并如实报错，不显示全部成功。
+pub fn release_control(module: &Path) -> Result<()> {
+    lifecycle::stop(module)?;
+    let state = Path::new(STATE_DIR);
+    let _lock = util::acquire_flock(&crate::storage::path(&state, "daemon.lock"))?;
+    let graphics_note = crate::graphics::revert_owned();
+    println!("{graphics_note}");
+    let restore = Snapshot::load(state, Logger::new(state)).and_then(|snapshot| snapshot.restore());
+    match &restore {
+        Ok(count) => println!("已撤销 NovaSched 节点控制（{count} 项恢复原厂值）；配置与规则已保留。"),
+        Err(error) => println!("节点恢复失败（已保留恢复数据，可重试）: {error}"),
+    }
+    restore.map(|_| ())
 }
 
 pub fn restore_after_supervisor_crash(_module: &Path) -> Result<()> {

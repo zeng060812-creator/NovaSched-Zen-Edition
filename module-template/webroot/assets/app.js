@@ -15,7 +15,7 @@
     if (match) { MODULE = match[1]; MODULE_CANDIDATES.unshift(MODULE); }
   } catch (_) {}
   const STORAGE = "novasched.zen.ui.v2";
-  const UI_VERSION = window.NovaRelease?.version || "2.12.0";
+  const UI_VERSION = window.NovaRelease?.version || "2.13.0";
 
   const MODES = {
     powersave:   { name: "省电", copy: "限制 CPU 频率上限，适合消息、阅读和轻量日用。" },
@@ -27,6 +27,10 @@
     off: "NovaFAS 未启用", idle: "NovaFAS 待命", active: "NovaFAS 已接管", degraded: "NovaFAS 信号不可用", paused: "NovaFAS 已暂停",
   };
   const THEME_NAMES = { system: "跟随系统", light: "浅色", dark: "深色" };
+  /* 仅 6 个系统表面的固定事实名称（AOSP/HyperOS 的真实 Label，非猜测）：
+     元数据通道就绪前的前台展示兜底，避免桌面/通知栏过场显示裸包名。
+     任何第三方应用的名称一律来自 PackageManager（AppInfoProvider），绝不
+     写死或按包名猜测。 */
   const SYSTEM_NAMES = {
     "com.android.systemui": "系统界面", "com.android.settings": "系统设置",
     "com.omarea.vtools": "Scene", "com.android.launcher3": "系统桌面",
@@ -36,12 +40,23 @@
   const s = {
     page: "overview", pendingControls: 0, online: false, connecting: true, phase: "", error: "", connectionError: "", version: "",
     mode: "", effective: "", pkg: "", controller: "", external: false, linked: false,
+    /* Scene 接管存档（novasched.scene.mode 非空且已联动）：横幅 + 锁四档 */
+    sceneDriving: false, cmdError: "",
     heartbeat: null, soc: "", socId: "", configProfile: "", fasAvailable: false, fasState: "unknown", fasMode: "", fasSync: "", fasLegacy: false, sceneInstalled: false, scenePresence: "unknown",
     fasEngineState: "", fasEngineSource: "", fasEngineReason: "", fasFps: 0, fasBoost: 0, fasOverride: false, fasGpu: 0, fasTick: 0, samsungSafe: false,
     extremePower: false, extremeStatus: "off", extremeError: "", extremePending: null,
     freqs: [],
     automatic: false, automaticActive: false, appKind: "", classificationSource: "",
     rules: [], rulesLoaded: false, overrides: {},
+    /* 目标 FPS 规则（fps_rules.json）。null = 尚未探测过；探测成功后缓存，
+       规则编辑器每次打开都强制重探，避免他处增删后页面显示陈旧值。 */
+    fpsRules: null,
+    /* 面板刷新率规则（refresh_rules.json，Scene 同款 SurfaceFlinger 模式
+       切换）。refreshHzList = 设备真实模式里出现过的 Hz 值，构建选项用。 */
+    refreshRules: null, refreshHzList: [], refreshModesError: "",
+    /* 图形后端规则（独立存储 graphics_rules.json，与档位规则互不影响）：
+       available=null 未探测 / true / false（false 时 angleAvailableReason 给出原因）。 */
+    graphics: { probed: false, available: null, reason: "", rules: {}, status: {}, capability: null },
     pending: null, sockets: {}, suspended: false, retry: 0, epoch: 0, probes: new Set(),
     transport: "", rootTimer: 0, rootJob: null, rootOrigin: "", rootGeneration: 0, logCursor: "",
     discovered: false, logConnected: false, logConnecting: false, logs: [], logTail: "", level: "all", follow: true,
@@ -125,42 +140,158 @@
   function appInfo(raw) {
     const pkg = basePackage(raw);
     const info = labels.get(pkg);
-    const name = info?.appLabel || SYSTEM_NAMES[pkg] || pkg || "无前台应用";
+    const label = info?.appLabel || SYSTEM_NAMES[pkg] || "";
+    const name = label || pkg || "无前台应用";
     return { package: String(raw || ""), base: pkg, name,
-      initial: Array.from(info?.appLabel || SYSTEM_NAMES[pkg] || pkg.split(".").pop() || "—")[0] };
+      /* 模块 meta 通道提供的 96px 真实图标（base64 PNG）；宿主桥不提供图标。 */
+      icon: typeof info?.icon === "string" ? info.icon : "",
+      /* 系统设置里被停用的应用（模块 meta 通道提供；null=未知）。 */
+      enabled: typeof info?.enabled === "boolean" ? info.enabled : null };
   }
-  const avatarColor = (name) => {
-    let hue = 7;
-    for (const ch of String(name)) hue = (hue * 31 + ch.charCodeAt(0)) % 360;
-    return `hsl(${hue}, 44%, 46%)`;
-  };
+  /* 统一占位图标：AppInfo 未就绪/读取失败时的中性图形。按规格不使用
+     首字母代替图标，也不按包名生成随机颜色——只有真实 PackageManager
+     图标（模块 meta 通道）才渲染为应用图标。 */
+  const APP_PLACEHOLDER = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="4.5" width="15" height="15" rx="4.5" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".38"/><circle cx="9.4" cy="9.4" r="1.5" fill="currentColor" opacity=".42"/><path d="M5.5 16l3.6-3.6 2.9 2.9 4.4-4.8 2.1 2.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity=".42"/></svg>';
 
-  /* ---------------- 应用名查询（宿主元数据桥） ---------------- */
+  /* ---------------- 应用名查询（宿主元数据桥） ----------------
+     只有“宿主明确应答”的包才记入 queried（含应用已卸载的确认）；
+     超时、异常或返回格式未知时保留有界重试机会，不把失败永久缓存。
+     宿主无 getPackagesInfo 接口时如实显示包名——按包名查询应用名的
+     根回退（app_process DEX 辅助）见 docs/v2.12.1-report.md 边界说明。 */
   const labels = new Map();
   const queried = new Set();
+  const labelFails = new Map();
+  const LABEL_MAX_FAILS = 3;
   const bridges = () => window.NovaHost?.hosts() || [window.ksu, window.magisk, window.apatch, window.KSU, window.mmrl].filter(Boolean);
   const bridge = () => bridges().find(api => typeof api.exec === "function") || bridges()[0];
   const metadataBridge = () => bridges().find(api => typeof api.getPackagesInfo === "function") || bridge();
+  /* ================= AppInfoProvider（统一应用信息层 · 规格化） =================
+     单一入口 ensureAppInfo(packages)，内部双通道互补：
+     1) 宿主桥 getPackagesInfo（真实存在才调用）：只采信应用名；
+     2) 模块 meta 通道（novasched meta，经 app_process 直读 PackageManager）：
+        label + 96px 真实图标 + system 标记 + enabled 启用状态，按包名严格
+        键取，设备侧 1h TTL 缓存，失败有界重试。
+     应用信息一律来自系统 PackageManager，不写死、不按包名猜测；名称与
+     图标仅用于显示，调度规则仍以 packageName 为唯一标识。 */
+  function ensureAppInfo(packages) {
+    loadLabels(packages);
+    ensureMeta(packages);
+  }
+
   function loadLabels(packages) {
     const api = metadataBridge();
     if (typeof api?.getPackagesInfo !== "function") return;
-    const needed = [...new Set(packages.map(basePackage))].filter(pkg => validPackage(pkg) && !queried.has(pkg));
+    const needed = [...new Set(packages.map(basePackage))]
+      .filter(pkg => validPackage(pkg) && !queried.has(pkg)
+        && (labelFails.get(pkg) || 0) < LABEL_MAX_FAILS);
     if (!needed.length) return;
     for (let index = 0; index < needed.length; index += 48) {
       const batch = needed.slice(index, index + 48);
-      try {
-        const response = api.getPackagesInfo(JSON.stringify(batch));
-        const result = typeof response === "string" ? JSON.parse(response) : response;
-        if (Array.isArray(result)) {
-          for (const info of result) {
-            if (batch.includes(info.packageName) && typeof info.appLabel === "string" && info.appLabel.trim()) {
-              labels.set(info.packageName, { ...info, appLabel: info.appLabel.trim().slice(0, 300) });
-              queried.add(info.packageName);
+      // 同步/异步返回都兼容；批量请求限时 3 秒，避免慢桥挂住渲染。
+      Promise.race([
+        Promise.resolve().then(() => api.getPackagesInfo(JSON.stringify(batch))),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("应用名查询超时")), 3000)),
+      ])
+        .then(response => {
+          const result = typeof response === "string" ? JSON.parse(response) : response;
+          const list = Array.isArray(result) ? result
+            : Array.isArray(result?.packagesInfo) ? result.packagesInfo : null;
+          if (!list) throw new Error("宿主返回格式未知");
+          const answered = new Set();
+          for (const info of list) {
+            if (!info || !batch.includes(info.packageName)) continue;
+            answered.add(info.packageName);
+            if (typeof info.appLabel === "string" && info.appLabel.trim()) {
+              // 只采信宿主桥的应用名；图标一律走模块 meta 通道——宿主桥的
+              // 图标与包名的配对在各管理器实现间不一致（曾出现图标映射
+              // 错位），本模块通道按包名严格键取，杜绝该类错位。
+              labels.set(info.packageName, {
+                packageName: info.packageName,
+                appLabel: info.appLabel.trim().slice(0, 300),
+                icon: "",
+              });
             }
           }
+          answered.forEach(pkg => { queried.add(pkg); labelFails.delete(pkg); });
+          if (answered.size) render();
+        })
+        .catch(() => {
+          batch.forEach(pkg => labelFails.set(pkg, (labelFails.get(pkg) || 0) + 1));
+        });
+    }
+  }
+
+  /* ---------------- 应用名与图标（模块 meta 通道，权威来源） ----------------
+     `novasched meta <包名>…`：经 app_process 读取 PackageManager，返回按
+     包名严格键取的 {label, icon(base64 PNG), system}，守护侧 1 小时 TTL
+     缓存。宿主桥缺失、应用名查询失败、或需要图标时都走这里；批内请求
+     失败按包计数有界重试。 */
+  const META_MAX_FAILS = 3;
+  const META_BATCH = 6;
+  const metaFails = new Map();
+  /* 故障诊断（规格五）：区分 Root 桥缺失 / CLI 失败 / JSON 解析失败 /
+     DEX·PackageManager 失败（后端已分层透传原因），并记录批次与
+     名称/图标命中数——不再把所有故障吞成静默占位。不含敏感信息。 */
+  const metaDiag = { lastError: "", batches: 0, okBatches: 0, returned: 0, labels: 0, icons: 0 };
+  let metaQueue = Promise.resolve();
+  function ensureMeta(packages) {
+    if (typeof bridge()?.exec !== "function") {
+      metaDiag.lastError = "Root 命令接口不可用（宿主未注入 exec 桥）";
+      return;
+    }
+    const needed = [...new Set(packages.map(basePackage))]
+      .filter(pkg => validPackage(pkg)
+        && (!(labels.get(pkg)?.appLabel) || !(labels.get(pkg)?.icon))
+        && (metaFails.get(pkg) || 0) < META_MAX_FAILS);
+    if (!needed.length) return;
+    /* 真机修正：48 个/批的图标 base64 输出可达数百 KB，撞 app_process
+       512KB 输出上限后整批失败、重试耗尽——规则页因此只见包名（个别
+       名称来自宿主桥的零星应答）。改为每批 6 个、串行渐进：单批输出
+       数十 KB，任何宿主桥都放得下；名称与图标随批次逐行点亮。 */
+    for (let index = 0; index < needed.length; index += META_BATCH) {
+      const batch = needed.slice(index, index + META_BATCH);
+      const command = moduleCommand(`meta ${batch.map(shellQuote).join(" ")}`);
+      metaQueue = metaQueue.then(() => rootExec(command, 20000, false)).then(result => {
+        if (result.errno !== 0) throw new Error(result.stderr || "meta 查询失败");
+        let parsed;
+        try { parsed = JSON.parse(result.stdout || "{}"); } catch (_) { throw new Error("meta 输出无法解析"); }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("meta 输出格式未知");
+        metaDiag.batches += 1;
+        metaDiag.okBatches += 1;
+        metaDiag.returned += Object.keys(parsed).length;
+        let changed = 0;
+        let gotLabels = 0;
+        let gotIcons = 0;
+        for (const pkg of batch) {
+          // 严格按键取条目：返回 JSON 的键就是包名，与顺序无关——图标
+          // 不可能配到别的应用头上（图标错位的结构性根治）。
+          const entry = parsed[pkg];
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+          const label = typeof entry.label === "string" ? entry.label.trim().slice(0, 300) : "";
+          const icon = typeof entry.icon === "string" && entry.icon ? entry.icon : "";
+          const enabled = typeof entry.enabled === "boolean" ? entry.enabled : null;
+          if (!label && !icon) continue;
+          if (label) gotLabels += 1;
+          if (icon) gotIcons += 1;
+          const existing = labels.get(pkg) || {};
+          labels.set(pkg, {
+            packageName: pkg,
+            appLabel: label || existing.appLabel || "",
+            icon: icon || existing.icon || "",
+            enabled: enabled !== null ? enabled : (typeof existing.enabled === "boolean" ? existing.enabled : null),
+          });
+          metaFails.delete(pkg);
+          changed++;
         }
-        batch.forEach(pkg => queried.add(pkg));
-      } catch (_) { batch.forEach(pkg => queried.add(pkg)); }
+        metaDiag.labels += gotLabels;
+        metaDiag.icons += gotIcons;
+        metaDiag.lastError = "";
+        if (changed) render();
+      }).catch(error => {
+        metaDiag.batches += 1;
+        metaDiag.lastError = String(error?.message || error).slice(0, 140);
+        batch.forEach(pkg => metaFails.set(pkg, (metaFails.get(pkg) || 0) + 1));
+      });
     }
   }
 
@@ -362,6 +493,11 @@
     rootRequest({endpoint:"snapshot",logs:job.logs,cursor:s.logCursor}).then(reply => {
       if (epoch !== s.epoch || s.suspended || generation !== s.rootGeneration) return;
       receiveRootSnapshot(reply,job.logs);
+      // root 备用通道就绪即探测系统能力（各一次；结果缓存，失败有界重试）：
+      // 触感 → 外观设置「测试触感」；图形后端 → 规则页徽标与编辑入口需要。
+      probeHaptics();
+      probeGraphics();
+      probeFps();
     }).catch(error => {
       if (epoch !== s.epoch || s.suspended || generation !== s.rootGeneration) return;
       offline("root"); s.connectionError = "宿主备用通道失败：" + publicError(error.message); render();
@@ -499,6 +635,10 @@
     s.mode = data.mode; s.effective = own(MODES, data.effective) ? data.effective : "";
     s.pkg = data.package || ""; s.controller = data.controller || "NovaSched";
     s.external = data.sceneActive === "true"; s.linked = data.sceneLinked === "true";
+    s.sceneDriving = data.sceneDriving === "true";
+    const incomingCmdError = data.cmdError || "";
+    if (incomingCmdError && incomingCmdError !== s.cmdError) toast(incomingCmdError, 4300);
+    s.cmdError = incomingCmdError;
     s.pendingControls = /^\d+$/.test(data.pendingControls || "") ? Number(data.pendingControls) : 0;
     s.samsungSafe = data.samsungSafe === "true";
     s.phase = data.phase; s.heartbeat = Number(data.heartbeatMs);
@@ -524,6 +664,7 @@
       s.fasEngineReason = data.fasReason || "";
       s.fasFps = Number(data.fasFps) || 0;
       s.fasGpu = Number(data.fasGpu) || 0;
+        s.fasTarget = Number(data.fasTarget) || 0;
       s.fasBoost = /^\d+$/.test(data.fasBoost || "") ? Number(data.fasBoost) : 0;
       s.fasOverride = data.fasOverride === "true";
       s.fasTick = /^\d+$/.test(data.fasTick || "") ? Number(data.fasTick) : 0;
@@ -538,7 +679,7 @@
     s.appKind = ["game", "daily", "unknown"].includes(data.appKind) ? data.appKind : "";
     s.classificationSource = data.classificationSource || "";
     if (Number(data.port) >= 1024) { s.port = Number(data.port); s.host = "127.0.0.1"; }
-    loadLabels([s.pkg]); confirmPending(); render();
+    ensureAppInfo([s.pkg]); confirmPending(); render();
     if (!welcomeShown && s.online) { welcomeShown = true; setTimeout(maybeShowWelcome, 800); }
   }
   function receiveApps(text) {
@@ -553,7 +694,8 @@
       s.error = typeof data.error === "string" ? data.error : "";
       if (typeof data.version === "string" && /^v?\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(data.version)) s.version = data.version.replace(/^v/, "");
       if (own(MODES, data.defaultMode)) s.mode = data.defaultMode;
-      loadLabels([...s.rules.map(r => r.package), ...Object.keys(s.overrides)]); confirmPending(); render();
+      ensureAppInfo([s.pkg, ...s.rules.map(r => r.package), ...Object.keys(s.overrides)]);
+      confirmPending(); render();
     } catch (_) { toast("应用规则数据无法解析，请重连后再试"); }
   }
   function parseLog(line) {
@@ -621,7 +763,12 @@
     if (p.kind === "auto") {
       if (s.automatic === (p.value === "on") && s.automaticActive === s.automatic && s.phase === "ready" && (p.value === "off" || s.effective === (s.appKind === "game" ? "fast" : "powersave"))) return finishPending(true, p.value === "on" ? "自动调度已开启" : "已返回手动调度");
     } else if (p.kind === "mode") {
-      if (s.automatic || s.automaticActive) return;
+      if (s.automatic || s.automaticActive) {
+        // 自动调度开启时手动切档由守护进程临时保持（前台应用变化或
+        // 约 10 分钟后恢复自动）；广播回显保持档位即可确认成功。
+        if (s.phase === "ready" && s.mode === p.value && s.effective === p.value) return finishPending(true, `${MODES[p.value].name}档已生效；自动调度保持中，前台应用变化或约 10 分钟后恢复自动`);
+        return;
+      }
       if (s.phase === "degraded" && s.pendingControls === 0 && s.mode === p.value) return finishPending(false, s.error || "策略下发失败，已保留最后成功档位");
       if (s.phase === "ready" && s.mode === p.value && s.effective === p.value) return finishPending(true, `${MODES[p.value].name}档已生效`);
       const rule = s.rules.find(r => r.package === basePackage(s.pkg));
@@ -649,7 +796,13 @@
     if (!s.online) return "等待本地服务";
     if (s.external) return "Scene 外部调度器";
     if (s.linked) return "Scene 联动";
-    return "WebUI 接管";
+    // 档位来源解释：回答“当前由谁决定档位”。
+    if (s.automatic || s.automaticActive) {
+      return `自动调度（当前分类：${s.appKind === "game" ? "游戏" : "日常"}）`;
+    }
+    const rule = s.rules.find(r => r.package === basePackage(s.pkg));
+    if (rule) return `应用规则（${MODES[rule.mode]?.name || rule.mode}）`;
+    return "手动档位";
   }
   function connectionSummary() {
     const message = s.connectionError.replace(/\s+/g, " ");
@@ -694,8 +847,16 @@
       button.setAttribute("aria-pressed", String(actual));
       button.setAttribute("aria-busy", String(pending));
       $(".badge", button).hidden = !actual || !!(!s.linked && (s.automatic || s.automaticActive));
-      button.disabled = !editable() || !!s.pending;
+      button.disabled = !editable() || !!s.pending || s.sceneDriving;
     });
+    /* ZenJooo · Scene 接管横幅：Scene 里切档后（novasched.scene.mode 非空）
+       四档交给 Scene 主导，本页只读；「取回控制权」清掉接管存档恢复编辑。 */
+    const takeover = $("#scene-takeover");
+    if (takeover) {
+      takeover.hidden = !(s.online && s.sceneDriving);
+      const release = $("#scene-release");
+      if (release) release.disabled = !!s.pending;
+    }
     present("#modes-state", s.online ? (s.external ? "外部控制" : MODES[s.effective]?.name || "—") : "—");
     const autoSwitch = $("#auto-switch");
     autoSwitch.disabled = !editable() || !!s.pending || s.linked;
@@ -733,7 +894,7 @@
     } else if (s.fasEngineState === "active") {
       engineTitle = ENGINE_TITLES.active;
       engineSource = s.fasEngineSource === "timestats"
-        ? "帧信号 · SurfaceFlinger"
+        ? (s.fasTarget > 0 ? `帧信号 · 调度目标 ${s.fasTarget} FPS` : "帧信号 · SurfaceFlinger")
         : s.fasEngineSource === "heuristic"
           ? `负载启发式 · GPU ${s.fasGpu.toFixed(0)}%`
           : "无信号源 · 仅档位包络";
@@ -763,7 +924,9 @@
     const meter = $("#fas-engine-meter");
     if (meter) meter.hidden = !engineRunning;
     const frameSource = s.fasEngineSource === "timestats";
-    present("#fas-engine-fps", engineRunning && frameSource ? `${s.fasFps.toFixed(1)} fps` : "—");
+    // 采样有效但前台没有出帧（暂停/静态画面）时如实显示“待渲染”，
+    // 不把无帧渲染成 0.0 fps 假数据。
+    present("#fas-engine-fps", engineRunning && frameSource ? (s.fasFps >= 0.05 ? `${s.fasFps.toFixed(1)} fps` : "待渲染") : "—");
     present("#fas-engine-gpu", engineRunning ? (s.fasGpu > 0 || s.fasEngineSource === "heuristic" ? `${Math.min(100, s.fasGpu).toFixed(0)}%` : "—") : "—");
     present("#fas-engine-boost", engineRunning ? `${s.fasBoost}%` : "—");
     /* 引擎拍数每次心跳都在增长：数值稳定不动时，它是区分“稳定”与“卡死”的唯一信号 */
@@ -785,7 +948,19 @@
     const pkgName = s.online && s.pkg ? appInfo(s.pkg).name : s.online ? "无前台应用" : "等待连接";
     present("#stat-pkg", pkgName);
     present("#stat-pkg-raw", s.online && s.pkg ? s.pkg : s.online ? "锁屏、待机或暂未读取到活动" : "连接后显示应用包名");
-    present("#foreground-avatar", s.online && s.pkg ? appInfo(s.pkg).initial : "—");
+    /* 前台头像：模块 meta 通道的图标就绪时显示真实图标，否则统一占位图形
+       （不使用首字母/随机色）。 */
+    const avatar = $("#foreground-avatar");
+    if (avatar) {
+      const info = s.online && s.pkg ? appInfo(s.pkg) : null;
+      const avatarHtml = !info ? "—"
+        : info.icon ? `<img src="data:image/png;base64,${info.icon}" alt="" aria-hidden="true">`
+        : APP_PLACEHOLDER;
+      if (avatar.dataset.key !== avatarHtml) {
+        avatar.dataset.key = avatarHtml;
+        avatar.innerHTML = avatarHtml;
+      }
+    }
     present("#stat-pkg-note", s.online && s.pkg
       ? (s.appKind === "game" ? "识别为游戏 · 自动模式使用极速" : s.appKind === "daily" ? "识别为日用 · 自动模式使用省电" : "暂未识别，自动模式先用省电")
       : "前台活动每两秒刷新一次。");
@@ -815,9 +990,9 @@
 
     /* 规则区 */
     renderRules();
+    renderGraphicsViews();
     present("#rules-count", s.rulesLoaded ? `${s.rules.length} 条规则` : "—");
     $("#add-rule").disabled = !editable() || !!s.pending;
-
     /* 关于 */
     present("#about-version", "v" + UI_VERSION);
     present("#about-engine-version", s.version ? "v" + s.version : "待连接");
@@ -832,10 +1007,108 @@
     return { ready: "fas-rs 已检测到", running: "fas-rs 运行中", unreadable: "fas-rs 不可读", invalid: "fas-rs 待就绪", absent: "fas-rs 未检测到", unknown: "待确认" }[s.fasState] || "待确认";
   }
   let ruleQuery="";
+  /* 历史轨迹（十九）：进入页面后按需加载，后台不轮询 */
+  let historyRange = 24, historyLoaded = { range: 0, at: 0 };
+  const historyPoints = [];
+  async function loadHistory() {
+    const status = $("#history-status");
+    if (status) status.textContent = "正在读取守护进程轨迹…";
+    try {
+      const reply = await rootExec(moduleCommand(`history ${historyRange}`), 20000, false);
+      // 规格四：区分各类失败，不统一吞成"history 命令失败"。
+      if (reply.errno !== 0) {
+        const stderr = (reply.stderr || "").trim();
+        const stdout = (reply.stdout || "").trim();
+        if (/未找到本模块的可执行文件/.test(stdout)) {
+          throw new Error("novasched 二进制不存在或模块目录不可用（moduleCommand 未命中）");
+        }
+        if (/root|su[- ]c|权限/i.test(stderr)) {
+          throw new Error(`Root 权限异常：${stderr.slice(0, 120)}`);
+        }
+        throw new Error(`命令执行失败（exit ${reply.errno}）：${(stderr || stdout || "无输出").slice(0, 120)}`);
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(reply.stdout || "{}");
+      } catch (parseError) {
+        // stdout 被日志污染或截断时在此显式暴露，而不是变成"命令失败"。
+        throw new Error(`JSON 解析失败：${String(parseError?.message || parseError).slice(0, 80)}；原始输出前 60 字符：${(reply.stdout || "").slice(0, 60)}`);
+      }
+      historyPoints.length = 0;
+      for (const sample of parsed.samples || []) historyPoints.push(sample);
+      historyLoaded = { range: historyRange, at: Date.now() };
+      if (status) status.textContent = historyPoints.length
+        ? `${historyPoints.length} 个采样点（本机数据，仅保存在设备上）`
+        : "所选时间范围内没有轨迹（历史目录尚未产生采样，或刚清空）；使用一段时间后再来看。";
+      drawHistory();
+    } catch (error) {
+      if (status) status.textContent = `读取失败：${String(error?.message || error).slice(0, 140)}`;
+    }
+  }
+  /* canvas 轨迹：电量（0–100%）与电池温度（双轴）；档位变化画事件刻度。
+     缺口（相邻点间隔 > 3×中位间隔）断线，不补零不跨缺口连接。 */
+  function drawHistory() {
+    const canvas = $("#history-canvas");
+    if (!canvas || !canvas.isConnected) return;
+    const width = canvas.clientWidth || 360, height = 260;
+    canvas.width = width * (window.devicePixelRatio || 1);
+    canvas.height = height * (window.devicePixelRatio || 1);
+    const ctx = canvas.getContext && canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+    ctx.clearRect(0, 0, width, height);
+    const points = historyPoints;
+    if (points.length < 2) return;
+    const t0 = points[0].t, t1 = points[points.length - 1].t;
+    const gaps = [];
+    for (let i = 1; i < points.length; i++) gaps.push(points[i].t - points[i - 1].t);
+    gaps.sort((a, b) => a - b);
+    const medianGap = gaps[gaps.length >> 1] || 30;
+    const X = t => 8 + (t - t0) / Math.max(1, t1 - t0) * (width - 16);
+    const tempMax = 55;
+    const yBatt = v => height * 0.12 + (100 - v) / 100 * height * 0.52;
+    const yTemp = v => height * 0.70 + Math.min(1, Math.max(0, (v - 25) / (tempMax - 25))) * height * 0.22;
+    // 网格
+    ctx.strokeStyle = "rgba(128,128,128,.25)"; ctx.lineWidth = 1;
+    for (const pct of [0, 25, 50, 75, 100]) {
+      ctx.beginPath(); ctx.moveTo(8, yBatt(pct)); ctx.lineTo(width - 8, yBatt(pct)); ctx.stroke();
+    }
+    const broken = (a, b) => (b.t - a.t) > medianGap * 3;
+    // 电量线
+    ctx.strokeStyle = "#4dd0e1"; ctx.lineWidth = 2; ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.battery == null) { pen = false; continue; }
+      const x = X(p.t), y = yBatt(p.battery);
+      if (!pen || (i > 0 && broken(points[i - 1], p))) { ctx.moveTo(x, y); pen = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // 温度线
+    ctx.strokeStyle = "#ffb74d"; ctx.beginPath(); pen = false;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.temp == null) { pen = false; continue; }
+      const x = X(p.t), y = yTemp(p.temp);
+      if (!pen || (i > 0 && broken(points[i - 1], p))) { ctx.moveTo(x, y); pen = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // 档位变化事件刻度
+    ctx.strokeStyle = "rgba(255,255,255,.5)";
+    for (let i = 1; i < points.length; i++) {
+      if (points[i].mode !== points[i - 1].mode) {
+        const x = X(points[i].t);
+        ctx.beginPath(); ctx.moveTo(x, height * 0.06); ctx.lineTo(x, height * 0.10); ctx.stroke();
+      }
+    }
+    canvas._historyMeta = { t0, t1, yBatt, yTemp, X };
+  }
   function renderRules() {
     const root = $("#rule-list");
     /* 心跳每 2 秒触发一次 render：内容没变时绝不重建 DOM，否则规则页会随心跳闪烁 */
-    const key = JSON.stringify([ruleQuery, s.rulesLoaded, s.rules, [...labels.entries()].map(([k, v]) => [k, v.appLabel])]);
+    const key = JSON.stringify([ruleQuery, s.rulesLoaded, s.rules, [...labels.entries()].map(([k, v]) => [k, v.appLabel, v.icon]), s.graphics.rules, s.fpsRules]);
     if (root.dataset.key === key) return;
     root.dataset.key = key;
     if (!s.rulesLoaded) {
@@ -846,16 +1119,149 @@
       const matches=s.rules.filter(rule=>!ruleQuery || (rule.package+" "+appInfo(rule.package).name).toLowerCase().includes(ruleQuery));
       root.innerHTML = matches.map((rule,index) => {
         const a = appInfo(rule.package);
-        return `<div class="rule-shell"><button class="swipe-delete" data-rule-delete="${esc(rule.package)}" type="button" tabindex="-1" aria-hidden="true">删除</button><button class="rule-row g" data-role="course" data-color-index="${index % 6}" data-radius="18" type="button" data-edit="${esc(rule.package)}" aria-label="${esc(a.name)}，${esc(MODES[rule.mode]?.name || "未知")}档">
-          <span class="app-avatar rule-avatar" style="background:${avatarColor(a.name)}">${esc(a.initial)}</span>
+        // 非默认图形后端在行内显示摘要徽标；默认（跟随系统）不显示。
+        const gfx = s.graphics.rules[rule.package];
+        const gfxBadge = gfx === "angle" ? '<span class="gfx-badge" title="OpenGL ES 经 ANGLE 转译，目标应用需完全退出重开生效">ANGLE</span>' : "";
+        const fpsRule = (s.fpsRules || {})[rule.package];
+        const fpsBadge = fpsRule ? `<span class="gfx-badge" title="调度目标（NovaFAS 帧基线，非强制限帧）">${fpsRule}FPS</span>` : "";
+        return `<div class="rule-shell"><button class="swipe-delete" data-rule-delete="${esc(rule.package)}" type="button" tabindex="-1" aria-hidden="true">删除</button><button class="rule-row g" data-role="course" data-color-index="${index % 6}" data-radius="18" type="button" data-edit="${esc(rule.package)}" aria-label="${esc(a.name)}，${esc(MODES[rule.mode]?.name || "未知")}档${gfx === "angle" ? "，ANGLE 后端" : ""}">
+          ${a.icon
+            ? `<img class="app-avatar rule-avatar" src="data:image/png;base64,${a.icon}" alt="" aria-hidden="true">`
+            : `<span class="app-avatar rule-avatar app-avatar-ph">${APP_PLACEHOLDER}</span>`}
           <span class="rule-copy"><b>${esc(a.name)}</b><small>${esc(rule.package)}</small></span>
-          <span class="mode-badge">${esc(MODES[rule.mode]?.name || "未知")}</span>
+          <span class="mode-badge">${esc(MODES[rule.mode]?.name || "未知")}</span>${gfxBadge}${fpsBadge}
           <svg class="chev" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
         </button></div>`;
       }).join("") || `<div class="rule-empty">没有找到匹配的应用</div>`;
     }
+    /* 名称/图标通道不可用时的如实提示：模块 meta 通道重试耗尽且一条名称
+       都没拿到时说明原因，不让用户对着裸包名猜链路状态。 */
+    const rulesNote = $("#rules-note");
+    if (rulesNote) {
+      const anyNamed = s.rules.some(rule => labels.get(basePackage(rule.package))?.appLabel);
+      rulesNote.textContent = (!s.rulesLoaded || !s.rules.length || anyNamed)
+        ? "本地自动模式关闭后，应用规则生效。"
+        : `应用名称与图标暂不可用（${metaDiag.lastError || "模块通道查询失败，已停止重试；重开本页可重试"}；本会话批次 ${metaDiag.batches}、名称命中 ${metaDiag.labels}、图标命中 ${metaDiag.icons}）。展示包名，调度不受影响。`;
+    }
     /* 新增的玻璃行注册到渲染器 */
     window.NovaGlass?.scan(root);
+  }
+  /* ================= 逐应用图形 / Vulkan 视图（规则页卡 + 独立页） ================= */
+  const GRAPHICS_STATUS_TEXT = {
+    applied: "已写入（读回一致）", pending: "已配置 · 待同步", follow: "跟随系统",
+    auto: "自动", unsupported: "不支持", disabled: "已停用", failed: "失败",
+  };
+  function graphicsStatusTitle(pkg) {
+    const info = s.graphics.status?.[pkg];
+    if (!info) return "";
+    return `状态 ${GRAPHICS_STATUS_TEXT[info.status] || info.status}${info.detail ? "：" + info.detail : ""}`;
+  }
+  function renderGraphicsViews() {
+    if (!s.graphics.probed) return;
+    const cap = s.graphics.capability;
+    const vulkanText = !cap ? "—"
+      : !cap.vulkan.length ? "未检测到 Vulkan HAL"
+      : cap.vulkan.map(device => `${device.name} (API ${device.api})`).join(" · ");
+    const angleText = cap ? (cap.angle ? "可用" : "未安装") : "未知";
+    const sdkText = cap && cap.sdk ? `Android SDK ${cap.sdk}` : "Android SDK —";
+    present("#graphics-cap-angle", angleText);
+    present("#graphics-cap-vulkan", vulkanText);
+    present("#graphics-cap-time", s.graphics.probed ? "已探测" : "—");
+    present("#gpage-angle", angleText);
+    present("#gpage-vulkan", vulkanText);
+    present("#gpage-sdk", sdkText);
+    present("#graphics-page-cap-time", s.graphics.probed ? "已探测" : "—");
+    const entries = Object.entries(s.graphics.rules || {});
+    const renderInto = (rootId, withEntry) => {
+      const root = $(rootId);
+      if (!root) return;
+      const key = JSON.stringify([entries, s.graphics.status, s.rules]);
+      if (root.dataset.key === key) return;
+      root.dataset.key = key;
+      if (!entries.length) {
+        root.innerHTML = `<div class="rule-empty">还没有图形后端规则<br><small>在规则页编辑应用时选择后端（跟随系统/自动/ANGLE/原生/Vulkan）。</small></div>`;
+        window.NovaGlass?.scan(root);
+        return;
+      }
+      root.innerHTML = entries.map(([pkg, mode]) => {
+        const a = appInfo(pkg);
+        const info = s.graphics.status?.[pkg] || {};
+        const statusText = GRAPHICS_STATUS_TEXT[info.status] || info.status || "待同步";
+        const detail = info.detail || "";
+        return `<button class="rule-row g" data-role="course" data-radius="18" type="button" data-edit="${esc(pkg)}" aria-label="${esc(a.name)}，图形后端 ${esc(mode)}">
+          ${a.icon
+            ? `<img class="app-avatar rule-avatar" src="data:image/png;base64,${a.icon}" alt="" aria-hidden="true">`
+            : `<span class="app-avatar rule-avatar app-avatar-ph">${APP_PLACEHOLDER}</span>`}
+          <span class="rule-copy"><b>${esc(a.name)}</b><small>${esc(pkg)}</small></span>
+          <span class="mode-badge" title="${esc(detail)}">${esc(mode)}${info.status && info.status !== "applied" ? " · " + esc(statusText) : ""}</span>
+          <svg class="chev" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
+        </button>`;
+      }).join("");
+      window.NovaGlass?.scan(root);
+    };
+    renderInto("#graphics-rule-list", true);
+    renderInto("#graphics-page-list", true);
+    present("#gpage-count", `${entries.length} 条`);
+  }
+  /* ================= DeepSeek 自适应引擎页 ================= */
+  let aiProbed = false;
+  function probeAi(force = false) {
+    if (!force && aiProbed) return;
+    if (typeof bridge()?.exec !== "function") return;
+    rootExec(moduleCommand("ai-status"), 8000, false).then(result => {
+      if (result.errno !== 0) return;
+      aiProbed = true;
+      renderAi(result.stdout || "");
+    }).catch(() => {});
+  }
+  function renderAi(statusText) {
+    const get = key => (statusText.match(new RegExp(`^${key}=(.*)$`, "m")) || [])[1] || "";
+    const mode = get("ai_mode") || "off";
+    $$("#page-ai [data-ai-mode]").forEach(button =>
+      button.classList.toggle("active", button.dataset.aiMode === mode));
+    present("#ai-mode-badge", get("ai_mode_label") || mode);
+    present("#ai-mode-note", `当前：${get("ai_mode_label") || mode}。Key 指纹 ${get("key") || "未设置"}；接口 ${get("base_url") || "—"} · 模型 ${get("model") || "—"}`);
+    present("#ai-key-badge", get("key") || "未设置");
+    present("#ai-usage-calls", get("calls_today") || "0");
+    present("#ai-usage-tokens", `今日 token ${get("tokens_today") || 0}（最近一次 ${get("last_tokens") || 0}）；用量与费用由用户在 DeepSeek 侧承担，本地已做配额+冷却+签名去重三重限频。`);
+    const policyRaw = get("policy");
+    const policyValid = policyRaw.startsWith("valid");
+    const expiresMatch = policyRaw.match(/expires_in=(\d+)/);
+    present("#ai-policy-note", policyValid
+      ? `临时策略生效（Scene 切档即失效）：${policyRaw.split(";").slice(1).join(" · ")}${get("policy_summary") ? " · " + get("policy_summary") : ""}`
+      : "临时策略：无（关闭/观察模式只记录建议，不参与调度；过期或 Scene 切换后自动失效）");
+    const decision = get("last_decision");
+    present("#ai-last-decision", `最近决策：${decision || "—"}`);
+    const input = $("#ai-model-input");
+    if (input && document.activeElement !== input) input.value = get("model") || "deepseek-chat";
+    const url = $("#ai-url-input");
+    if (url && document.activeElement !== url) url.value = get("base_url") || "";
+  }
+  function probeAiLog() {
+    if (typeof bridge()?.exec !== "function") return;
+    rootExec(moduleCommand("ai-log"), 8000, false).then(result => {
+      const lines = (result.stdout || "").split("\n").filter(line => line.trim()).reverse().slice(0, 30);
+      const root = $("#ai-log-list");
+      if (!root) return;
+      const key = (result.stdout || "").length + ":" + lines[0];
+      if (root.dataset.key === key) return;
+      root.dataset.key = key;
+      root.innerHTML = lines.length ? lines.map(line => {
+        let at = "", text = line;
+        try { const obj = JSON.parse(line); at = new Date((obj.at || 0) * 1000).toLocaleTimeString(); text = obj.summary || obj.reason || obj.error || obj.text || line; } catch (_) {}
+        return `<button class="rule-row g" type="button"><span class="rule-copy"><b>${esc(text)}</b><small>${esc(at)}</small></span></button>`;
+      }).join("") : `<div class="rule-empty">暂无 AI 调度日志<br><small>设置 Key 并触发事件（或点「立即分析」）后这里会出现决策与原因。</small></div>`;
+      present("#ai-log-count", `${lines.length} 条`);
+    }).catch(() => {});
+  }
+  function aiApply(fn, okMessage) {
+    return fn.then(result => {
+      const text = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+      if (result.errno !== 0) { toast(text.slice(0, 200) || "命令失败"); return false; }
+      toast(okMessage || text.slice(0, 200));
+      probeAi(true); probeAiLog();
+      return true;
+    }).catch(error => { toast(`失败：${String(error?.message || error).slice(0, 140)}`); return false; });
   }
 
   /* ---------------- 日志渲染（增量追加，避免整表重建卡顿） ---------------- */
@@ -898,7 +1304,9 @@
   const logsActive = () => s.page === "logs";
 
   /* ---------------- 页面切换（底部胶囊 dock，双向转场） ---------------- */
-  const PAGE_IDS = ["overview", "rules", "logs", "about"];
+  const PAGE_IDS = ["overview", "rules", "logs", "about", "history", "graphics", "ai"];
+  /* 子页面没有 dock 按键：高亮跟随父页（图形→规则，AI→设置）。 */
+  const DOCK_PARENT = { graphics: "rules", ai: "about" };
   let currentPage = "overview", routeDepth = 0;
   const pageScroll = new Map();
   const motionQuery=window.matchMedia?.("(prefers-reduced-motion: reduce)");
@@ -917,6 +1325,42 @@
   }
   function finishMotion(){stopPageMotion?.();for(const motion of [...motions.values()])motion.finish();}
   motionQuery?.addEventListener?.("change",()=>{if(reducedMotion())finishMotion();});
+  /* 物理弹簧：欠阻尼二阶系统（ζ≈0.84，轻微过冲）按 16ms 采样成 WAAPI
+     关键帧，每帧 easing:"linear"——运动由采样值承载，而不是把一条
+     cubic-bezier 宣称成弹簧。时长由收敛阈值推导（约 430ms，与旧转场
+     时长同量级），不写固定毫秒。 */
+  const SPRING={stiffness:170,damping:22,dt:1/60,maxMs:900,threshold:.01,velocity:.04};
+  function springFrames(p0){
+    const {stiffness,damping,dt,maxMs,threshold,velocity}=SPRING;
+    const frames=[p0];let p=p0,v=0,t=0;
+    while(t<maxMs){
+      const a=-stiffness*(p-1)-damping*v;
+      v+=a*dt;p+=v*dt;t+=dt*1000;
+      frames.push(p);
+      if(Math.abs(p-1)<threshold&&Math.abs(v)<velocity)break;
+    }
+    frames.push(1);
+    return frames;
+  }
+  /* 把 0..1（可过冲）的弹簧进度映射为关键帧属性；build 每帧调用一次。 */
+  function springKeyframes(p0,build){
+    const frames=springFrames(p0),last=frames.length-1;
+    return {frames:frames.map((p,i)=>({...build(p),offset:i===0?0:i/last,easing:"linear"})),duration:Math.round(frames.length*1000/60)};
+  }
+  /* 中断续接：元素在动画或拖拽中时，读取当前计算矩阵作为起点，
+     新动画从当前位置继续，不跳回端点重放。宿主不提供
+     getComputedStyle 时返回 null，动画退回端点起播。 */
+  function currentMotionState(element){
+    if(typeof getComputedStyle!=="function")return null;
+    const computed=element&&getComputedStyle(element);
+    if(computed&&computed.transform&&computed.transform.startsWith("matrix(")){
+      const parts=computed.transform.slice(7,-1).split(",").map(Number);
+      if(parts.length===6&&parts.every(Number.isFinite)){
+        return {dx:parts[4],dy:parts[5],sx:parts[0]||1,sy:parts[3]||1,op:Number(computed.opacity)||0,raw:true};
+      }
+    }
+    return null;
+  }
   /* 兼容别名：所有触感统一走 NovaHaptics 语义层 */
   function haptic() { NovaHaptics.select(); }
   function rememberRoute(overlay = null, replace = false) {
@@ -934,15 +1378,86 @@
     document.body.classList.toggle("overlay-open", modal);
     document.body.style.overflow=modal?"hidden":"";
   }
-  /* 锚点 morph：打开与关闭共用同一组关键帧，关闭时反向播放，
-     元素精确回到它的来源锚点（从哪来就从哪回去）。 */
-  function morph(element,anchor,opening=true,complete){
-    const target=element?.getBoundingClientRect(),from=anchor?.getBoundingClientRect();
-    let small="translateY(12px) scale(.96)";
-    if(target?.width&&target.height&&from?.width&&from.height){const dx=from.left+from.width/2-target.left-target.width/2,dy=from.top+from.height/2-target.top-target.height/2;small=`translate(${dx}px,${dy}px) scale(${Math.max(.08,from.width/target.width)},${Math.max(.08,from.height/target.height)})`;}
-    const frames=[{transform:small,opacity:0},{transform:"none",opacity:1}];
-    const motion=ownedMotion(element,opening?frames:[...frames].reverse(),{duration:opening?420:320,easing:"cubic-bezier(.22,.8,.25,1)",fill:"both"},complete);
-    window.NovaGlass?.invalidate(500);return motion;
+  /* 锚点 morph（FLIP + 缩放补偿）：打开与关闭共用同一几何描述，
+     弹簧驱动、可中断——从当前实际位置/圆角继续，不跳回端点。
+     文字保护：内容包进 .morph-inner 并做逐帧反向缩放，容器按真实边界
+     缩放而文字/图标始终以目标尺寸渲染（经典 FLIP 补偿），不存在
+     “文字随容器拉伸”。圆角：每帧写入 rv/sx、rv/sy 的水平/垂直半径，
+     渲染出的圆角恒等于起点→终点的线性插值，中途与结尾都不跳变。
+     玻璃装饰层 .glass-surface 留在容器外（弹层的预览态选择器依赖
+     直接子代关系）。 */
+  const morphRadius = new WeakMap();
+  function ensureMorphInner(element) {
+    if (element.dataset.morphInner === "1") return element.querySelector(":scope > .morph-inner");
+    const inner = document.createElement("div");
+    inner.className = "morph-inner";
+    // 静态快照遍历：appendChild 会移动节点，while(firstChild) 写法会在
+    // “最后一个子节点是玻璃装饰层”时原地自旋。
+    for (const node of [...element.childNodes]) {
+      if (node.nodeType === 1 && node.classList.contains("glass-surface")) continue;
+      inner.appendChild(node);
+    }
+    element.appendChild(inner);
+    element.dataset.morphInner = "1";
+    return inner;
+  }
+  function readRadius(element) {
+    if (morphRadius.has(element)) return morphRadius.get(element);
+    if (typeof getComputedStyle !== "function") return 22;
+    const value = parseFloat(getComputedStyle(element).borderTopLeftRadius);
+    return Number.isFinite(value) ? value : 22;
+  }
+  function morph(element,anchor,opening=true,complete,startState=null){
+    const target=element?.getBoundingClientRect(),anchorRect=anchor?.getBoundingClientRect();
+    let small={dx:0,dy:12,sx:.96,sy:.96,op:0};
+    if(target?.width&&target.height&&anchorRect?.width&&anchorRect.height){
+      small={dx:anchorRect.left+anchorRect.width/2-target.left-target.width/2,dy:anchorRect.top+anchorRect.height/2-target.top-target.height/2,
+        sx:Math.max(.08,anchorRect.width/target.width),sy:Math.max(.08,anchorRect.height/target.height),op:0};
+    }
+    const identity={dx:0,dy:0,sx:1,sy:1,op:1};
+    const midFlight=motions.has(element)||!!element?.style?.transform;
+    let from=startState||(opening&&!midFlight?small:currentMotionState(element)||(opening?small:identity));
+    const to=opening?identity:small;
+    const lerp=(a,b,m)=>a+(b-a)*m;
+    // 圆角端点：打开=锚点圆角→容器圆角；关闭=容器圆角→锚点圆角。
+    // 中断续接时从上一动画最后帧记录的圆角出发。
+    const rFrom=opening?readRadius(anchor):readRadius(element);
+    const rTo=opening?readRadius(element):(readRadius(anchor)||rFrom);
+    const build=m=>{
+      const sx=lerp(from.sx,to.sx,m),sy=lerp(from.sy,to.sy,m);
+      const rv=Math.max(0,lerp(rFrom,rTo,m));
+      morphRadius.set(element,rv);
+      return {
+        transform:`translate(${lerp(from.dx,to.dx,m)}px, ${lerp(from.dy,to.dy,m)}px) scale(${lerp(from.sx,to.sx,m)}, ${lerp(from.sy,to.sy,m)})`,
+        opacity:Math.max(0,Math.min(1,lerp(from.op,to.op,m))),
+        borderRadius:`${(rv/Math.max(.05,sx)).toFixed(1)}px / ${(rv/Math.max(.05,sy)).toFixed(1)}px`
+      };
+    };
+    const {frames,duration}=springKeyframes(0,build);
+    // 内容反缩放：内层每帧 1/sx、1/sy，抵消容器缩放——内容始终以
+    // 目标尺寸渲染，展开时从容器的真实边界逐渐显露（FLIP 裁切接入）。
+    const inner=element?.dataset ? ensureMorphInner(element) : null;
+    const prevOverflow=inner?.parentElement?element.style.overflow:"",prevPE=inner?inner.style.pointerEvents:"";
+    let innerMotion=null;
+    if(inner){
+      const sx0=from.sx,sy0=from.sy,tx=to.sx,ty=to.sy;
+      const innerFrames=frames.map(frame=>{
+        const match=/scale\(([-\d.]+), ([-\d.]+)\)/.exec(frame.transform);
+        const sx=match?parseFloat(match[1]):lerp(sx0,tx,frame.offset),sy=match?parseFloat(match[2]):lerp(sy0,ty,frame.offset);
+        return {...frame,transform:`scale(${(1/Math.max(.05,sx)).toFixed(4)}, ${(1/Math.max(.05,sy)).toFixed(4)})`};
+      });
+      innerMotion=ownedMotion(inner,innerFrames,{duration,fill:"both"},null);
+      // 飞行期间冻结滚动与指针：约 0.4 秒，落定后恢复原状态。
+      element.style.overflow="hidden";
+      inner.style.pointerEvents="none";
+    }
+    const motion=ownedMotion(element,frames,{duration,fill:"both"},finished=>{
+      innerMotion?.cancel();
+      if(element){element.style.overflow=prevOverflow;}
+      if(inner){inner.style.pointerEvents=prevPE;}
+      complete?.(finished);
+    });
+    window.NovaGlass?.invalidate(Math.min(600,duration+120));return motion;
   }
   function animatePageSwitch(previous,next,forward){
     stopPageMotion?.();
@@ -952,10 +1467,23 @@
       let motion;const finish=()=>{motion?.cancel();if(stopPageMotion===finish)stopPageMotion=null;};stopPageMotion=finish;
       motion=ownedMotion(incoming,[{opacity:.45},{opacity:1}],{duration:220,easing:"ease-out",fill:"both"},()=>{if(stopPageMotion===finish)stopPageMotion=null;});window.NovaGlass?.invalidate(320);return;
     }
-    const duration=360,easing="cubic-bezier(.22,.8,.25,1)";let out,inn,timer=0,done=0,settled=false;
+    let out,inn,timer=0,done=0,settled=false;
     const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);for(const a of [out,inn])if(a){a.onfinish=null;a.oncancel=null;a.cancel();}outgoing.classList.remove("leaving");if(stopPageMotion===finish)stopPageMotion=null;window.NovaGlass?.invalidate(240);};
     stopPageMotion=finish;outgoing.classList.add("leaving");
-    try{out=outgoing.animate([{transform:"none",opacity:1},{transform:`translateX(${forward?"-12%":"12%"})`,opacity:0}],{duration,easing,fill:"both"});inn=incoming.animate([{transform:`translateX(${forward?"18%":"-18%"})`,opacity:0},{transform:"none",opacity:1}],{duration,easing,fill:"both"});const ended=()=>{if(++done===2)finish();};out.onfinish=ended;inn.onfinish=ended;out.oncancel=finish;inn.oncancel=finish;timer=setTimeout(finish,duration+100);}catch(_){finish();}
+    // 弹簧驱动 + 中断续接：快速连点切页时从各页当前计算位移继续，
+    // 不从 ±12%/±18% 端点重放。
+    const restPct=()=>Math.round((mainScroll.clientWidth||1)*.18);
+    const shift=(element,rest)=>currentMotionState(element)||{dx:rest,dy:0,sx:1,sy:1,op:rest?0:1};
+    const outFrom=shift(outgoing,0),inFrom=shift(incoming,1);
+    const outDx=(forward?-1:1)*restPct();
+    const outBuild=m=>({transform:`translateX(${outFrom.dx+(outDx-outFrom.dx)*m}px)`,opacity:Math.max(0,Math.min(1,outFrom.op*(1-m)))});
+    const inBuild=m=>({transform:`translateX(${inFrom.dx*(1-m)}px)`,opacity:Math.max(0,Math.min(1,inFrom.op+(1-inFrom.op)*m))});
+    try{
+      const outSpec=springKeyframes(0,outBuild),inSpec=springKeyframes(0,inBuild);
+      out=outgoing.animate(outSpec.frames,{duration:outSpec.duration,fill:"both"});
+      inn=incoming.animate(inSpec.frames,{duration:inSpec.duration,fill:"both"});
+      const ended=()=>{if(++done===2)finish();};out.onfinish=ended;inn.onfinish=ended;out.oncancel=finish;inn.oncancel=finish;timer=setTimeout(finish,Math.max(outSpec.duration,inSpec.duration)+120);
+    }catch(_){finish();}
     window.NovaGlass?.invalidate(460);
   }
   function setPage(page, fromHistory = false) {
@@ -973,13 +1501,19 @@
       node.setAttribute("aria-hidden", String(node.id !== "page-" + page));
       node.inert=node.id!=="page-"+page;
     });
-    const index = PAGE_IDS.indexOf(page);
+    const index = PAGE_IDS.indexOf(DOCK_PARENT[page] ?? page);
     $$(".dock button").forEach((button, buttonIndex) => {
       if (buttonIndex === index) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");
     });
     $(".dock").style.setProperty("--tab-index", String(index));
     document.documentElement.dataset.page = page;
+  if (page === "history") {
+    const stale = historyLoaded.range !== historyRange || Date.now() - historyLoaded.at > 60000;
+    if (stale) loadHistory(); else drawHistory();
+  }
+  if (page === "graphics") probeGraphics(true);
+  if (page === "ai") { probeAi(true); probeAiLog(); }
     if (changed) {
       /* Tab 式导航：每个页面保留自己的滚动位置，切回时恢复。 */
       mainScroll.scrollTop = pageScroll.get(page) || 0;
@@ -1005,7 +1539,7 @@
   const dock = $(".dock"); let dockDrag = null, ignoreDockClick = 0;
   dock.addEventListener("pointerdown", event => {
     if(event.button>0||event.isPrimary===false||dockDrag)return;
-    const rect = dock.getBoundingClientRect(), cell = (rect.width - 10) / 4;
+    const rect = dock.getBoundingClientRect(), cell = (rect.width - 10) / 5;
     dockDrag = { pointer: event.pointerId, start: event.clientX, startY: event.clientY, rect, cell, moved: false, index: PAGE_IDS.indexOf(currentPage) };
     /* 按下后下一帧给轻微压缩反馈；不缩放单个按钮，点击区域保持稳定 */
     requestAnimationFrame(() => { if (dockDrag && !dockDrag.moved) dock.classList.add("dock-pressing"); });
@@ -1147,11 +1681,11 @@
     requestAnimationFrame(()=>{if(epoch!==personalEpoch||!layer.classList.contains("open"))return;if(glassOnly)$("#glass-controls").scrollIntoView?.({block:"start"});else $(".personal-scroll").scrollTop=0;$("#personalize-close").focus();});
     window.dispatchEvent(new Event("nova:overlay"));
   }
-  function closePersonalize(fromHistory=false,immediate=false){
+  function closePersonalize(fromHistory=false,immediate=false,startState=null){
     const layer=$("#appearance-layer");if(!layer.classList.contains("open")||layer.classList.contains("closing")&&!immediate)return;
     stopSliderPreview();const epoch=++personalEpoch;motions.get($("#personal-panel"))?.cancel();clearTimeout(personalCloseTimer);
     const finish=finished=>{if(!finished||epoch!==personalEpoch)return;layer.classList.remove("open","closing");layer.setAttribute("aria-hidden","true");if(personalAnchor)personalAnchor.style.visibility="";syncInert();if(!$("#dialog-layer").classList.contains("open")&&personalFocus?.isConnected)personalFocus.focus();window.dispatchEvent(new Event("nova:overlay"));if(!fromHistory&&history.state?.overlay==="appearance")history.back();};
-    layer.classList.add("closing");if(immediate||reducedMotion())finish(true);else morph($("#personal-panel"),personalAnchor,false,finish);
+    layer.classList.add("closing");if(immediate||reducedMotion())finish(true);else morph($("#personal-panel"),personalAnchor,false,finish,startState);
   }
   $("#personalize-open").onclick=event=>openPersonalize(event.currentTarget);
   $("#appearance-settings").onclick=event=>openPersonalize(event.currentTarget);
@@ -1159,9 +1693,32 @@
   $("#personalize-close").onclick=()=>closePersonalize();
   $("#appearance-layer").addEventListener("click",event=>{if(event.target===$("#appearance-layer"))closePersonalize();});
   let panelDrag=null;const panelHandle=$(".personal-title");
-  panelHandle.addEventListener("pointerdown",event=>{if(event.button>0||event.isPrimary===false||event.target.closest("button")||panelDrag)return;panelDrag={id:event.pointerId,y:event.clientY,dy:0};panelHandle.setPointerCapture?.(event.pointerId);});
-  panelHandle.addEventListener("pointermove",event=>{if(!panelDrag||event.pointerId!==panelDrag.id)return;panelDrag.dy=Math.max(0,event.clientY-panelDrag.y);if(panelDrag.dy>8){event.preventDefault();$("#personal-panel").style.transform=`translateY(${Math.min(140,panelDrag.dy)}px)`;window.NovaGlass?.invalidate();}});
-  function endPanelDrag(event,cancelled=false){if(!panelDrag||event.pointerId!==panelDrag.id)return;const drag=panelDrag;panelDrag=null;if(panelHandle.hasPointerCapture?.(event.pointerId))panelHandle.releasePointerCapture?.(event.pointerId);const panel=$("#personal-panel"),transform=panel.style.transform||"none";panel.style.transform="";if(!cancelled&&drag.dy>65)closePersonalize();else if(drag.dy>8)ownedMotion(panel,[{transform},{transform:"none"}],{duration:260,easing:"cubic-bezier(.22,.8,.25,1)",fill:"both"});window.NovaGlass?.invalidate(360);}
+  panelHandle.addEventListener("pointerdown",event=>{if(event.button>0||event.isPrimary===false||event.target.closest("button")||panelDrag)return;panelDrag={id:event.pointerId,y:event.clientY,dy:0,lastY:event.clientY,lastT:performance.now(),v:0};panelHandle.setPointerCapture?.(event.pointerId);});
+  panelHandle.addEventListener("pointermove",event=>{if(!panelDrag||event.pointerId!==panelDrag.id)return;const now=performance.now(),dt=now-panelDrag.lastT;panelDrag.dy=Math.max(0,event.clientY-panelDrag.y);
+    // 速度用最近一次移动采样（px/ms），60ms 内的样本才有效：停住再松手
+    // 不应被视为甩动。
+    if(dt>0&&dt<120){panelDrag.v=(event.clientY-panelDrag.lastY)/dt;panelDrag.lastY=event.clientY;panelDrag.lastT=now;}
+    else if(dt>=120){panelDrag.v=0;panelDrag.lastY=event.clientY;panelDrag.lastT=now;}
+    if(panelDrag.dy>8){event.preventDefault();$("#personal-panel").style.transform=`translateY(${Math.min(140,panelDrag.dy)}px)`;window.NovaGlass?.invalidate();}});
+  function endPanelDrag(event,cancelled=false){
+    if(!panelDrag||event.pointerId!==panelDrag.id)return;
+    const drag=panelDrag;panelDrag=null;
+    if(panelHandle.hasPointerCapture?.(event.pointerId))panelHandle.releasePointerCapture?.(event.pointerId);
+    const panel=$("#personal-panel");
+    // 甩动判定：位移过阈值或释放速度足够大（且方向向下）即完成关闭；
+    // 否则弹簧回弹到原位。取消一律回弹。
+    const fling=!cancelled&&drag.dy>0&&drag.v>0.45;
+    if(!cancelled&&(drag.dy>65||fling)){
+      // 从当前拖拽位置继续关闭动画（morph 读取传入起点，不跳变）。
+      panel.style.transform="";
+      closePersonalize(false,false,{dx:0,dy:drag.dy,sx:1,sy:1,op:1});
+    }else if(drag.dy>8){
+      panel.style.transform="";
+      const {frames,duration}=springKeyframes(0,m=>({transform:`translateY(${drag.dy*(1-m)}px)`,opacity:1}));
+      ownedMotion(panel,frames,{duration,fill:"both"});
+    }
+    window.NovaGlass?.invalidate(360);
+  }
   panelHandle.addEventListener("pointerup",e=>endPanelDrag(e));panelHandle.addEventListener("pointercancel",e=>endPanelDrag(e,true));panelHandle.addEventListener("lostpointercapture",e=>endPanelDrag(e,true));
   $("#wall-pick").onclick=()=>$("#wall-input").click();
   $("#wall-clear").onclick=()=>{ui.wallData="";ui.portrait={centerX:.5,centerY:.5,scale:1};ui.landscape={centerX:.5,centerY:.5,scale:1};saveUI();applyTheme();toast("已恢复默认壁纸");};
@@ -1209,6 +1766,17 @@
 
   /* ---------------- 弹窗 ---------------- */
   let dialogFocus = null, dialogCloseTimer = 0;
+  /* 来源重解析：列表渲染会重建行元素，关闭时按选择器找回最新的来源行，
+     morph 回到它的当前位置；行已被删除/筛除时自然降级（收拢到原位小态）。 */
+  let dialogAnchorQuery = null;
+  function dialogAnchor() {
+    if (dialogFocus?.isConnected) return dialogFocus;
+    if (dialogAnchorQuery) {
+      const row = document.querySelector(dialogAnchorQuery);
+      if (row) return row;
+    }
+    return dialogFocus;
+  }
   function openDialog(bodyHtml) {
     const epoch=++dialogEpoch,reopening=$("#dialog-layer").classList.contains("closing");
     motions.get($(".dialog"))?.cancel();clearTimeout(dialogCloseTimer);$("#dialog-layer").classList.remove("closing");
@@ -1222,17 +1790,55 @@
     syncInert();
     $("#dialog-close").onclick = () => closeDialog();
     window.NovaGlass?.scan(layer);
-    if(firstOpen||reopening)morph($(".dialog"),dialogFocus);else ownedMotion($("#dialog-body"),[{opacity:.45,transform:"translateY(5px)"},{opacity:1,transform:"none"}],{duration:180,easing:"ease-out",fill:"both"});
+    if(firstOpen||reopening)morph($(".dialog"),dialogAnchor());else ownedMotion($("#dialog-body"),[{opacity:.45,transform:"translateY(5px)"},{opacity:1,transform:"none"}],{duration:180,easing:"ease-out",fill:"both"});
     window.dispatchEvent(new Event("nova:dialog"));
     requestAnimationFrame(() => { if(epoch===dialogEpoch&&layer.classList.contains("open")) ($("#dialog-input") || $("#dialog-close")).focus(); });
     return epoch;
   }
-  function closeDialog(fromHistory=false,immediate=false){
+  function closeDialog(fromHistory=false,immediate=false,startState=null){
     const layer=$("#dialog-layer");if(!layer.classList.contains("open")||layer.classList.contains("closing")&&!immediate)return;
     const epoch=++dialogEpoch;motions.get($(".dialog"))?.cancel();clearTimeout(dialogCloseTimer);
     const finish=finished=>{if(!finished||epoch!==dialogEpoch)return;layer.classList.remove("open","closing");layer.setAttribute("aria-hidden","true");syncInert();if(dialogFocus?.isConnected&&!dialogFocus.closest?.("[inert],[aria-hidden=true]"))dialogFocus.focus();window.dispatchEvent(new Event("nova:dialog"));if(!fromHistory&&history.state?.overlay==="dialog")history.back();};
-    layer.classList.add("closing");if(immediate||reducedMotion())finish(true);else morph($(".dialog"),dialogFocus,false,finish);
+    // 关闭从当前实际状态开始，回到来源的最新有效位置（行元素被列表
+    // 渲染重建后按选择器重解析）；来源消失时自然收拢，不飞向错误位置。
+    layer.classList.add("closing");if(immediate||reducedMotion())finish(true);else morph($(".dialog"),dialogAnchor(),false,finish,startState);
   }
+  /* 标题区拖拽关闭：拖多少动多少；按位移与释放速度判定完成或回弹；
+     回弹从当前拖拽位置弹簧续接（保留动量方向），取消一律回弹。
+     仅接管标题区，正文滚动不受影响；系统返回手势与历史路由共用
+     closeDialog 这一个退出状态机。 */
+  let dialogDrag=null;
+  $("#dialog-body").addEventListener("pointerdown",event=>{
+    if(event.button>0||dialogDrag||!$("#dialog-layer").classList.contains("open"))return;
+    if(!event.target.closest("h3,.eyebrow,.dialog-close"))return;
+    dialogDrag={id:event.pointerId,y:event.clientY,dy:0,lastY:event.clientY,lastT:performance.now(),v:0};
+    event.target.setPointerCapture?.(event.pointerId);
+  });
+  $("#dialog-body").addEventListener("pointermove",event=>{
+    if(!dialogDrag||event.pointerId!==dialogDrag.id)return;
+    const now=performance.now(),dt=now-dialogDrag.lastT;
+    dialogDrag.dy=Math.max(0,event.clientY-dialogDrag.y);
+    if(dt>0&&dt<120){dialogDrag.v=(event.clientY-dialogDrag.lastY)/dt;dialogDrag.lastY=event.clientY;dialogDrag.lastT=now;}
+    else if(dt>=120){dialogDrag.v=0;dialogDrag.lastY=event.clientY;dialogDrag.lastT=now;}
+    if(dialogDrag.dy>6){event.preventDefault();$(".dialog").style.transform=`translateY(${Math.min(140,dialogDrag.dy)}px)`;window.NovaGlass?.invalidate();}
+  });
+  function endDialogDrag(event,cancelled=false){
+    if(!dialogDrag||event.pointerId!==dialogDrag.id)return;
+    const drag=dialogDrag;dialogDrag=null;
+    const dialog=$(".dialog");
+    const fling=!cancelled&&drag.dy>0&&drag.v>0.45;
+    if(!cancelled&&(drag.dy>65||fling)){
+      dialog.style.transform="";
+      closeDialog(false,false,{dx:0,dy:drag.dy,sx:1,sy:1,op:1});
+    }else if(drag.dy>6){
+      dialog.style.transform="";
+      const {frames,duration}=springKeyframes(0,m=>({transform:`translateY(${drag.dy*(1-m)}px)`,opacity:1}));
+      ownedMotion(dialog,frames,{duration,fill:"both"});
+    }
+    window.NovaGlass?.invalidate(360);
+  }
+  $("#dialog-body").addEventListener("pointerup",e=>endDialogDrag(e));
+  $("#dialog-body").addEventListener("pointercancel",e=>endDialogDrag(e,true));
   $("#dialog-layer").addEventListener("click", event => {
     if (event.target === $("#dialog-layer")) closeDialog();
   });
@@ -1253,6 +1859,25 @@
     const a = pkg ? appInfo(pkg) : null;
     let selected = existing?.mode || s.mode || "balance";
     if (!own(MODES, selected)) selected = "balance";
+    // 图形后端当前值：独立存储，缺省“跟随系统”。
+    probeGraphics();
+    // 每次打开都强制重探：他处（CLI/另一会话）增删的规则不能显示陈旧值。
+    probeFps(true);
+    probeRefresh(true);
+    const graphicsValue = s.graphics.rules[pkg] || "follow";
+    const angleUsable = s.graphics.available === true;
+    const cap = s.graphics.capability;
+    const vulkanBlockedReason = !cap ? "图形能力未知（root 通道未就绪）"
+      : !cap.vulkan.length ? "未检测到 Vulkan HAL 描述文件（/system|/vendor/etc/vulkan）"
+      : "Android 公开的逐应用驱动入口仅接受 ANGLE/原生；强制 Vulkan 需应用 manifest 自带声明，外部无安全开关——选择后将显示真实 unsupported 原因";
+    const vulkanUsable = !vulkanBlockedReason;
+    const hasRoot = typeof bridge()?.exec === "function";
+    const fpsValue = (s.fpsRules || {})[pkg] || 0;
+    const refreshValue = (s.refreshRules || {})[pkg] || 0;
+    const FPS_OPTIONS = [[0, "跟随应用"], [30, "30"], [45, "45"], [60, "60"], [90, "90"], [120, "120"]];
+    // 面板刷新率选项：只来自设备真实模式列表；解析不到时整行禁用并说明。
+    const REFRESH_OPTIONS = [[0, "跟随系统"], ...s.refreshHzList.map(hz => [hz, String(hz)])];
+    const refreshDisabled = !hasRoot || (s.refreshRules !== null && !s.refreshHzList.length);
     openDialog(`
       <p class="eyebrow">${existing ? "编辑规则" : "新建规则"}</p>
       <h3 id="dialog-title">${existing ? esc(a.name) : "添加应用规则"}</h3>
@@ -1264,16 +1889,88 @@
       <div class="mode-chips" role="group" aria-label="目标档位">
         ${Object.entries(MODES).map(([mode, info]) => `<button type="button" data-chip="${mode}" class="${mode === selected ? "active" : ""}">${info.name}</button>`).join("")}
       </div>
+      <label>图形后端（逐应用 Vulkan 管理）</label>
+      <div class="mode-chips" role="group" aria-label="图形后端">
+        <button type="button" data-gfx="follow" class="${graphicsValue === "follow" ? "active" : ""}">跟随系统</button>
+        <button type="button" data-gfx="auto" class="${graphicsValue === "auto" ? "active" : ""}">自动</button>
+        <button type="button" data-gfx="angle" class="${graphicsValue === "angle" ? "active" : ""}" ${angleUsable && hasRoot ? "" : "disabled"}>ANGLE</button>
+        <button type="button" data-gfx="native" class="${graphicsValue === "native" ? "active" : ""}">原生</button>
+        <button type="button" data-gfx="vulkan" class="${graphicsValue === "vulkan" ? "active" : ""}" ${vulkanUsable && hasRoot ? "" : "disabled"} title="${esc(vulkanBlockedReason)}">Vulkan</button>
+      </div>
+      <p class="dialog-sub" id="graphics-note" style="font-size:11px;">${
+        !hasRoot ? "图形后端需要 root 备用通道；当前不可用，档位规则仍可保存。"
+        : angleUsable ? "ANGLE=官方转译层（逐应用可用）；原生=驱动原生 GL；自动=按能力解析；Vulkan 档显示真实不支持原因（Android 无公开逐应用强制入口）。保存后应用需完全退出重开。"
+        : (s.graphics.reason || "图形后端能力未知") + "；ANGLE 不可用时仍可选自动/原生/Vulkan（按能力降级）。"
+      }</p>
+      <label>目标 FPS（调度目标）</label>
+      <div class="mode-chips" role="group" aria-label="目标 FPS">
+        ${FPS_OPTIONS.map(([value, label]) => `<button type="button" data-fps="${value}" class="${fpsValue === value ? "active" : ""}" ${hasRoot ? "" : "disabled"}>${label}</button>`).join("")}
+      </div>
+      <p class="dialog-sub" id="fps-note" style="font-size:11px;">${
+        hasRoot
+          ? "调度目标：NovaFAS 以此判断帧率是否达标、是否需要加压（应用达不到目标时才提升 CPU）。不是强制限帧，不改变游戏渲染上限。"
+          : "目标 FPS 需要 root 备用通道；当前不可用。"
+      }</p>
+      <label>面板刷新率（Scene 同款）</label>
+      <div class="mode-chips" role="group" aria-label="面板刷新率">
+        ${REFRESH_OPTIONS.map(([value, label]) => `<button type="button" data-refresh="${value}" class="${refreshValue === value ? "active" : ""}" ${refreshDisabled ? "disabled" : ""}>${label}</button>`).join("")}
+      </div>
+      <p class="dialog-sub" id="refresh-note" style="font-size:11px;">${
+        !hasRoot ? "面板刷新率需要 root 备用通道；当前不可用。"
+        : refreshDisabled ? "未能从设备解析出可用的显示模式列表，入口保持可见但暂不可用。"
+        : "前台进入该应用时把面板切到目标刷新率（SurfaceFlinger 激活显示模式，与 Scene 同一机制）；离开后回到启动时的原模式。这不是强制帧率上限，不改变游戏渲染目标。"
+      }</p>
       <div class="dialog-actions">
         <button class="btn-capsule ghost" type="button" id="dialog-cancel">取消</button>
         <button class="btn-capsule accent" type="button" id="dialog-save">保存规则</button>
       </div>
       ${existing ? '<button class="danger-link" type="button" id="dialog-delete">删除这条规则</button>' : ""}
     `);
+    // 关闭时按选择器重解析来源行：列表刷新重建 DOM 后仍回到最新位置。
+    dialogAnchorQuery = pkg ? `[data-edit="${pkg}"]` : "#add-rule";
+    // 探测可能在对话框打开后才返回：返回后就地刷新 ANGLE 可用态与说明，
+    // 不要求用户重开对话框。
+    const editorEpoch = dialogEpoch;
+    // 连接期探测可能尚未返回：强制重探一次（一条只读命令），返回后就地
+    // 刷新 ANGLE 可用态与说明，不要求用户重开对话框。
+    probeGraphics(true).then(g => {
+      if (editorEpoch !== dialogEpoch) return;
+      const angleButton = $('[data-gfx="angle"]');
+      const vulkanChip = $('[data-gfx="vulkan"]');
+      const note = $("#graphics-note");
+      if (!angleButton || !note) return;
+      angleButton.disabled = !(g.available === true && hasRoot);
+      const vulkanBlocked = !g.capability || !g.capability.vulkan.length;
+      if (vulkanChip) {
+        vulkanChip.disabled = vulkanBlocked && hasRoot ? true : !hasRoot;
+        vulkanChip.title = vulkanBlocked
+          ? "Vulkan 档：真实 unsupported 原因链（Android 无公开逐应用强制 Vulkan 入口）"
+          : "Vulkan 档：设备支持 Vulkan，但 Android 公开入口仍仅接受 ANGLE/原生——将显示如实原因";
+      }
+      note.textContent =
+        !hasRoot ? "图形后端需要 root 备用通道；当前不可用，档位规则仍可保存。"
+        : g.available === true ? "ANGLE=官方转译层（逐应用）；自动=按能力解析；Vulkan 档显示真实 unsupported 原因链。写入后应用需完全退出重开生效。"
+        : (g.reason || "图形后端能力未知") + "；ANGLE 不可用时仍可选自动/原生/Vulkan（按能力降级）。";
+    });
     let mode = selected;
+    let graphics = graphicsValue;
+    let fpsTarget = fpsValue;
+    let refreshTarget = refreshValue;
     $$("#dialog-body [data-chip]").forEach(button => button.onclick = () => {
       mode = button.dataset.chip;
       $$("#dialog-body [data-chip]").forEach(node => node.classList.toggle("active", node === button));
+    });
+    $$("#dialog-body [data-gfx]").forEach(button => button.onclick = () => {
+      graphics = button.dataset.gfx;
+      $$("#dialog-body [data-gfx]").forEach(node => node.classList.toggle("active", node === button));
+    });
+    $$("#dialog-body [data-fps]").forEach(button => button.onclick = () => {
+      fpsTarget = Number(button.dataset.fps);
+      $$("#dialog-body [data-fps]").forEach(node => node.classList.toggle("active", node === button));
+    });
+    $$("#dialog-body [data-refresh]").forEach(button => button.onclick = () => {
+      refreshTarget = Number(button.dataset.refresh);
+      $$("#dialog-body [data-refresh]").forEach(node => node.classList.toggle("active", node === button));
     });
     $("#dialog-cancel").onclick = () => closeDialog();
     $("#dialog-save").onclick = () => {
@@ -1283,6 +1980,19 @@
         error.hidden = false;
         error.textContent = "请输入有效的主应用包名，例如 com.example.app。";
         return;
+      }
+      // 图形后端独立保存：与档位规则分属两个存储，互不覆盖。
+      // 仅在用户显式修改时提交；跟随系统 → graphics-remove（只撤销本模块条目）。
+      if (graphics !== (s.graphics.rules[value] || "follow") && hasRoot) {
+        applyGraphics(value, graphics).then(outcome => toast(outcome.message, outcome.ok ? 3200 : 4600));
+      }
+      // 目标 FPS 独立保存（fps_rules.json）；0 = 跟随应用/系统 → 移除。
+      if (fpsTarget !== ((s.fpsRules || {})[value] || 0) && hasRoot) {
+        applyFps(value, fpsTarget).then(outcome => toast(outcome.message, outcome.ok ? 3200 : 4600));
+      }
+      // 面板刷新率独立保存（refresh_rules.json）；0 = 跟随系统 → 移除。
+      if (refreshTarget !== ((s.refreshRules || {})[value] || 0) && hasRoot && !refreshDisabled) {
+        applyRefresh(value, refreshTarget).then(outcome => toast(outcome.message, outcome.ok ? 3200 : 4600));
       }
       if (beginPending("rule", mode, value)) { error.hidden = true; }
     };
@@ -1301,12 +2011,44 @@
       </div>
     `);
     $("#dialog-cancel").onclick = () => showRuleEditor(pkg);
-    $("#dialog-confirm").onclick = () => { if (beginPending("delete", null, pkg)) $("#dialog-confirm").disabled = true; };
+    $("#dialog-confirm").onclick = () => {
+      if (!beginPending("delete", null, pkg)) return;
+      $("#dialog-confirm").disabled = true;
+      // 删除规则同时撤销本模块写入的图形后端覆盖与刷新率规则
+      // （独立存储、只动自己的条目）。
+      if (s.graphics.rules[pkg] && typeof bridge()?.exec === "function") applyGraphics(pkg, "follow");
+      if ((s.refreshRules || {})[pkg] && typeof bridge()?.exec === "function") applyRefresh(pkg, 0);
+    };
   }
   $("#rule-list").addEventListener("click", event => {
     const row = event.target.closest("[data-edit]");
     if (row) showRuleEditor(row.dataset.edit);
   });
+  $$("#page-history .history-range button").forEach(button => button.onclick = () => {
+    historyRange = Number(button.dataset.range) || 24;
+    $$("#page-history .history-range button").forEach(node => node.classList.toggle("active", node === button));
+    loadHistory();
+  });
+  {
+    const canvas = $("#history-canvas");
+    canvas.addEventListener("pointermove", event => {
+      if (!canvas._historyMeta || !historyPoints.length) return;
+      const rect = canvas.getBoundingClientRect();
+      const meta = canvas._historyMeta;
+      const t = meta.t0 + (event.clientX - rect.left - 8) / (rect.width - 16) * (meta.t1 - meta.t0);
+      let best = null, bestDist = Infinity;
+      for (const p of historyPoints) {
+        const dist = Math.abs(p.t - t);
+        if (dist < bestDist) { bestDist = dist; best = p; }
+      }
+      if (!best) return;
+      const tip = $("#history-tip");
+      // 第二阶段·闭环反馈：同一时间线对照"加压幅度 ↔ 实际帧率"——
+      // 有加压没帧收益的时间段在气泡里直接可见。
+      const boostText = Number(best.boost) > 0 ? ` · 加压 ${best.boost}%` : "";
+      if (tip) tip.textContent = `${new Date(best.t * 1000).toLocaleTimeString()} · ${best.pkg || "无前台"} · ${best.mode}档 · 电量 ${best.battery ?? "—"}% · ${best.charging ? "充电中" : "未充电"} · 温度 ${best.temp ?? "—"}℃${best.fps != null ? ` · ${best.fps.toFixed(1)} FPS` : ""}${boostText}`;
+    });
+  }
   $("#add-rule").onclick = () => showRuleEditor("");
 
   /* ---------------- 捐赠与欢迎 ---------------- */
@@ -1501,6 +2243,72 @@
     render();
   };
   $("#scene-diagnose").onclick = () => showDiagnostics(true);
+  $("#open-graphics")?.addEventListener("click", () => { NovaHaptics.select(); setPage("graphics"); });
+  $("#ai-settings-entry")?.addEventListener("click", () => { NovaHaptics.select(); setPage("ai"); });
+  /* DeepSeek 页：三态切换 / Key / 模型 / 接口 / 测试 / 恢复本地调度。 */
+  $$("#page-ai [data-ai-mode]").forEach(button => button.onclick = () => {
+    NovaHaptics.select();
+    aiApply(rootExec(moduleCommand(`ai-mode ${shellQuote(button.dataset.aiMode)}`), 8000, false),
+      { off: "已关闭：完全本地调度", observe: "观察模式：只分析建议，不修改参数", auto: "自动模式：建议经本地验证后参与调度" }[button.dataset.aiMode]);
+  });
+  $("#ai-key-eye")?.addEventListener("click", () => {
+    const input = $("#ai-key-input");
+    if (input) input.type = input.type === "password" ? "text" : "password";
+  });
+  $("#ai-key-save")?.addEventListener("click", () => {
+    const value = ($("#ai-key-input")?.value || "").trim();
+    if (!value) { toast("请输入 API Key"); return; }
+    NovaHaptics.select();
+    aiApply(rootExec(moduleCommand(`ai-key set ${shellQuote(value)}`), 8000, false), "Key 已保存（仅设备本地 0600）")
+      .then(ok => { if (ok) $("#ai-key-input").value = ""; });
+  });
+  $("#ai-key-clear")?.addEventListener("click", () => {
+    NovaHaptics.select();
+    aiApply(rootExec(moduleCommand("ai-key clear"), 8000, false), "Key 已清除")
+      .then(ok => { if (ok) $("#ai-key-input").value = ""; });
+  });
+  $("#ai-test")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    NovaHaptics.select();
+    button.disabled = true;
+    const result = $("#ai-test-result");
+    if (result) result.textContent = "连接测试中…（会消耗一次极小请求）";
+    try {
+      const outcome = await rootExec(moduleCommand("ai-test"), 40000, false);
+      const text = `${outcome.stdout || ""}\n${outcome.stderr || ""}`.trim();
+      const ok = outcome.errno === 0;
+      if (result) { result.textContent = text.slice(0, 200) || (ok ? "成功" : "失败"); result.dataset.ok = ok ? "1" : "0"; }
+      ok ? NovaHaptics.success() : NovaHaptics.failure();
+      probeAi(true);
+    } catch (error) {
+      if (result) result.textContent = `失败：${String(error?.message || error).slice(0, 140)}`;
+      NovaHaptics.failure();
+    } finally { button.disabled = false; }
+  });
+  $("#ai-model-save")?.addEventListener("click", () => {
+    const value = ($("#ai-model-input")?.value || "").trim();
+    if (!value) { toast("请输入模型名"); return; }
+    aiApply(rootExec(moduleCommand(`ai-model ${shellQuote(value)}`), 8000, false), "模型已保存");
+  });
+  $("#ai-url-save")?.addEventListener("click", () => {
+    const value = ($("#ai-url-input")?.value || "").trim();
+    if (!value) { toast("请输入接口地址"); return; }
+    aiApply(rootExec(moduleCommand(`ai-url ${shellQuote(value)}`), 8000, false), "接口地址已保存（localhost/私有地址会被拒绝）");
+  });
+  $("#ai-restore")?.addEventListener("click", () => {
+    NovaHaptics.select();
+    aiApply(rootExec(moduleCommand("ai-restore"), 8000, false), "已恢复本地调度（AI 临时策略已清除）");
+  });
+  $("#scene-release")?.addEventListener("click", () => {
+    if (s.pending) return;
+    NovaHaptics.select();
+    // ZenJooo · 取回控制权：服务端清除 novasched.scene.mode 存档属性；
+    // 守护下一拍回读后 sceneDriving 翻转，横幅消失、四档恢复可点。
+    if (!send("modes", "scene\trelease")) return;
+    s.sceneDriving = false;
+    render();
+    toast("已取回档位控制权");
+  });
   $("#scene-diagnose-settings").onclick = () => showDiagnostics(true);
   $("#about-diagnose").onclick = event => { event.preventDefault(); showDiagnostics(); };
   $("#about-update").onclick = () => showUpdate();
@@ -1584,17 +2392,111 @@
   window.addEventListener("pagehide", suspend);
   window.addEventListener("pageshow", resume);
 
-  /* ---------------- 触感开关（外观组） ---------------- */
+  /* ---------------- 目标 FPS（调度目标，独立存储 fps_rules.json） ----------------
+     Android 无公开的按应用 FPS 强制入口：这里的目标传给 NovaFAS 作为帧
+     基线（达标不加压、低于目标才加压），不改变游戏渲染上限，不称"已限帧"。 */
+  function probeFps(force = false) {
+    if (!force && s.fpsRules) return Promise.resolve(s.fpsRules);
+    if (typeof bridge()?.exec !== "function") return Promise.resolve({});
+    return rootExec(moduleCommand("fps-status"), 8000, false).then(result => {
+      const rules = {};
+      if (result.errno === 0) {
+        for (const match of (result.stdout || "").matchAll(/^rule_(\S+)=(\d+)$/gm)) {
+          if (Number(match[2]) > 0) rules[match[1]] = Number(match[2]);
+        }
+        s.fpsRules = rules;
+        renderRules();
+      }
+      return s.fpsRules || {};
+    }).catch(() => ({}));
+  }
+  function applyFps(pkg, fps) {
+    const command = fps === 0
+      ? moduleCommand(`fps-remove ${shellQuote(pkg)}`)
+      : moduleCommand(`fps-set ${shellQuote(pkg)} ${shellQuote(String(fps))}`);
+    return rootExec(command, 15000, false).then(result => {
+      const text = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+      // fps-set/fps-remove 成功时回显 status()（必含 rules_count=）；失败
+      // 走 stderr 且退出码非 0。旧判定依赖中文文案易误判（审计 F8）。
+      if (result.errno !== 0 || !/rules_count=/.test(result.stdout || "")) {
+        return { ok: false, message: text.slice(0, 160) || "目标 FPS 命令失败" };
+      }
+      s.fpsRules = { ...s.fpsRules };
+      if (fps === 0) delete s.fpsRules[pkg];
+      else s.fpsRules[pkg] = fps;
+      renderRules();
+      return { ok: true, message: `调度目标 ${fps} FPS 已保存：NovaFAS 以此判断是否加压；不改变游戏渲染上限` };
+    }).catch(error => ({ ok: false, message: `目标 FPS 保存失败：${String(error?.message || error).slice(0, 120)}` }));
+  }
+
+  /* ---------------- 面板刷新率（Scene 同款，refresh_rules.json） ----------------
+     机制与 Scene N1 相同：dumpsys display 解析设备真实模式列表，前台切换时
+     `service call SurfaceFlinger 1035` 设置激活显示模式。选项只来自设备真实
+     模式，解析不到就禁用并说明原因，不虚构 Hz。 */
+  function probeRefresh(force = false) {
+    if (!force && s.refreshRules) return Promise.resolve(s.refreshRules);
+    if (typeof bridge()?.exec !== "function") return Promise.resolve({});
+    return rootExec(moduleCommand("refresh-status"), 8000, false).then(result => {
+      const rules = {};
+      const hzList = new Set();
+      let modesError = "";
+      if (result.errno === 0) {
+        for (const match of (result.stdout || "").matchAll(/^rule_(\S+)=(\d+)$/gm)) {
+          if (Number(match[2]) > 0) rules[match[1]] = Number(match[2]);
+        }
+        for (const match of (result.stdout || "").matchAll(/^mode_\d+=(\d+)Hz/gm)) {
+          const hz = Number(match[1]);
+          if (hz >= 30 && hz <= 240) hzList.add(hz);
+        }
+        const unavailable = (result.stdout || "").match(/^modes_unavailable=(.+)$/m);
+        if (unavailable) modesError = unavailable[1].trim().slice(0, 120);
+      } else {
+        modesError = "refresh-status 查询失败";
+      }
+      s.refreshRules = rules;
+      s.refreshHzList = [...hzList].sort((a, b) => b - a);
+      s.refreshModesError = modesError;
+      return rules;
+    }).catch(() => ({}));
+  }
+  function applyRefresh(pkg, hz) {
+    const command = hz === 0
+      ? moduleCommand(`refresh-remove ${shellQuote(pkg)}`)
+      : moduleCommand(`refresh-set ${shellQuote(pkg)} ${shellQuote(String(hz))}`);
+    return rootExec(command, 15000, false).then(result => {
+      const text = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+      // 与 applyFps 同一判定：成功必回显 rules_count=（审计 F8 同类修正）。
+      if (result.errno !== 0 || !/rules_count=/.test(result.stdout || "")) {
+        return { ok: false, message: text.slice(0, 160) || "刷新率规则保存失败" };
+      }
+      s.refreshRules = { ...s.refreshRules };
+      if (hz === 0) delete s.refreshRules[pkg];
+      else s.refreshRules[pkg] = hz;
+      renderRules();
+      return { ok: true, message: `刷新率 ${hz}Hz 已保存：前台进入该应用时切换面板模式（Scene 同款）；不是强制帧率上限` };
+    }).catch(error => ({ ok: false, message: `刷新率保存失败：${String(error?.message || error).slice(0, 120)}` }));
+  }
+
+  /* ---------------- 触感开关（外观组） ----------------
+     通道链路：NovaHostHaptics（若宿主注入）→ `haptic` 系统命令
+     （cmd vibrator_manager，能力探测含 list 振动器检查并缓存）→
+     Web Vibration。各层只声明“请求已提交”，不声称用户感受到了振动。 */
   const hapticsSwitch = $("#haptics-switch");
   const hapticsNote = $("#haptics-note");
+  const hapticsTest = $("#haptics-test");
   function renderHapticsSetting() {
     const on = NovaHaptics.isEnabled();
     hapticsSwitch.setAttribute("aria-checked", String(on));
     const channel = NovaHaptics.channel();
+    const system = NovaHaptics.systemStatus();
     hapticsNote.textContent = !on ? "已关闭"
       : channel === "native" ? "宿主原生触感"
-      : channel === "system" ? "Android 系统触感（遵循系统开关）"
-      : channel === "vibrate" ? "设备振动（系统触感关闭时自动静默）"
+      : channel === "system"
+        ? system.hapticEnabled === false
+          ? "系统触感命令已接入；系统设置中的触感反馈当前为关闭"
+          : "Android 系统触感（遵循系统开关）"
+      : channel === "vibrate" ? "设备振动回退（系统触感未接入或不可用）"
+      : system.wired && system.detail ? `系统触感不可用：${system.detail}`
       : "当前宿主未提供触感能力";
   }
   hapticsSwitch.onclick = () => {
@@ -1603,10 +2505,133 @@
     renderHapticsSetting();
     if (next) NovaHaptics.toggle();
   };
+  if (hapticsTest) hapticsTest.onclick = async () => {
+    probeHaptics(true);
+    hapticsTest.disabled = true;
+    try {
+      const outcome = await NovaHaptics.test();
+      renderHapticsSetting();
+      toast(outcome.message, outcome.ok ? 2600 : 4200);
+    } finally {
+      hapticsTest.disabled = false;
+    }
+  };
   renderHapticsSetting();window.addEventListener("nova:haptics",renderHapticsSetting);
-  let hapticsProbed=false;
-  function probeHaptics(){if(hapticsProbed||typeof bridge()?.exec!=="function")return;hapticsProbed=true;rootExec(moduleCommand("haptic probe"),5000).then(result=>{if(result.errno===0&&/(?:^|\n)haptic=system(?:\n|$)/.test(result.stdout))NovaHaptics.setSystemBridge(async semantic=>{const r=await rootExec(moduleCommand(`haptic ${shellQuote(semantic)}`),5000,false);if(r.errno!==0)throw new Error("系统触感不可用");});}).catch(()=>{});}
-  for(const id of ["personalize-open","appearance-settings","glass-settings"])$("#"+id).addEventListener("click",probeHaptics);
+  /* 系统触感探测：桥接就绪后自动执行一次；瞬时失败有界重试（3 次，
+     退避 1.5s），确定性失败保留原因并允许“测试触感”强制重探。
+     探测结果解析 stdout：channel/haptic_enabled 分别决定通道与静音提示。 */
+  let hapticsProbed = false, hapticsProbeAttempts = 0;
+  function wireHapticsProbe(stdout, stderr, errno) {
+    if (errno === 0) {
+      hapticsProbed = true;
+      hapticsProbeAttempts = 0;
+      const channel = /channel=feedback/.test(stdout) ? "feedback" : /channel=synced/.test(stdout) ? "synced" : "";
+      const hapticEnabled = /haptic_enabled=1/.test(stdout) ? true : /haptic_enabled=0/.test(stdout) ? false : null;
+      if (channel) {
+        NovaHaptics.setSystemBridge(async semantic => {
+          const r = await rootExec(moduleCommand(`haptic ${shellQuote(semantic)}`), 5000, false);
+          if (r.errno !== 0) throw new Error((r.stderr || "系统触感命令失败").trim().slice(0, 120));
+          if (/haptic=submitted/.test(r.stdout || "")) return "submitted";
+          if (/haptic=skipped/.test(r.stdout || "")) return "skipped";
+          throw new Error("系统触感命令未确认提交");
+        }, { hapticEnabled });
+        return;
+      }
+      NovaHaptics.setSystemBridge(null, { detail: (stderr || stdout || "系统没有兼容的触感命令").trim().slice(0, 120) });
+      return;
+    }
+    // 探测本身失败（无兼容命令 / 无振动器）：确定性失败保留原因。
+    hapticsProbed = true;
+    NovaHaptics.setSystemBridge(null, { detail: (stderr || "系统触感探测失败").trim().slice(0, 120) });
+  }
+  function probeHaptics(force = false) {
+    if (!force && (hapticsProbed || typeof bridge()?.exec !== "function")) return;
+    if (hapticsProbeAttempts >= 3) return; // 有界：瞬时故障重试 3 次后停止
+    hapticsProbeAttempts += 1;
+    rootExec(moduleCommand("haptic probe"), 5000)
+      .then(result => wireHapticsProbe(result.stdout || "", result.stderr || "", result.errno))
+      .catch(() => {
+        // 瞬时失败（桥未就绪/root 瞬断）：不清空已接入通道，退避后重试。
+        if (hapticsProbeAttempts < 3) setTimeout(() => { if (!hapticsProbed) probeHaptics(true); }, 1500 * hapticsProbeAttempts);
+        else hapticsProbeAttempts = 0; // 下一轮打开设置时重新允许探测
+      });
+  }
+  for(const id of ["personalize-open","appearance-settings","glass-settings"])$("#"+id).addEventListener("click",() => probeHaptics());
+
+  /* ---------------- 图形后端规则（ANGLE / 跟随系统） ----------------
+     规则存储在 graphics_rules.json，与档位规则（app_modes.txt）相互独立；
+     经 root 备用通道调用 novasched graphics-status / graphics-set /
+     graphics-remove，后端写系统 angle 列表并读回确认。
+     如实声明：ANGLE 是 OpenGL ES 经 ANGLE 转译，不是“原生 Vulkan”；
+     Android 没有公开的按应用强制 Vulkan 入口，本模块不提供虚假选项。
+     生效条件是目标应用完全退出重开；保存成功≠当前进程已切换。 */
+  function probeGraphics(force = false) {
+    if (!force && s.graphics.probed) return Promise.resolve(s.graphics);
+    if (typeof bridge()?.exec !== "function") {
+      s.graphics = { ...s.graphics, available: null, reason: "需要 root 备用通道才能读取图形后端能力" };
+      return Promise.resolve(s.graphics);
+    }
+    return rootExec(moduleCommand("graphics-status"), 8000, false).then(result => {
+      s.graphics = { ...s.graphics, probed: true };
+      if (result.errno !== 0) {
+        s.graphics.available = null;
+        s.graphics.reason = (result.stderr || "graphics-status 查询失败").trim().slice(0, 120);
+        renderGraphicsViews();
+        return s.graphics;
+      }
+      const text = result.stdout || "";
+      const available = /angle_driver_available=yes/.test(text) ? true
+        : /angle_driver_available=no/.test(text) ? false : null;
+      const rules = {};
+      // schema v2：rule_<pkg>=<mode>;enabled=…;status=…;detail=…
+      for (const match of text.matchAll(/^rule_(\S+)=([a-z]+);enabled=(true|false);status=([^;]*);detail=(.*)$/gm)) {
+        rules[match[1]] = match[2];
+      }
+      const status = {};
+      for (const match of text.matchAll(/^rule_(\S+)=[a-z]+;enabled=(?:true|false);status=([^;]*);detail=(.*)$/gm)) {
+        status[match[1]] = { status: match[2], detail: match[3] };
+      }
+      const vulkanDevices = [...text.matchAll(/^vulkan_device=(.+)\|API ([\d.]+)$/gm)]
+        .map(match => ({ name: match[1], api: match[2] }));
+      const sdkMatch = text.match(/^android_sdk=(\d+)$/m);
+      s.graphics.available = available;
+      s.graphics.reason = available === false ? "本机未安装 ANGLE 驱动包（com.google.android.angle）" : "";
+      s.graphics.rules = rules;
+      s.graphics.status = status;
+      s.graphics.capability = {
+        sdk: sdkMatch ? Number(sdkMatch[1]) : null,
+        vulkan: vulkanDevices,
+        angle: available,
+      };
+      renderGraphicsViews();
+      renderRules();
+      return s.graphics;
+    }).catch(error => {
+      s.graphics = { ...s.graphics, available: null, reason: String(error?.message || error).slice(0, 120) };
+      renderGraphicsViews();
+      return s.graphics;
+    });
+  }
+  /* 提交单条图形后端规则并读回；resolve 简短结果文案。跟随系统=移除；
+     vulkan 档返回真实的 unsupported 原因链（写盘成功但状态=unsupported）。 */
+  function applyGraphics(pkg, backend) {
+    const command = backend === "follow"
+      ? moduleCommand(`graphics-remove ${shellQuote(pkg)}`)
+      : moduleCommand(`graphics-set ${shellQuote(pkg)} ${shellQuote(backend)}`);
+    return rootExec(command, 20000, false).then(result => {
+      const text = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+      if (result.errno !== 0) return { ok: false, message: text.slice(0, 160) || "图形后端命令失败" };
+      s.graphics.rules = { ...s.graphics.rules };
+      if (backend === "follow") delete s.graphics.rules[pkg];
+      else s.graphics.rules[pkg] = backend;
+      const unsupported = text.match(/(com\.\S+: 不支持 —— .*)/);
+      renderGraphicsViews();
+      renderRules();
+      if (unsupported) return { ok: true, message: unsupported[1].slice(0, 200) };
+      return { ok: true, message: "图形后端已保存并写回系统设置；目标应用需完全退出重开才能生效" };
+    }).catch(error => ({ ok: false, message: `图形后端保存失败：${String(error?.message || error).slice(0, 120)}` }));
+  }
+
 
   applyTheme();
   loadWallpaperFromStorage();

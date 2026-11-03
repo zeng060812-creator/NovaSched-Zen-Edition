@@ -367,24 +367,44 @@ pub fn request_webui_start(module: &Path) -> Result<&'static str> {
 }
 
 pub fn diagnose(module: &Path) -> Result<()> {
+    print!("{}", diagnose_report(module)?);
+    Ok(())
+}
+
+/// 生成诊断报告文本（`fault-report` 复用同一内容落盘）。
+/// 默认只含公开诊断文件；webui.session 等鉴权数据从不进入报告。
+pub fn diagnose_report(module: &Path) -> Result<String> {
     root()?;
-    println!(
+    let mut out = String::new();
+    let line = |out: &mut String, text: String| {
+        out.push_str(&text);
+        out.push('\n');
+    };
+    line(&mut out, format!(
         "NovaSched Zen Edition {}\ntime={}\nmodule={}\n",
         env!("CARGO_PKG_VERSION"),
         util::local_timestamp(),
         module.display()
-    );
-    let running = match daemon::print_status(module) {
-        Ok(()) => true,
-        Err(error) => { println!("status_error={error}"); false }
+    ));
+    let running = match daemon::health(module) {
+        Ok(status) => {
+            line(&mut out, format!("running=true\nverified=true\n{status}"));
+            true
+        }
+        Err(error) => {
+            let reason = connection_failure(Path::new(STATE_DIR), module, &error);
+            line(&mut out, format!("running=false\nverified=false\nreason={reason}"));
+            false
+        }
     };
-    println!(
+    line(&mut out, format!(
         "manager_gate=none\nmodule_disabled={}\nmodule_remove_pending={}\nboot_completed={}",
         module.join("disable").exists(),
         module.join("remove").exists(),
         util::getprop("sys.boot_completed")
-    );
-    println!("\n[android-user]\n{}", crate::boot_guard::diagnostic());
+    ));
+    line(&mut out, format!("\n[android-user]\n{}", crate::boot_guard::diagnostic()));
+    line(&mut out, format!("\n[graphics-backend]\n{}", crate::graphics::status()));
     for name in [
         "startup",
         "boot-guard",
@@ -397,24 +417,42 @@ pub fn diagnose(module: &Path) -> Result<()> {
         "bootstrap.log",
         "novasched.log",
     ] {
-        println!("\n[{name}]");
+        line(&mut out, format!("\n[{name}]"));
         match tail(&crate::storage::path(Path::new(STATE_DIR), name), 32768) {
-            Ok(s) => println!("{s}"),
-            Err(e) => println!("{e}"),
+            Ok(s) => { out.push_str(&s); out.push('\n'); }
+            Err(e) => line(&mut out, e),
         }
     }
-    if module.join("boot-entry.log").exists(){println!("\n[legacy-module/boot-entry.log]\n{}",tail(&module.join("boot-entry.log"),32768)?);}
-    println!(
+    if module.join("boot-entry.log").exists(){line(&mut out, format!("\n[legacy-module/boot-entry.log]\n{}",tail(&module.join("boot-entry.log"),32768)?));}
+    line(&mut out, format!(
         "\n[scene-telemetry]\n{}",
         crate::telemetry::inspect_scene().diagnostic_text()
-    );
+    ));
     match crate::config::Config::load(Path::new(crate::util::CONFIG_PATH)) {
-        Ok(config) if running => println!("\n[policy-audit]\n{}", daemon::print_policy_audit(&config)),
-        Ok(_) => println!("\n[policy-audit]\n守护未运行，当前配置尚未由本模块下发；启动后再核对策略。"),
-        Err(e) => println!("\n[policy-audit] 配置读取失败: {e}"),
+        Ok(config) if running => line(&mut out, format!("\n[policy-audit]\n{}", daemon::print_policy_audit(&config))),
+        Ok(_) => line(&mut out, "\n[policy-audit]\n守护未运行，当前配置尚未由本模块下发；启动后再核对策略。".into()),
+        Err(e) => line(&mut out, format!("\n[policy-audit] 配置读取失败: {e}")),
     }
+    Ok(out)
+}
+
+/// 用户主动导出的故障报告：与 `diagnose` 同内容，写入本地文件，
+/// 不自动上传；不含鉴权数据。报告大小与保留份数有上限。
+pub fn fault_report(module: &Path) -> Result<()> {
+    let report = diagnose_report(module)?;
+    let capped: String = report.chars().take(256 * 1024).collect();
+    let logs = Path::new(STATE_DIR).join("logs");
+    util::create_dir(&logs)?;
+    let path = logs.join(format!(
+        "fault-report-{}.txt",
+        util::local_timestamp().replace([' ', ':'], "-")
+    ));
+    util::atomic_write(&path, capped.as_bytes(), 0o600)?;
+    println!("报告已保存：{}", path.display());
+    println!("大小 {} 字节；仅保存在本机，不自动上传；可直接作为附件发送", capped.len());
     Ok(())
 }
+
 /// Preserve identity verification and add context, without guessing which
 /// manager/version caused an absent identity. Only public diagnostic files
 /// are read here; webui.session is deliberately never included.

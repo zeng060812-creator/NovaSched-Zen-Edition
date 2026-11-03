@@ -93,6 +93,11 @@ pub fn run(module: &Path) -> Result<()> {
         Ok(notes) => warnings.extend(notes),
         Err(error) => errors.push(format!("Scene 清理未完成：{error}")),
     }
+    // 图形后端规则只撤销本模块写入且未被外部修改的表项；失败不阻断卸载，
+    // 保留恢复记录供重试。
+    println!("  撤销按应用图形后端表项。");
+    let graphics_note = crate::graphics::revert_owned();
+    println!("  {graphics_note}");
 
     if !errors.is_empty(){return Err(format!("恢复未完成，已保留配置、日志和 restore 恢复数据：{}；请重启后重试卸载",errors.join("；")));}
     println!("[4/4] 清理配置、规则、凭据、备份、缓存和日志。");

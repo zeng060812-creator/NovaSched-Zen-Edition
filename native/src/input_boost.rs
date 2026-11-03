@@ -260,6 +260,17 @@ impl Pulse {
             stock
         };
         if activity && state.active && !state.boost_min.is_empty() {
+            // 第二阶段·输入响应优化：NovaFAS 已在节点上持有不低于脉冲目标
+            // 的加压（fas_min ≥ boost_min）时，触摸脉冲不再参与——引擎的
+            // 帧驱动加压已经覆盖交互需求，脉冲只会重复写同一值并延长占用。
+            if !state.fas_min.is_empty()
+                && percent(&state.fas_min)
+                    .zip(percent(&state.boost_min))
+                    .is_some_and(|(fas, pulse)| fas >= pulse)
+            {
+                *self = Self::default();
+                return None;
+            }
             let target = if percent(baseline)? >= percent(&state.boost_min)? {
                 baseline.to_string()
             } else {
@@ -329,17 +340,51 @@ mod tests {
     }
     #[test]
     fn expired_pulse_returns_to_fas_boost_before_dispatcher_baseline() {
+        // 无引擎加压时的经典路径：脉冲建立 → 到期回到最新调度器基线。
+        let now = Instant::now();
+        let mut pulse = Pulse::default();
+        let mut state = state(); // boost_min=30, top_app_min=15
+        assert_eq!(pulse.update(&state, now, true, "15", "0"), Some("30".into()));
+        state.top_app_min = "20".into();
+        assert_eq!(
+            pulse.update(&state, now + Duration::from_millis(301), false, "30", "0"),
+            Some("20".into())
+        );
+    }
+
+    #[test]
+    fn engine_takeover_hands_pulse_ownership_to_fas_without_rewrite() {
+        // 第二阶段·输入响应：脉冲先建立，随后引擎加压 ≥ 脉冲目标——下一次
+        // 触摸让脉冲整体退出（不重复写同一值、不延长占用），节点由引擎的
+        // fas_min 接管；引擎回落后的基线恢复由引擎释放路径负责。
         let now = Instant::now();
         let mut pulse = Pulse::default();
         let mut state = state();
-        // NovaFAS 加压 36 高于脉冲上限 30：按下沿直接保持 36，不写脉冲。
+        assert_eq!(pulse.update(&state, now, true, "15", "0"), Some("30".into()));
         state.fas_min = "36".into();
-        assert_eq!(pulse.update(&state, now, true, "36", "0"), None);
-        // 引擎回落清空 fas_min 后，脉冲到期回到调度器基线 15。
-        state.fas_min.clear();
         assert_eq!(
-            pulse.update(&state, now + Duration::from_millis(301), false, "36", "0"),
-            Some("15".into())
+            pulse.update(&state, now + Duration::from_millis(50), true, "36", "0"),
+            None
+        );
+        assert_eq!(pulse.value, None, "脉冲已退出且不残留旧值");
+    }
+
+    #[test]
+    fn fas_boost_at_or_above_pulse_target_suppresses_the_pulse_entirely() {
+        // fas_min ≥ boost_min：脉冲不参与；fas_min 回落后脉冲照常建立。
+        // 节点当前已是目标值时，建立脉冲也不产生多余写入（返回 None 但
+        // 脉冲状态已就绪，供后续触摸续期）。
+        let now = Instant::now();
+        let mut pulse = Pulse::default();
+        let mut state = state(); // boost_min=30, top_app_min=15
+        state.fas_min = "30".into();
+        assert_eq!(pulse.update(&state, now, true, "30", "0"), None);
+        assert_eq!(pulse.value, None, "脉冲被抑制且不残留旧值");
+        state.fas_min = "20".into();
+        let outcome = pulse.update(&state, now, true, "30", "0");
+        assert!(
+            outcome.is_none() && pulse.value.as_deref() == Some("30"),
+            "fas_min 低于脉冲目标时脉冲恢复建立；节点已是目标值则无写入（实际 {outcome:?}）"
         );
     }
 

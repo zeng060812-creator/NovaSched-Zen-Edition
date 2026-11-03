@@ -12,9 +12,10 @@ pub enum Soc {
     Dimensity8400,
     Dimensity9300Plus,
     Dimensity9400Plus,
+    Dimensity9500,
     XringO3,
 }
-pub const SUPPORTED: [Soc; 12] = [
+pub const SUPPORTED: [Soc; 13] = [
     Soc::Gen1,
     Soc::Gen1Plus,
     Soc::Gen2,
@@ -26,6 +27,7 @@ pub const SUPPORTED: [Soc; 12] = [
     Soc::Dimensity8400,
     Soc::Dimensity9300Plus,
     Soc::Dimensity9400Plus,
+    Soc::Dimensity9500,
     Soc::XringO3,
 ];
 impl Soc {
@@ -42,6 +44,7 @@ impl Soc {
             Self::Dimensity8400 => "DIMENSITY8400",
             Self::Dimensity9300Plus => "MT6989",
             Self::Dimensity9400Plus => "DIMENSITY9400PLUS",
+            Self::Dimensity9500 => "DIMENSITY9500",
             Self::XringO3 => "XRING_O3",
         }
     }
@@ -58,6 +61,7 @@ impl Soc {
             Self::Dimensity8400 => "MediaTek Dimensity 8400",
             Self::Dimensity9300Plus => "MediaTek Dimensity 9300+",
             Self::Dimensity9400Plus => "MediaTek Dimensity 9400+",
+            Self::Dimensity9500 => "MediaTek Dimensity 9500",
             Self::XringO3 => "Xiaomi Xring O3",
         }
     }
@@ -74,6 +78,7 @@ impl Soc {
             Self::Dimensity8400 => "DIMENSITY8400.json",
             Self::Dimensity9300Plus => "MT6989.json",
             Self::Dimensity9400Plus => "DIMENSITY9400PLUS.json",
+            Self::Dimensity9500 => "DIMENSITY9500.json",
             Self::XringO3 => "XRING_O3.json",
         }
     }
@@ -91,6 +96,12 @@ impl Soc {
             // 1×X4 超大核 cpu7（真机采集：vivo V2417A）。
             Self::Dimensity9300Plus => [0, 4, 7, -1],
             Self::Dimensity9400Plus => [0, 4, 7, -1],
+            // 天玑 9500（MT6993）：4×A725 cpu0-3（policy0，300–2700MHz）、
+            // 3×A725 cpu4-6（policy4，300–3500MHz）、1×C1-Ultra cpu7
+            // （policy7，300–4210MHz）。真机采集：Redmi prague
+            // （2604FRK1EC，Android 17），拓扑与频率取自 policies.tsv /
+            // cpus.tsv；识别与准入已验证，档位包络为候选值待真机调优。
+            Self::Dimensity9500 => [0, 4, 7, -1],
             // Legacy eight-core reference; ten-core O3 policies are mapped from the kernel.
             Self::XringO3 => [4, 0, 1, -1],
         }
@@ -165,6 +176,7 @@ pub fn marketing_model(value: &str) -> Option<Soc> {
         }
         "dimensity9300plus" | "天玑9300plus" => Some(Soc::Dimensity9300Plus),
         "dimensity9400plus" | "天玑9400plus" => Some(Soc::Dimensity9400Plus),
+        "dimensity9500" | "天玑9500" => Some(Soc::Dimensity9500),
         "xringo3" | "玄戒o3" => Some(Soc::XringO3),
         _ => None,
     }
@@ -221,9 +233,11 @@ pub fn mtk_platform(value: &str) -> Option<Soc> {
         return None;
     }
     match code {
-        // vivo PD2417（天玑 9300+）以 MT6989 上报；红米 dali 以 MT6991 上报 9400+。
+        // vivo PD2417（天玑 9300+）以 MT6989 上报；红米 dali 以 MT6991 上报 9400+；
+        // 红米 prague（天玑 9500）以 MT6993 上报（真机 device.properties 采集）。
         "6989" => Some(Soc::Dimensity9300Plus),
         "6991" => Some(Soc::Dimensity9400Plus),
+        "6993" => Some(Soc::Dimensity9500),
         _ => None,
     }
 }
@@ -269,6 +283,24 @@ mod tests {
         assert_eq!(mtk_platform("mt6989"), Some(Soc::Dimensity9300Plus));
         assert_eq!(mtk_platform("mt69890"), None);
         assert_eq!(kernel_id(685), Some(Soc::Gen5));
+    }
+
+    #[test]
+    fn dimensity9500_identity_matches_collected_device_evidence() {
+        // 真机采集（Redmi prague / 2604FRK1EC）：ro.soc.model=MT6993、
+        // ro.board.platform=mt6993、营销名 Dimensity 9500。
+        assert_eq!(marketing("Dimensity 9500"), Some(Soc::Dimensity9500));
+        assert_eq!(marketing("MediaTek Dimensity 9500"), Some(Soc::Dimensity9500));
+        assert_eq!(marketing("天玑9500"), Some(Soc::Dimensity9500));
+        assert_eq!(mtk_platform("mt6993"), Some(Soc::Dimensity9500));
+        assert_eq!(mtk_platform("mt69930"), None);
+        // 近似型号不得误认：9400/9400 Ultra 仍不是 9500。
+        assert_eq!(marketing("Dimensity 9400"), None);
+        assert_eq!(marketing("Dimensity 9500 Ultra"), None);
+        assert_eq!(marketing("Dimensity 95000"), None);
+        // 拓扑准入：4+3+1 三簇，与真机 policy0/4/7 对应。
+        assert_eq!(Soc::Dimensity9500.anchors(), [0, 4, 7, -1]);
+        assert_eq!(Soc::Dimensity9500.file(), "DIMENSITY9500.json");
     }
     #[test]
     fn sm_tokens_split_model_from_alphanumeric_suffixes() {

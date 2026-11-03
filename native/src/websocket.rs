@@ -35,8 +35,14 @@ struct RuntimeData {
     controller: String,
     scene_active: bool,
     scene_linked: bool,
+    /// ZenJooo · Scene 接管存档（novasched.scene.mode 非空且已联动）：
+    /// WebUI 据此显示接管横幅并禁用四档按钮。
+    scene_driving: bool,
     phase: String,
     error: String,
+    /// 最近一次状态命令的失败原因（审计 F2：命令失败曾直接断开连接，
+    /// 客户端只能看到"连接中断"，拿不到原因）。
+    command_error: String,
     port: u16,
     tick: Option<Instant>,
     power_profile: String,
@@ -55,6 +61,7 @@ struct RuntimeData {
     fas_engine_source: String,
     fas_engine_reason: String,
     fas_engine_fps: f32,
+    fas_engine_target: u32,
     fas_engine_gpu: f32,
     fas_engine_boost: u32,
     fas_engine_override: bool,
@@ -74,6 +81,8 @@ pub struct PolicyStatus<'a> {
     pub controller: &'a str,
     pub foreign: bool,
     pub linked: bool,
+    /// Scene 正在主导档位（novasched.scene.mode 非空且已联动）。
+    pub driving: bool,
     pub automatic: bool,
     pub phase: &'a str,
     pub error: &'a str,
@@ -94,6 +103,7 @@ impl RuntimeState {
             data.controller = update.controller.into();
             data.scene_active = update.foreign;
             data.scene_linked = update.linked;
+            data.scene_driving = update.driving;
             data.automatic_active = update.automatic;
             data.phase = update.phase.into();
             data.error = update.error.into();
@@ -103,6 +113,24 @@ impl RuntimeState {
             data.fas_mode = update.fas.mode.clone();
             data.fas_sync = update.fas.sync.into();
             data.tick = Some(Instant::now());
+        }
+    }
+
+    /// 状态命令失败原因（审计 F2）：随 payload 推给发起客户端，不断开连接。
+    pub fn set_command_error(&self, error: &str) {
+        if let Ok(mut data) = self.inner.lock() {
+            data.command_error = error
+                .replace(',', "，")
+                .replace(['\n', '\r', ':'], " ")
+                .into();
+        }
+    }
+
+    /// ZenJooo · Scene 接管状态的即时更新（取回控制权/手动切档时立即生效，
+    /// 不等守护下一拍回读 prop）。
+    pub fn set_scene_driving(&self, driving: bool) {
+        if let Ok(mut data) = self.inner.lock() {
+            data.scene_driving = driving;
         }
     }
 
@@ -195,6 +223,7 @@ impl RuntimeState {
             data.fas_engine_source = status.source.into();
             data.fas_engine_reason = status.reason.into();
             data.fas_engine_fps = status.fps;
+            data.fas_engine_target = status.target;
             data.fas_engine_gpu = status.gpu;
             data.fas_engine_boost = status.boost;
             data.fas_engine_override = status.override_active;
@@ -602,8 +631,24 @@ fn handle_state(
         match frame {
             Frame::Text(message) => {
                 if state.runtime.webui_allows_message(&message) {
-                    if !app_endpoint && matches!(message.as_str(), "auto\ton" | "auto\toff") {
-                        state.automatic.set_enabled(message == "auto\ton")?;
+                    if !app_endpoint && message == "scene\trelease" {
+                        // ZenJooo ·「取回控制权」：清除 Scene 接管存档属性，
+                        // 档位交回本模块；不影响 Scene 应用规则的双向同步。
+                        match crate::util::set_prop(crate::util::SCENE_MODE_PROP, "") {
+                            Ok(()) => state.runtime.set_scene_driving(false),
+                            Err(error) => state
+                                .runtime
+                                .set_command_error(&format!("取回控制权失败: {error}")),
+                        }
+                    } else if !app_endpoint && matches!(message.as_str(), "auto\ton" | "auto\toff") {
+                        // 审计 F2：命令失败不再 `?` 断开连接（客户端只会看到
+                        // "连接中断"，拿不到原因），改为随 payload 推送原因。
+                        match state.automatic.set_enabled(message == "auto\ton") {
+                            Ok(()) => state.runtime.set_command_error(""),
+                            Err(error) => state
+                                .runtime
+                                .set_command_error(&format!("自动调度设置失败: {error}")),
+                        }
                     } else if !app_endpoint && matches!(message.as_str(), "extreme\t1" | "extreme\t0") {
                         let enabled = message == "extreme\t1";
                         let path = crate::storage::path(
@@ -621,21 +666,54 @@ fn handle_state(
                     } else if app_endpoint {
                         if let Some(rest) = message.strip_prefix("set\t") {
                             if let Some((package, mode)) = rest.split_once('\t') {
-                                state.app_modes.set_rule(package, mode)?;
+                                match state.app_modes.set_rule(package, mode) {
+                                    Ok(()) => state.runtime.set_command_error(""),
+                                    Err(error) => state
+                                        .runtime
+                                        .set_command_error(&format!("应用规则保存失败: {error}")),
+                                }
                             }
                         } else if let Some(package) = message.strip_prefix("delete\t") {
-                            state.app_modes.remove_rule(package)?;
+                            match state.app_modes.remove_rule(package) {
+                                Ok(_) => state.runtime.set_command_error(""),
+                                Err(error) => state
+                                    .runtime
+                                    .set_command_error(&format!("应用规则删除失败: {error}")),
+                            }
                         } else if let Some((package, kind)) = message
                             .strip_prefix("classify\t")
                             .and_then(|s| s.split_once('\t'))
                         {
                             if automatic::valid_classification(package, kind) {
-                                state.automatic.set_kind(package, kind)?;
+                                match state.automatic.set_kind(package, kind) {
+                                    Ok(()) => state.runtime.set_command_error(""),
+                                    Err(error) => state
+                                        .runtime
+                                        .set_command_error(&format!("应用分类保存失败: {error}")),
+                                }
+                            } else {
+                                // 审计 F2：非法分类曾静默忽略，客户端空等超时；
+                                // 现在把原因回给发起方。
+                                state
+                                    .runtime
+                                    .set_command_error("应用分类无效（可选 game/daily/auto）");
                             }
                         }
                     } else if app_modes::supported(message.trim()) {
-                        state.app_modes.set_rule("*", message.trim())?;
-                        state.automatic.set_enabled(false)?;
+                        // 手动切档 = 取回控制权：清除 Scene 接管存档属性，
+                        // 守护下一拍回读后接管横幅消失。
+                        let _ = crate::util::set_prop(crate::util::SCENE_MODE_PROP, "");
+                        state.runtime.set_scene_driving(false);
+                        let applied = state
+                            .app_modes
+                            .set_rule("*", message.trim())
+                            .and_then(|()| state.automatic.set_enabled(false));
+                        match applied {
+                            Ok(()) => state.runtime.set_command_error(""),
+                            Err(error) => state
+                                .runtime
+                                .set_command_error(&format!("档位切换失败: {error}")),
+                        }
                     }
                 }
                 state.changed();
@@ -666,13 +744,14 @@ fn payload(state: &WebState, app_endpoint: bool) -> String {
     };
     if !app_endpoint {
         return format!(
-            "mode:{},effective:{},package:{},controller:{},sceneActive:{},sceneLinked:{},phase:{},heartbeatMs:{},port:{},powerSaveProfile:{},socName:{},socId:{},configProfile:{},automaticEnabled:{},appKind:{},classificationSource:{},automaticActive:{},fasAvailable:{},sceneInstalled:{},scenePresence:{},fasState:{},fasMode:{},fasSync:{},fasEngine:{},fasEngineSrc:{},fasReason:{},fasFps:{},fasGpu:{},fasBoost:{},fasOverride:{},fasTick:{},freqs:{},extremePower:{},extremeStatus:{},extremeError:{},version:{},pendingControls:{},samsungSafe:{}",
+            "mode:{},effective:{},package:{},controller:{},sceneActive:{},sceneLinked:{},sceneDriving:{},phase:{},heartbeatMs:{},port:{},powerSaveProfile:{},socName:{},socId:{},configProfile:{},automaticEnabled:{},appKind:{},classificationSource:{},automaticActive:{},fasAvailable:{},sceneInstalled:{},scenePresence:{},fasState:{},fasMode:{},fasSync:{},fasEngine:{},fasEngineSrc:{},fasReason:{},fasFps:{},fasTarget:{},fasGpu:{},fasBoost:{},fasOverride:{},fasTick:{},freqs:{},extremePower:{},extremeStatus:{},extremeError:{},cmdError:{},version:{},pendingControls:{},samsungSafe:{}",
             default,
             runtime.effective_mode,
             runtime.package,
             runtime.controller,
             runtime.scene_active,
             runtime.scene_linked,
+            runtime.scene_driving,
             runtime.phase,runtime.tick.map(|t|t.elapsed().as_millis()).unwrap_or(u128::MAX),
             runtime.port,
             runtime.power_profile,
@@ -683,12 +762,14 @@ fn payload(state: &WebState, app_endpoint: bool) -> String {
             runtime.fas_engine_state, runtime.fas_engine_source,
             runtime.fas_engine_reason,
             format!("{:.1}", runtime.fas_engine_fps),
+            runtime.fas_engine_target,
             format!("{:.0}", runtime.fas_engine_gpu),
             runtime.fas_engine_boost,
             runtime.fas_engine_override,
             runtime.fas_engine_ticks,
             runtime.frequencies.iter().map(u32::to_string).collect::<Vec<_>>().join(";"),
             runtime.extreme_power, runtime.extreme_power_status, runtime.extreme_power_error,
+            runtime.command_error,
             env!("CARGO_PKG_VERSION"), runtime.pending_controls, runtime.samsung,
         );
     }
@@ -707,11 +788,11 @@ fn payload(state: &WebState, app_endpoint: bool) -> String {
         ));
     }
     let result = format!(
-        "{{\"type\":\"app-modes\",\"defaultMode\":\"{}\",\"currentPackage\":\"{}\",\"effectiveMode\":\"{}\",\"controller\":\"{}\",\"sceneAvailable\":{},\"sceneLinked\":{},\"locked\":{},\"rules\":[{}],\"revision\":{},\"phase\":\"{}\",\"error\":\"{}\",\"version\":\"{}\",\"port\":{},\"powerSaveProfile\":\"{}\",\"socName\":\"{}\",\"socId\":\"{}\",\"configProfile\":\"{}\"}}",
+        "{{\"type\":\"app-modes\",\"defaultMode\":\"{}\",\"currentPackage\":\"{}\",\"effectiveMode\":\"{}\",\"controller\":\"{}\",\"sceneAvailable\":{},\"sceneLinked\":{},\"sceneDriving\":{},\"locked\":{},\"rules\":[{}],\"revision\":{},\"phase\":\"{}\",\"error\":\"{}\",\"cmdError\":\"{}\",\"version\":\"{}\",\"port\":{},\"powerSaveProfile\":\"{}\",\"socName\":\"{}\",\"socId\":\"{}\",\"configProfile\":\"{}\"}}",
         json_escape(&default), json_escape(&runtime.package), json_escape(&runtime.effective_mode), json_escape(&runtime.controller),
-        runtime.scene_active || runtime.scene_linked, runtime.scene_linked, runtime.scene_active, rules,
+        runtime.scene_active || runtime.scene_linked, runtime.scene_linked, runtime.scene_driving, runtime.scene_active, rules,
         state.revision.load(Ordering::Relaxed),
-        json_escape(&runtime.phase),json_escape(&runtime.error),env!("CARGO_PKG_VERSION"),
+        json_escape(&runtime.phase),json_escape(&runtime.error),json_escape(&runtime.command_error),env!("CARGO_PKG_VERSION"),
         runtime.port,json_escape(&runtime.power_profile),
         json_escape(&runtime.soc),json_escape(&runtime.soc_id),json_escape(&runtime.config_profile),
     );

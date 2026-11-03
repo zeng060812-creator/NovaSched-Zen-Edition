@@ -1,5 +1,113 @@
 # 更新记录
 
+## v2.13.0 修复批次（meta 参数解析 / 前端故障吞噬 / 历史读取链路 · ZenJooo）
+
+- **meta CLI 参数解析根因修复（main.rs）**：`requested_mode` 的命令列表错误包含 `meta`——首个应用包名被当值参数提前消费；同时 meta 包名收集预循环吞掉全部剩余参数，`--module-dir` 及其路径进包名列表（被 valid_package 静默丢弃）且模块目录回落默认值。修复：`meta` 移出值参数命令列表；参数解析重构为纯函数 `parse_args`（meta 位置参数与 `--module-dir/--origin/--request` 同轮解析、任意交错，`--` 选项值缺失显式报错），包名/目录不再互吞。新增 5 项单元测试覆盖规格测试 A–D 与其他命令语义不变（fps-set 首参仍是 requested_mode）。
+- **meta.rs 失败分层（规格五）**：DEX 级错误行（如 `{"error":"no context"}`）此前被静默跳过 → 全部包零命中时仍打印空 JSON 假装成功。现归纳三层原因：app_process/systemMain Context 失败 / PackageManager 查询失败（附首个原因与未命中数）/ 输出截断或 DEX 版本过旧，以明确 Err 返回；协议本身（按键配对、label 转义、icon Base64、缓存）经审计无顺序依赖，保持不变。
+- **前端 ensureMeta 故障吞噬修复（app.js）**：空 catch 曾把所有失败吞成静默占位。新增 `metaDiag` 诊断（最近失败原因/批次/返回条数/名称命中/图标命中，无敏感信息），Root 桥缺失显式记录；规则页底部提示在重试耗尽且零命中时展示具体原因与会话统计。
+- **历史读取链路（app.js loadHistory）**：旧实现把一切失败吞成"history 命令失败"。现区分：模块二进制不存在（moduleCommand 兜底输出特征）/ Root 权限异常（stderr 关键字）/ 命令执行失败（附 exit code 与 stderr）/ JSON 解析失败（附解析错误与原始输出前 60 字符）；空采样仍为诚实空态文案（不伪造曲线）。后端链路审计：`history` CLI 纯 JSON stdout、目录缺失/损坏行跳过/空范围均返回空样本（非错误）——后端无需改动。
+- 修复批次回归：Rust 314 通过/0 失败（含 parse_args 测试 A–D）；WebUI glass-ui 29 项 + DOM 全 PASS；本轮历史格式与 FAS/Scene/图形规则零改动（规格八遵守）。
+
+## Ultimate · v2.13.0 增补批次（App Vulkan Manager + DeepSeek 自适应引擎 · ZenJooo / GLM-5.3-Flash）
+
+架构决议：**C 混合模式**（本地引擎实时调度，DeepSeek 低频分析给出带 TTL 建议，经本地验证后参与）+ **三态**（关闭 / 观察 / 自动，观察默认推荐）。设计文档 `docs/ultimate-design.md`；仲裁优先级并入 `docs/arbitration-v2.13.md`（AI 临时策略位于应用规则之下、自动分类之上）。
+
+- **App Vulkan Manager（graphics.rs schema v2 `novasched-graphics/2`）**：逐应用五档 `follow/auto/angle/native/vulkan` + enabled 开关 + **每规则实际侧状态**（applied/waiting/follow/auto/unsupported/failed + detail），用户请求 ≠ 生效；旧 v1 字符串文件原位迁移。能力探测全部真实数据源：SDK 属性、`/system|/vendor/etc/vulkan/*.json` 枚举 Vulkan GPU 与 API 版本、ANGLE 包探测、`dumpsys package` 解析目标应用 Vulkan 特性声明——**不按 GPU 型号推断功能**。vulkan 档诚实降级：Android 公开的逐应用驱动入口仅接受 ANGLE/原生，外部强制 Vulkan 需应用 manifest 自带声明，全局开关属伪装（规格禁止）——状态机恒为 unsupported 并给出逐层原因链，绝不写入假状态。auto 档同步时按 ANGLE 可用性解析并记录依据。
+- **DeepSeek 引擎（ai.rs，新模块 ~700 行）**：三态配置；Key 唯一落盘点 `run/ai.key` 0600（不进 JS/localStorage/日志/URL）；HTTP 走 curl `-K` 0600 配置携带 Authorization（Key 不进 argv/URL，wget 兜底如实降级）；URL 守卫拒绝 localhost/环回/私有/保留地址（OpenAI 兼容 `/chat/completions`，模型默认 deepseek-chat 可配）；事件驱动五类触发（游戏启动/Scene 变化/瓶颈结论变化/极限省电变化/持续下发失败 ≥10 分钟）+ 冷却（默认 20 分钟）+ 每日配额（默认 6 次）+ 快照签名去重；最小载荷（SoC/簇频率/GPU/电池/内存/档位/Scene/FAS/瓶颈），零用户隐私；输出仅接受固定 JSON 字段，越界拒绝，`fas_ceiling` 只能作为上限钳制（min 语义，不得高于配置），TTL 钳 5–120 分钟；observe 模式只记录不改任何参数；日志 64KB 封顶脱敏。
+- **仲裁集成（daemon.rs）**：AI 建议消费条件 = auto ∧ 未过期 ∧ Scene 签名一致 ∧ 无手动保持 ∧ 非外部接管；优先级低于手动保持与显式应用规则、高于自动分类；`FasShared.ai_ceiling` 全链钳制（frame_ctrl 控制器与 apply_targets 统一生效）；AI 关闭即删临时策略，断网只记日志不影响本地。
+- **CLI**：`ai-status / ai-mode off|observe|auto / ai-key set|clear / ai-model / ai-url / ai-test / ai-decide / ai-log / ai-restore`；usage 日記供费用自担（calls_today/tokens 展示）。
+- **UI**：规则页新增「逐应用图形/Vulkan」能力卡与入口；独立「应用图形管理」页（能力事实 + 逐应用请求/实际状态列表）；规则编辑器五档 chips（Vulkan 按能力禁用并给真实原因）；独立 DeepSeek 页（三态 chips、Key 密码框+显隐+保存/清除+连接测试、模型/接口、今日用量、最近决策、策略状态、日志、恢复本地调度）。dock 仍 5 键，子页高亮跟随父页；dock 拖拽换算 `cell` 顺手修正 4→5 列（此前拖动指示器会漂移——动效标准“按钮待在自己的位置”）。
+- **测试**：Rust 308 通过/0 失败（新增 URL 守卫 14 例、门禁 7 例、验证层 9 例、载荷签名、Vulkan 原因链/版本解码/五档模式/迁移与回环）；DOM 新增 Ultimate 场景断言（图形能力页 Adreno 探测、逐应用状态列表、AI 页路由/三态/Key 指纹/日志）并将 `.rule-row` 断言全部收窄到 `#rule-list` 作用域（新列表渲染不再互相污染）。性能基线 8 项 PASS。
+
+## v2.13.0 · 417（策略代际 392）（动效标准：连续性而非表演）
+
+- **动效八条标准逐条审计**（ZenJooo 标准：自然过渡/空间轨迹/原路返回/不跳动/连点不冲突/十次同样流畅/低性能不掉帧/连续性优先）：①-⑥与⑧均有既有实现证据——弹层背景 220ms 渐入渐出（含 blur 渐变，非突然变暗）；弹窗锚点 morph（FLIP+缩放补偿）打开与关闭共用同一几何描述（原路径返回，来源行关闭时重解析）；analytic spring（stiffness 170/damping 22）时长由收敛推导；dialogEpoch+ownedMotion.cancel 中断续接（连点从当前矩阵继续，reopening 走轻淡入不重放 morph）；morph-inner 逐帧反向缩放保证内容不拉伸不跳动；动画句柄按元素持有、无累积监听。DOM 测试既有的 motion fallback / rapid navigation / delayed ack 用例即为回归防线。
+- **第 7 条（低性能设备）补上标准化逃生门**：新增 `@media(prefers-reduced-transparency:reduce)`——系统省电/无障碍声明减少透明度时，全部大面积 backdrop-filter 整体退出，卡片保留表面着色（提高不透明度补偿层级感）与弹窗加深遮罩，模糊成本归零；与既有双层设计互补（WebGL 玻璃就绪时 `.glass-ready` 本就关闭 CSS blur，本规则覆盖 WebGL 不可用的降级路径；个性化面板另有 --glass-blur 0-64px 手动滑杆）。
+- **动效护栏进测试**：DOM 新增三条断言（7 场景全覆盖）——弹层必须渐变过渡（nova-overlay-in/out 关键字）、必须存在 prefers-reduced-transparency 逃生门、常驻无限动画 ≤2 处（现有仅状态点呼吸与 pending 勾选两处小元素，防止未来新增大面积常驻动画）。
+- 性能基线：test-glass-performance 8 项 PASS（模拟 WebGL 调用计数——如实声明该数字不是真机 FPS；真机帧率仍需装机实测）。本轮未新增任何动画——遵循"连续性优先，不追求动画数量"。
+
+## v2.13.0 · 417（策略代际 392）（应用信息系统改造 / AppInfoProvider 规格化）
+
+- **统一 AppInfoProvider**：`ensureAppInfo()` 单一门面收敛双通道——宿主桥（真实存在才调用，仅采信应用名）+ 模块 meta 通道（app_process 直读 PackageManager：label / 96px 真实图标 / system 标记 / enabled 启用状态，按包名严格键取，设备侧 1h TTL 缓存，批量 6 串行按需加载，从不全量扫描）。调度规则仍以 packageName 为唯一标识，名称与图标仅用于显示。
+- **enabled 启用状态**：NovaMeta.dex 新增 `ApplicationInfo.enabled` 公开字段输出（DEX 4792B，javac+d8 可复现构建）；meta.rs 解析/缓存/输出全链接入，旧缓存缺键按未停用处理（向后兼容）。
+- **统一占位图标**：按规格移除"首字母色块"与按包名哈希生成的随机颜色——AppInfo 未就绪/读取失败时显示统一的中性描边占位图形（`.app-avatar-ph`）；只有 PackageManager 真实图标才渲染为应用图标。6 个系统表面（系统界面/系统设置/Scene/桌面等）保留固定事实名称兜底（AOSP 真实 Label，非猜测），任何第三方应用名称一律来自 PackageManager。
+- **多宿主能力矩阵**：新增 `docs/appinfo-providers.md`——KernelSU/Next、APatch、MMRL（部分构建含 getPackagesInfo）提供 root exec 桥，均无图标 API；**官方 Magisk 不提供 WebView 内 root exec JS 桥**（如实边界，页面只读诊断，调度功能不受影响）；Magisk Alpha 未逐一验证、不虚构。图标方案（NovaMeta.dex）不依赖宿主能力，是一切提供 exec 的宿主下的原生辅助。
+- 搜索已支持名称+包名（`renderRules` 联合匹配）；宿主桥/模块通道双按键存取杜绝图标错位；规则行保留真实图标+名称+完整包名+档位徽标布局。
+
+## v2.13.0 · 417（策略代际 392）（第二阶段：全局调度仲裁 / 应用名与图标完整化）
+
+- **全局调度仲裁表（第二阶段·第一项交付）**：新增 `docs/arbitration-v2.13.md`，把 FAS / Scheduler / Input Boost / App Modes / Automatic / Profiles 之间已存在的优先级（内核温控 > 极限省电 > 外部调度器让位 > Scene 驱动档位 > 手动保持 > 应用规则 > 自动分类 > FAS 临时加压 > 输入脉冲）、临时/持久策略分界、逐节点所有权与异常恢复路径固化为单一事实来源。结论：不新增仲裁器——需要的规则已在各模块实现并对照入表，今后改动须同步该文档。
+- **CPU/GPU 瓶颈识别（第二阶段·第三项）**：NovaFAS 帧路径同步采样 GPU 忙碌度（单节点读，与启发式同量级开销）。连续 3 个"帧率不足 + GPU≥85%"采样判定 GPU 瓶颈——CPU 加压上限收窄到档位 ceiling 的 60%（继续提频对帧时间无收益，不再空耗电），状态卡如实标注"瓶颈在 GPU"；连续"≤60%"判定 CPU 瓶颈并保持全幅度加压；中间负载不下结论。GPU 负载回落自动解除收窄。这是"瓶颈识别后才针对性加压"的落地：加压不再单凭帧率低就推到顶格。
+- **输入脉冲让位（第二阶段·第四项）**：NovaFAS 已持有不低于脉冲目标的加压（fas_min ≥ boost_min）时，触摸脉冲整体退出，不再重复写同一 uclamp 值；fas_min 回落后脉冲自动恢复。帧驱动加压覆盖交互需求时输入加速不再叠加。
+- **闭环反馈（第二阶段·第七项）**：历史轨迹新增 boost 字段（NovaFAS 当拍加压百分比，旧文件缺该键按 0 读回，完全向后兼容）。同一时间线可直接对照"加压幅度 ↔ 实际帧率"——没有帧收益的加压在历史气泡里一目了然；不宣称无数据支撑的优化成功。
+- **触感反馈真机不可用修复（两个静态可证根因）**：
+  - **静音开关误判（主因）**：`settings get system haptic_feedback_enabled` 对从未写入的键返回字面量 `null`——系统性默认值是开启，旧实现判 `=="1"` 把 null 当"用户已关闭"→ 每次触感都被 `haptic=skipped` 静默跳过、通道状态还是 ready、界面只提示"系统已关闭"。从未动过该设置的设备上触感等于完全不存在。现改为只有显式 `0` 才算关闭（与 AOSP getInt 默认值语义一致）。
+  - **常量域错误（次因）**：`cmd vibrator_manager feedback <constant>` 的常量域是 VibrationEffect 预定义效果（1/2/3/5，经 createPredefined），旧实现传的是 HapticFeedbackConstants 域的 9/16/17——createPredefined 对其抛 IllegalArgumentException，tick/success/failure/warning 从未被受理。已全部换成合法常量域，语义强度对应保留（select=CLICK / toggle=HEAVY_CLICK / success=DOUBLE_CLICK / failure=强 HEAVY_CLICK…）。
+  - **兜底**：feedback 重试仍失败时单次降级 `synced oneshot` 波形（时长与语义一致，成功标注 fallback=1）；WebUI 侧系统通道提交失败时同一次点击立即以 WebView 振动兜底（skipped 尊重静音开关不兜底）。
+- **规则页名称/图标真机不可用修复（输出上限根因）**：模块 meta 通道 48 个/批的图标 base64 输出可达数百 KB，撞 app_process 512KB 输出上限后整批失败、重试耗尽——规则页因此只见裸包名（真机截图实证；个别名称如"相机"来自宿主桥零星应答）。改为每批 6 个串行渐进加载（单批数十 KB），名称与图标逐行点亮；查询彻底不可用时规则页底部如实提示原因。DOM 测试新增 meta 通道场景断言（宿主桥缺失时规则行显示"聊天"+真实图标+包名副文本）。
+- 底栏五页签错位修复（真机截图定位）：v2.12.1 新增「历史」页时声称"dock 网格 4 列→5 列"，但实际只改了选中镜头的 `/5` 定宽，`.dock` 网格仍留在 4 列——第 5 个页签换行溢出胶囊下方（真机截图可见"历史"图标悬在概览下方）。现网格改为 `repeat(5,…)`，与镜头定宽一致；DOM 测试新增三断言（网格必须 5 列/不得回退 4 列/镜头按 /5 折算），7 个场景全覆盖防回归。
+- 应用名称与图标完整化（WebUI）：修复图标映射错位的结构性根因并补全规则页展示——
+  - 图标一律改走模块自有 meta 通道（`novasched meta`，经 app_process 直读 PackageManager，返回按包名严格键取的 label+96px 图标，守护侧 1h TTL 缓存）：图标不可能再配到别的应用头上。宿主桥（getPackagesInfo）只采信应用名、不再采信其图标——各管理器实现的图标配对顺序不一致正是"图标错位"的来源；
+  - 修复 `appInfo()` 丢弃 icon 字段导致规则页图标永远不渲染的缺陷；
+  - 规则页每行显示应用名 + 真实图标（无图标时退回首字色块），包名作为副文本保留；概览前台卡片同样显示图标；历史气泡显示加压百分比。
+- 其余第二阶段研究项（CPU 拓扑迁移、场景识别扩展、温控趋势）如实记录边界：现有实现已覆盖容量感知拓扑准入、分类缓存+手动保持防抖、温度入轨迹与档位包络随温控实时钳制；更大范围的变化需要真机数据支撑，本阶段不为架构漂亮而动。
+- 测试：新增 CPU/GPU 瓶颈（收窄/解除/中间负载不下结论/健康清零）、输入脉冲让位/恢复、历史 boost 往返与旧文件兼容回归；全部版本标识统一 2.13.0 / 417。
+
+## v2.12.2 · 416（策略代际 392）（深度审计修复 / Scene 接管存档 / 帧率调节 / 游戏目录）
+
+- **目标 FPS 持久化修复（P0）**：`fps_rules` 的 serialize 曾自带 `"rules"` 外壳而 save 又包一层，落盘 `{"rules":{"rules":…}}`，读回恒失败静默回空——目标 FPS 从不生效、重启即丢（graphics.rs 历史上踩过并修掉的同款缺陷复发）。现 serialize 只出内层对象，save 保持单层；新增"落盘版式可原样读回"回归测试。
+- **历史轨迹数值 ×10 修复（P1）**：fps/温度写盘按 0.1 刻度存整（595=59.5）但读回未 ÷10，历史 fps/温度虚高 10 倍，`history` 命令输出二次放大为 ×100。现读回 ÷10，存量文件无需迁移；新增 595→59.5 显式解码回归测试。
+- **Scene 接管存档（新功能，ZenJooo 设计）**：powercfg.sh 回调每次被 Scene 调用先 `setprop novasched.scene.mode <档位>`（standby 映射 powersave、init 清空）。守护经 bionic `__system_property_get` 直读（零 fork），prop 非空且已联动 = Scene 正在主导档位：WebUI 显示「Scene 正在控制档位」横幅并锁定四档按钮，提供「取回控制权」（`scene→release` 命令清 prop）；WebUI 手动切档同样视为取回。属性非 persist，重启即失、自然回到"无接管"；未联动时守护清掉残留 prop。
+- **按应用面板刷新率（新功能，Scene 同款机制）**：与 Scene N1 相同的 `service call SurfaceFlinger 1035 i32 <modeId>` 激活显示模式方案。规则存 `refresh_rules.json`；目标 Hz 只接受设备 dumpsys display 真实模式（解析不出列表就禁用并说明，不虚构）；前台切换时下发且写后回读 `mActiveModeId` 确认；离开规则应用/锁屏/外部调度接管/守护停止时回到启动时记录的原激活模式，读不回就保留现状并告警。CLI：`refresh-status/refresh-set/refresh-remove`；WebUI 规则编辑器新增「面板刷新率」段（选项来自真实模式列表）。明确语义：切换面板刷新率不是强制帧率上限。
+- **运行时游戏目录（新功能）**：自动调度分类在编译期内置清单外合成运行时来源——模块自有存档 `config/games.json`（`game-add/game-remove/games-status`，带锁原子写）+ Scene 遗留 `games.xml` + Scene 内置 `refresh_rate.txt`（出现即视为游戏）。经 APK 静态分析确认 N1 2026.10 Beta10 已无 games.xml（改用 SQLite scene_config3），来源缺失时如实降级并在 `games-status` 说明，不虚构包名。
+- **NovaFAS 小核折扣按物理频率识别（审计 CF-1）**：不再假设配置槽 0 是小核（用户自定义 policy 槽序会把 ×0.6 节能权重反转到大核）；改为按各簇 cpuinfo_max_freq 识别唯一最低者，识别不了（并列/缺失）全部 1.0，不猜。
+- **fas-rs 接管集合 PID 复用防护（P2）**：已暂停条目每轮复核 pidfd 存活（POLLHUP）——旧 fas-rs 死亡、PID 被新 fas-rs 复用时旧条目让位，新进程走正常探测-暂停，不再有双调度器窗口；老内核无 pidfd 时按 /proc 身份复核。
+- **NovaFAS uclamp 写后读回（P2）**：与 freq 路径对齐，目标未落地就作废去重下一拍重写，不再等强制校验轮（最长 ~5 秒）才补。
+- **目标 FPS 取 base 包名（P2）**：前台是 `com.game:glssurface` 子进程时也能命中按主包名保存的调度目标，与分类器口径一致。
+- **规则并发保护（审计 F1）**：fps-set/graphics set·remove/refresh-set/game-add 的读-改-写全部加 flock（有界重试，与 web_auth::register_origin 同模式），WebUI 连续保存不再互相覆盖丢规则。
+- **WebSocket 命令失败不再断连（审计 F2）**：自动调度/应用规则/分类/档位命令失败时把原因随 payload（`cmdError`）推回发起客户端并 toast，非法分类不再静默忽略导致空等超时；连接保持。
+- **WebUI FPS 探测修正（审计 F4/F6/F8）**：规则编辑器每次打开强制重探 fps 规则；`fpsRules` 进初始状态声明（保持 null 语义）；fps-set/refresh-set 成功判定改按 `rules_count=` 回显，不再依赖中文文案。
+- 小项：history 测试未使用变量与 meta.rs 无效 `mut` 清理；全部版本标识统一 2.12.2 / 416。
+- 测试：WSL 全量 `cargo test` 289 通过 / 0 失败（基线 276+2 已知失败全部修复转绿 + 新增 11 项回归）。真机验证清单见 docs/audit-v2.12.2.md。
+
+## v2.12.1 · 415（策略代际 392）（目标FPS / 历史轨迹 / 应用名称与图标）
+
+- **目标 FPS（二十）**：应用规则新增「目标 FPS（调度目标）」段（跟随应用/30/45/60/90/120），独立存储 fps_rules.json，与档位、图形后端互不覆盖。Android 没有公开的按应用 FPS 强制入口，数值作为 NovaFAS 帧基线：目标设为 60 时，应用被限制在 60fps 就不再为 120Hz 屏幕持续加压；达不到目标才提升 CPU 且以档位上限封顶。UI 文案明确「不是强制限帧，不改变游戏渲染上限」；引擎卡显示当前调度目标。CLI：fps-set/fps-remove/fps-status。
+- **历史轨迹（十九）**：新增「历史」页（底栏第 5 项）。守护进程在既有唤醒节拍上节流采样（游戏前台 10 秒、其余 20 秒，不新增唤醒），记录前台应用、档位、NovaFAS 帧/目标、四簇频率、电量/充电/电池温度到按天滚动文件（保留 7 天、总量 8MB 上限、超限删最旧）。读取命令 `history <小时>` 均匀降采样≤900 点（点数受限但每个点都是实测值）；canvas 双轴图绘制电量与温度曲线、档位变化事件刻度；采样缺口断线不补零；触摸显示时间点数值。health-check 增加历史子项。
+- **应用名称与图标（十七）**：新增 NovaMeta.dex（源码 scripts/meta-dex/NovaMeta.java；官方 JDK17 + build-tools r34 可复现构建，见 scripts/build-meta-dex.cjs/.sh），经 app_process 读取 PackageManager：应用名、96px 透明底 PNG 图标（等比缩放不裁切）、系统应用分类。原生 meta 命令带包名校验、批量≤48、20 秒超时、512KB 输出上限与 1 小时 TTL 缓存；结果经 root 通道供 WebUI 显示。应用更新/语言变化由 TTL 收敛；失败结果不进缓存可重试。宿主 getPackagesInfo 仍是名称首选（本批已修复其失败缓存缺陷），DEX 辅助覆盖宿主缺失场景。app_process 真机执行待装机验证（本机未装模块）。
+- 全部新命令与存储已进发布包与 health-check。
+
+## v2.12.1 · 415（策略代际 392）（WebUI 专项）
+
+- **个性化弹层「主导航错位」根因修复**：截图中出现在「液态玻璃」区中间的"主导航"实为面板内的 `dock-preview` 视觉复制品（240×54 胶囊、相同四个页签名、相同选中态高亮），天然会被当成错位导航；真实主导航层级本就正确（z-45 位于弹层 z-75 之下、弹层打开时已 inert）。修复：预览加显式标注「导航栏外观预览（示意，非页面导航）」并去导航化（缩小、虚线描边、去除选中态药丸）。
+- **图形后端 UI 入口**：规则编辑对话框新增「图形后端」段（跟随系统 / ANGLE），与档位规则同框但独立存储、独立保存；连接时经 root 通道探测，列表行显示非默认后端 ANGLE 徽标；编辑器在探测返回后就地刷新可用态。无 ANGLE 驱动时入口保持可见、禁用并显示原因；不提供"原生 Vulkan 强制切换"。删除规则或选回跟随系统只撤销本模块写入的表项；保存文案明确需完全退出重开生效。
+- **代表性交互 morph 升级（FLIP 缩放补偿）**：内容包进 `.morph-inner` 逐帧反向缩放——容器按真实边界缩放、文字图标始终以目标尺寸渲染，消除文字拉伸；圆角每帧写入 rv/sx、rv/sy 水平/垂直半径，渲染圆角恒等于起点→终点线性插值，中途与结尾不跳变；弹簧中断续接保留。弹窗新增标题区拖拽关闭（位移+速度判定，回弹从当前位置续接），与返回键/关闭按钮/遮罩共用同一退出状态机；关闭时来源行按选择器重解析，列表刷新后仍回到最新位置，来源消失自然收拢。
+- **过程证据**：`scripts/record-fluid.cjs` 在真实 Chromium（Edge，桌面环境，非 Android WebView——如实标注）驱动真实 DOM/CSS/动画，产出展开中段/反向重开/关闭中段/列表等 9 帧过程截图（`dist/webui-evidence/`）；DOM 断言新增图形后端入口可见性、禁用原因、独立保存、morph 包络等用例（31 项全部通过）。帧率与流畅度需真机 WebView 实测，本环境不提供数字。
+
+## v2.12.1 · 415（策略代际 392）（触感 / 档位同步 / 健康检查）
+
+- **触感链路修复**：真机追踪发现两层根因——其一，HyperOS 的 `cmd vibrator_manager help` 以退出码 255 返回完整输出、`feedback` 成功时无输出且非法常量退出码也是 0，按退出码判定使系统命令通道在任何设备上都不可用（旧实现从未真正工作过）；现改按输出内容判定，并以 `cmd vibrator_manager list` 确认振动器真实存在。其二，UI 探测一次性置位、失败吞掉、仅在三个设置入口触发，现桥接就绪自动探测、瞬时失败有界重试（3 次退避）、确定性失败保留原因。能力结果按开机会话缓存（TTL 1 天），后续触感不再重复 fork help 查询；系统触感开关（haptic_feedback_enabled）每次发送前实时读取，关闭时输出 skipped 而不算失败。外观设置新增「测试触感」：走真实链路提交并区分已提交/被系统设置跳过/失败原因；文案不声称用户实际感受到振动（软件无法确认体感）。
+- **档位切换同步**：定位到自动调度分支每次心跳用分类结果覆盖手动选择（原注释即声明 mode.txt 无法保持），自动模式下手动切极速约 2 秒内被打回、WebUI 挂到 30 秒超时后报“未收到确认”。现在手动/Scene 显式切档在当前前台应用上保持（最长 10 分钟），前台应用变化或到期后自动调度恢复；守护重启回到自动调度（安全默认）。WebUI 在自动模式下按广播回显确认切档，说明保持窗口；不再提前报失败。
+- **健康检查**：新增 `novasched health-check`（只读聚合）：守护、配置、SoC、控制权、Scene、fas-rs、WebUI 端口、触感能力（只读探测不振动）、图形后端规则、应用名元数据、历史轨迹、温度。结果区分 ok/unsupported/failed/unknown 并给出下一步；不修改温控、其它模块或共享配置。
+- **撤销控制与故障导出**：`novasched release-control` 明确命名“撤销 NovaSched 控制”——停止下发、按所有权撤销节点约束与图形后端表项、解冻 fas-rs，保留用户配置，不触碰温控与其它模块；`novasched fault-report` 将诊断内容写入本地文件（256KB 上限、0600 权限、不自动上传、不含鉴权数据）。
+- **应用名称查询**：修复 `loadLabels` 三处真实缺陷——宿主查询失败/异常/格式未知时包被永久记入已查询（不再重试）；同步返回假设导致异步桥永远失败；无独立回退说明。现在只有宿主明确应答的包才记入已查询，失败按包计数有界重试（3 次），兼容异步返回与 3 秒超时。真机图标与名称的 app_process DEX 辅助未实现：本机构建环境无可复现的 javac/d8 工具链，按“不交付不可复现构建”的边界如实记录（docs/v2.12.1-report.md）。
+- 概览状态卡的档位来源解释扩展为：自动调度（当前分类）/应用规则/手动档位/Scene，回答“当前由谁决定档位”。
+
+## v2.12.1 · 415（策略代际 392）
+
+- **NovaFAS 窗口统计修复**：timestats 采样改为“restart 感知差分”——`-clear` 生效（计数清零）、SurfaceFlinger 重启、图层重建、应用切换后首个窗口直接取当前累计作为窗口帧数；clear 不生效时用差分。修复旧实现把“clear 生效 + 累计差分”混用导致 fps 恒为 0、永远走回落路径的问题。
+- **NovaFAS 主图层选举**：FPS 不再把同包名所有图层帧数求和（游戏 SurfaceView 与菜单/弹窗/Activity 窗口层叠加会虚高一倍）。按窗口帧数选出主渲染图层并保持稳定（候选需超过现主图层 2 倍才切换），图层重建（`#序号` 变化）通过去序号的 base 键跨采样对齐。
+- **NovaFAS 目标与实际区分**：基线重学只在两个无歧义边界进行——boost==0（未加压的实际帧率即真实目标）或 boost 已到上限仍持续不足（快速接受实际帧率并回落，避免上限加压长期挂满空耗电）；中间加压区间继续加压，不把“还没推到位”误学成低目标。应用停止渲染时按加倍步长回落，fps 0 是合法样本不再当作信号失败反复 fork dumpsys。
+- **NovaFAS 启发式有界**：无帧时间证据时 GPU 高负载的加压上限收窄到档位 ceiling 的 60%，不再单凭 GPU 忙推到顶格；中间负载区间（45–70）按低速档节奏回落，不再无限期保留高 boost。
+- **NovaFAS 边界与自愈**：修复 floor 缓存高于被温控压低的 `scaling_max_freq` 时 `clamp` 直接 panic 且加压值悬挂的问题（每拍以实际上限为界、缓存失效重解析）；强制校验轮现在绕过 `last_min` 去重并做写后读回（读回不一致作废缓存下一拍重试）；引擎线程 panic 时按快照释放全部节点控制。
+- **fas-rs 接管 pidfd 化**：SIGSTOP/SIGCONT 一律通过 pidfd 发送，进程在扫描与停止之间死亡、PID 被复用时不会误停无关进程；扫描限频到每秒一次，不再每拍全量扫 /proc。
+- **NovaFAS 应用切换同步**：切换前台应用时窗口计数、主图层归属、frame_ok、失败计数一并作废，旧应用的加压不会带进新应用。
+- **天玑 9500（MT6993）适配**：识别（MT6993 平台码 / Dimensity 9500 营销名）、拓扑准入（4+3+1，policy0/4/7）与模板按真机采集报告（Redmi prague，Android 17）落地；governor 保留 OEM `sugov_ext`；档位包络为按 OPP 表推导的候选值，能效待真机调优。GPU 为 MaliG1Ultra（gpufreqv2 私有接口、无标准 devfreq），GPU devfreq 功能在该平台保持停用并告警降级。
+- **按应用图形后端规则（ANGLE）**：新增 `graphics-set/graphics-remove/graphics-sync/graphics-status/graphics-revert`，把 per-app ANGLE/native 规则写入 `angle_gl_driver_selection_pkgs/values` 并读回确认；只撤销本模块写入且未被外部修改的表项；ANGLE 驱动包缺失时如实报告不可用（有 Vulkan 驱动不等于有 ANGLE）；规则变更需目标应用完全退出重开，不强杀进程。`diagnose` 输出包含该状态。
+- **厂商限频器诊断**：`game-diagnose` 新增只读 vendor-limit 段（WALT sched_fmax_cap、MIUI 热限频 sconfig/cpu_limits、MIGT、metis、msm_performance、game_opt、mi_display 实际面板帧率、刷新率设置），用于回答“游戏被锁帧的限制来自哪里”，不修改任何节点。
+- **WebUI 流体交互**：弹窗/面板 morph 与页面切换改为物理弹簧关键帧（欠阻尼二阶系统采样，非 cubic-bezier 假弹簧）；中断续接——快速连点、关闭途中再打开时从当前计算矩阵继续，不跳回端点重放；面板下拉释放按位置与速度判定完成/取消，甩动直接关闭且动画从拖拽位置连续过渡；无信号帧率如实显示“待渲染”而不是 0.0 fps。
+- 界面版本、模块版本、Rust 版本统一为 2.12.1 / 415。
+
 ## v2.12.0 · 414（策略代际 392）
 
 - **NovaFAS 基线中毒修复**：引擎启用瞬间抓到高刷过场（如 120fps 开屏动画）当目标帧率后，旧的"基线只在不加压时重学"逻辑会进入永远"低于基线→永远加压"的死锁。现在持续（约 10 秒）达不到基线时按每采样 10% 缓慢把基线拉回实际帧率；短暂抖动不触发，加压节奏不变。

@@ -80,6 +80,18 @@ pub fn running_pids() -> Vec<i32> {
     running_pids_in(Path::new("/proc")).unwrap_or_default()
 }
 
+/// 校验单个 PID 当前是否是 fas-rs 进程（判定标准与 `running_pids` 一致：
+/// cmdline 首段的文件名）。配合 pidfd 使用时它只负责减少无谓的 fd 打开；
+/// PID 复用防护由 pidfd 本身保证，不依赖本函数的时效。
+pub fn looks_like_fas_pid(pid: i32) -> bool {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let executable = bytes.split(|b| *b == 0).next().unwrap_or_default();
+    Path::new(std::str::from_utf8(executable).unwrap_or(""))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "fas-rs" | "fas_rs"))
+}
+
 fn running_pids_in(proc: &Path) -> Option<Vec<i32>> {
     let entries = fs::read_dir(proc).ok()?;
     let mut pids = Vec::new();

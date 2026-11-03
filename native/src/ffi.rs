@@ -90,6 +90,8 @@ extern "C" {
 #[cfg(target_os = "android")]
 extern "C" {
     pub fn __system_property_get(name: *const c_char, value: *mut c_char) -> c_int;
+    /// bionic：设置系统属性（root 域可用）。返回 0 视为已提交。
+    pub fn __system_property_set(name: *const c_char, value: *const c_char) -> c_int;
 }
 
 pub type SignalHandler = extern "C" fn(c_int);

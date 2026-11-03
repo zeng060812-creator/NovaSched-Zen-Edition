@@ -218,7 +218,7 @@ pub fn identify_soc(
         .map(|(soc, e)| (soc, e.join(", ")))
         .ok_or_else(|| {
             format!(
-                "未识别到支持的处理器（骁龙 8 系列、天玑 8350 / 8400 / 9300+ / 9400+、玄戒 O3）；检测值: {}",
+                "未识别到支持的处理器（骁龙 8 系列、天玑 8350 / 8400 / 9300+ / 9400+ / 9500、玄戒 O3）；检测值: {}",
                 properties
                     .iter()
                     .filter(|(_, v)| !v.trim().is_empty())
@@ -1154,6 +1154,8 @@ mod tests {
                     Soc::Elite | Soc::Elite5 | Soc::Dimensity9400Plus | Soc::Gen5 => "1560000",
                     // MT6989 全大核：省电档首簇（A720）留 60% 保底日常流畅。
                     Soc::Dimensity9300Plus => "1800000",
+                    // 天玑 9500 省电小核上限与 9400+ 同比例（52%）。
+                    Soc::Dimensity9500 => "1560000",
                 }
             );
         }
@@ -1531,6 +1533,15 @@ mod tests {
                 vec![(0, "0-3"), (4, "4-6"), (7, "7")],
                 [0, 4, 7, -1],
             ),
+            (
+                // 天玑 9500（MT6993）：真机采集 Redmi prague（2604FRK1EC）。
+                // MIDR：cpu0-3=0x411fd8b1、cpu4-6=0x411fd900、cpu7=0x411fd8c0；
+                // policy0=0-3、policy4=4-6、policy7=7。
+                Soc::Dimensity9500,
+                include_str!("../tests/fixtures/dimensity9500-cpuinfo.txt"),
+                vec![(0, "0-3"), (4, "4-6"), (7, "7")],
+                [0, 4, 7, -1],
+            ),
         ];
         for (soc, dump, groups, expected) in samples {
             let normalized = dump.replace("\r\n", "\n");
@@ -1563,6 +1574,10 @@ mod tests {
                 Soc::Dimensity9300Plus => assert_eq!(
                     parts,
                     ["0xd81", "0xd81", "0xd81", "0xd81", "0xd82", "0xd82", "0xd82", "0xd82"]
+                ),
+                Soc::Dimensity9500 => assert_eq!(
+                    parts,
+                    ["0xd8b", "0xd8b", "0xd8b", "0xd8b", "0xd90", "0xd90", "0xd90", "0xd8c"]
                 ),
                 Soc::Elite5 | Soc::Gen5 => assert!(parts.iter().all(|part| part == "0x002")),
                 _ => unreachable!(),
